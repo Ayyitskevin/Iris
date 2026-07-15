@@ -1,0 +1,27 @@
+import type { Note } from '@iris/shared';
+
+/**
+ * The one error type routes throw. A single error handler (app.ts) turns it into the
+ * uniform `{ error: { code, message, conflict? } }` envelope the client expects.
+ */
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string,
+    message: string,
+    public readonly conflict?: Note,
+  ) {
+    super(message);
+    this.name = 'HttpError';
+  }
+}
+
+export const badRequest = (msg: string, code = 'bad_request') => new HttpError(400, code, msg);
+export const unauthorized = (msg = 'Authentication required') =>
+  new HttpError(401, 'unauthorized', msg);
+export const forbidden = (msg = 'Not permitted') => new HttpError(403, 'forbidden', msg);
+export const notFound = (msg = 'Not found') => new HttpError(404, 'not_found', msg);
+export const paymentRequired = (msg: string) => new HttpError(402, 'payment_required', msg);
+/** Version conflict: carries the authoritative server note so the client can reconcile. */
+export const conflict = (msg: string, serverNote: Note) =>
+  new HttpError(409, 'version_conflict', msg, serverNote);

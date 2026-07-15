@@ -1,0 +1,9 @@
+node_modules
+dist
+build
+.expo
+web-build
+.data
+coverage
+pnpm-lock.yaml
+apps/api/migrations/**/*.sql

@@ -1,0 +1,31 @@
+{
+  "name": "iris",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Iris — a notes-and-knowledge app that treats AI agents as first-class actors. iOS, Android, and web from one codebase.",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter ./packages/* run build",
+    "typecheck": "pnpm -r run typecheck",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "pnpm --filter @iris/api run test",
+    "dev:api": "pnpm --filter @iris/api run dev",
+    "dev:mobile": "pnpm --filter @iris/mobile run start",
+    "db:migrate": "pnpm --filter @iris/api run db:migrate",
+    "db:generate": "pnpm --filter @iris/api run db:generate"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.10.0",
+    "eslint": "10.7.0",
+    "eslint-config-prettier": "10.1.8",
+    "prettier": "3.9.5",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.64.0"
+  }
+}
