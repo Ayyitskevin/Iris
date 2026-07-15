@@ -1,0 +1,16 @@
+{
+  "expo": {
+    "name": "Iris",
+    "slug": "iris",
+    "scheme": "iris",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "platforms": ["ios", "android", "web"],
+    "ios": { "supportsTablet": true, "bundleIdentifier": "app.iris.client" },
+    "android": { "package": "app.iris.client" },
+    "web": { "bundler": "metro", "output": "single" },
+    "plugins": ["expo-router", "expo-secure-store"]
+  }
+}
