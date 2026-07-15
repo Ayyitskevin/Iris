@@ -65,7 +65,7 @@ PGlite runs the *actual Postgres engine* (same source, WASM build) including RLS
 triggers, and transactions — so our tenant-isolation tests exercise real Postgres
 semantics without a running server, a Docker daemon, or CI service containers. The
 selection is automatic: `DATABASE_URL` present → node-postgres; absent → PGlite at
-`.data/iris.db`. Migrations are the same SQL against both.
+the `.data/iris` directory. Migrations are the same SQL against both.
 
 **ORM: Drizzle.** Type-safe schema-as-code, SQL-first migrations we can read in review,
 first-class support for both the node-postgres and pglite drivers. Chosen over Prisma
@@ -85,7 +85,7 @@ Two layers of defense:
    by it; there is no query path that omits it. The authenticated principal (user session
    *or* agent token) resolves to exactly one `workspace_id`, set per request.
 2. **Database layer (defense in depth).** RLS policies on tenant tables gate every row by
-   a `current_setting('iris.workspace_id')` GUC that the request sets inside its
+   a `current_setting('app.current_workspace')` GUC that the request sets inside its
    transaction. Even a buggy query that forgets the `WHERE` clause returns nothing across
    the tenant boundary.
 
@@ -101,8 +101,8 @@ B's notes through the API. That test is the definition of this ADR being true.
 The brief says: use a managed provider (Clerk or Supabase Auth) "so you're not building
 password reset and OAuth from scratch."
 
-**What we built:** an `AuthProvider` interface (`verifyCredentials`, `createUser`,
-`getPrincipal`) with a **`LocalAuthProvider`** implementation (email + password hashed
+**What we built:** an `AuthProvider` interface (`signUp`, `signIn` — where `signUp` is
+also the tenant-provisioning path) with a **`localAuthProvider`** implementation (email + password hashed
 with Node's built-in `crypto.scrypt`, sessions via signed JWT using `jose`). It is the
 default and makes the entire foundation **runnable and testable offline, with zero
 external accounts or native build dependencies.**
