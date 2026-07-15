@@ -33,6 +33,7 @@ export async function recordVersionAndActivity(
     version: note.version,
     title: note.title,
     bodyMd: note.bodyMd,
+    tags: note.tags ?? [],
     authorType: ctx.principal.type,
     authorId: ctx.principal.id,
     authorName: ctx.principal.name,

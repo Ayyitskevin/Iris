@@ -16,14 +16,15 @@ domain pillars → client/test/reference), or jump straight to whatever your cha
 3. **database-and-migrations** — schema, hand-authored SQL migrations, RLS, the two DB drivers.
 4. **add-an-api-route** — the end-to-end recipe for a new endpoint (ties the above together).
 5. **notes-and-versioning** — note CRUD, the version/conflict choke point.
-6. **activity-and-undo** — the append-only feed and reversible-action model (pillar #2).
-7. **agent-actors-and-tokens** — scoped hashed tokens, the `Principal`, scope enforcement.
-8. **sync-protocol** — the local-first change-feed: cursor pulls, base_version pushes, conflicts.
-9. **billing-and-the-sync-gate** — Stripe seam and the multi-device 402 gate.
-10. **auth-provider-seam** — swapping local auth for a managed provider (Clerk/Supabase).
-11. **client-architecture** — the Expo/Legend-State mobile client.
-12. **testing** — the `apps/api` black-box harness (`makeApp`/`call`/`signUp`).
-13. **conventions-and-gotchas** — pinned versions, imports, error/serializer rules; reference/last.
+6. **search-and-tags** — full-text search + tags (phase 2), built on the notes spine.
+7. **activity-and-undo** — the append-only feed and reversible-action model (pillar #2).
+8. **agent-actors-and-tokens** — scoped hashed tokens, the `Principal`, scope enforcement.
+9. **sync-protocol** — the local-first change-feed: cursor pulls, base_version pushes, conflicts.
+10. **billing-and-the-sync-gate** — Stripe seam and the multi-device 402 gate.
+11. **auth-provider-seam** — swapping local auth for a managed provider (Clerk/Supabase).
+12. **client-architecture** — the Expo/Legend-State mobile client.
+13. **testing** — the `apps/api` black-box harness (`makeApp`/`call`/`signUp`).
+14. **conventions-and-gotchas** — pinned versions, imports, error/serializer rules; reference/last.
 
 ## Index
 
@@ -34,6 +35,7 @@ domain pillars → client/test/reference), or jump straight to whatever your cha
 | [database-and-migrations](database-and-migrations/SKILL.md) | Open when changing the DB — adding a table/column, writing a migration, adding RLS for a new tenant table, or debugging PGlite-vs-Postgres behavior. |
 | [add-an-api-route](add-an-api-route/SKILL.md) | Open when adding, extending, or debugging a REST endpoint on apps/api — the end-to-end recipe from zod schema to client method to route to service to test. |
 | [notes-and-versioning](notes-and-versioning/SKILL.md) | Open when touching note CRUD, version history, the baseVersion 409-conflict path, restore/undo, or soft delete — anything that mutates a note or reads its history. |
+| [search-and-tags](search-and-tags/SKILL.md) | Open when touching note tags (jsonb array, filtering, tag list) or full-text search (generated tsvector, ranking) — added in phase 2 (ADR-010). |
 | [activity-and-undo](activity-and-undo/SKILL.md) | Open when touching the activity feed, the undo endpoint, note_versions/activity_log rows, or debugging why an action shows (or won't show) as undone. |
 | [agent-actors-and-tokens](agent-actors-and-tokens/SKILL.md) | Open when issuing, hashing, scoping, verifying, or revoking agent tokens, debugging agent 401/403s, or adding/changing agent scopes. |
 | [sync-protocol](sync-protocol/SKILL.md) | Open when touching the local-first change-feed — cursor pulls, base_version pushes, conflict surfacing, the outbox, or the client sync() loop (ADR-005). |

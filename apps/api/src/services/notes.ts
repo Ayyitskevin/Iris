@@ -6,7 +6,7 @@
  * Services never open their own transactions or set the GUC — they run inside the
  * per-request tenant transaction from runTenant(), and use ctx.db throughout.
  */
-import { and, desc, eq, isNull } from 'drizzle-orm';
+import { and, desc, eq, isNull, sql } from 'drizzle-orm';
 import type { CreateNoteRequest, Note, UpdateNoteRequest } from '@iris/shared';
 import { noteVersions, notes } from '../db/schema';
 import type { Ctx } from '../context';
@@ -15,11 +15,29 @@ import { isUuid, newId } from '../lib/ids';
 import { serializeNote } from '../serialize';
 import { loadNote, recordVersionAndActivity } from './note-write';
 
-export async function listNotes(ctx: Ctx): Promise<Note[]> {
+/** Trim, lowercase, drop empties, and de-dupe tags so "Work" and " work " collapse. */
+export function normalizeTags(tags: string[] | undefined): string[] {
+  if (!tags) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of tags) {
+    const t = raw.trim().toLowerCase();
+    if (t && !seen.has(t)) {
+      seen.add(t);
+      out.push(t);
+    }
+  }
+  return out;
+}
+
+export async function listNotes(ctx: Ctx, tag?: string): Promise<Note[]> {
+  const filters = [eq(notes.workspaceId, ctx.workspaceId), isNull(notes.deletedAt)];
+  // jsonb `?` tests membership of a string in the tags array (see migration 0002).
+  if (tag) filters.push(sql`${notes.tags} ? ${tag}`);
   const rows = await ctx.db
     .select()
     .from(notes)
-    .where(and(eq(notes.workspaceId, ctx.workspaceId), isNull(notes.deletedAt)))
+    .where(and(...filters))
     .orderBy(desc(notes.updatedAt));
   return rows.map(serializeNote);
 }
@@ -40,6 +58,7 @@ export async function createNote(ctx: Ctx, input: CreateNoteRequest): Promise<No
       title: input.title ?? '',
       bodyMd: input.bodyMd ?? '',
       folder: input.folder ?? null,
+      tags: normalizeTags(input.tags),
       version: 1,
     })
     .returning();
@@ -64,6 +83,7 @@ export async function updateNote(ctx: Ctx, id: string, input: UpdateNoteRequest)
       title: input.title ?? current.title,
       bodyMd: input.bodyMd ?? current.bodyMd,
       folder: input.folder === undefined ? current.folder : input.folder,
+      tags: input.tags === undefined ? current.tags : normalizeTags(input.tags),
       version: current.version + 1,
       updatedAt: new Date(),
     })
@@ -117,6 +137,7 @@ export async function restoreVersion(ctx: Ctx, id: string, versionId: string): P
     .set({
       title: target.title,
       bodyMd: target.bodyMd,
+      tags: target.tags ?? [],
       version: current.version + 1,
       deletedAt: null,
       updatedAt: new Date(),

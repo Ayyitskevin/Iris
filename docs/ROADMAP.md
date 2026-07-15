@@ -29,10 +29,16 @@ These were named as out of scope and are staying out until the foundation is pro
 - **Workspace membership** — `workspace_members(role)` is present; multi-user/roles land here.
 - **Token scopes** — `notes:read` / `notes:write` today; finer scopes (per-folder, admin)
   extend the same `scopes` array.
-- **Organization primitive: folders** — chosen over tags for the foundation; tags can be
-  added as an orthogonal table without touching notes.
+- **Organization primitive: folders** — the foundation's primary primitive. **Tags shipped
+  in phase 2** (ADR-010) as an orthogonal `jsonb` array on notes; folders remain primary.
 
-## Near-term follow-ups (first things after the foundation ships)
+## Shipped after the foundation
+
+- **Phase 2 — tags + full-text search** (ADR-010): versioned `jsonb` tags with list/filter,
+  and ranked Postgres FTS over a generated `tsvector` column. Client: search bar (server FTS
+  + offline fallback) and tag chips/input.
+
+## Near-term follow-ups (next things)
 
 1. **Managed auth provider** wired for real (Clerk or Supabase) + password reset + OAuth +
    email verification — these are the managed provider's job, not `LocalAuthProvider`'s.
@@ -47,7 +53,8 @@ These were named as out of scope and are staying out until the foundation is pro
 6. **EAS Build + store submission** pipeline and OTA update channels.
 7. **Editor upgrades**: live Markdown preview, slash-menu, image paste — still emitting
    plain Markdown.
-8. **Full-text search** over notes (Postgres `tsvector` first; a dedicated index later).
+8. **Search/tags upgrades**: tag rename/merge, search snippets & highlighting, filter by
+   tag *and* query together, per-field ranking weights.
 
 ## Tempted-but-parked ideas (write here, don't build)
 

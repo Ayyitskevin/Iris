@@ -248,6 +248,33 @@ a place to harden).
 
 ---
 
+## ADR-010 — Tags & full-text search (phase 2)
+
+**Accepted.**
+
+**Tags** are a `jsonb` string array on `notes` (and on every `note_versions` snapshot, so
+they are versioned and restore correctly). Chosen over a normalized `note_tags` join
+table because tags then travel with the note for free — through sync (part of the note
+payload), export (frontmatter), and history — with no joins. Membership filtering uses the
+jsonb `?` operator, backed by a GIN index; the tag list is aggregated (small workspaces).
+Tags are normalized (trim / lowercase / de-dupe) at the service boundary so `Work` and
+` work ` collapse. Folders remain the primary org primitive; tags are orthogonal and
+additive (they close the ROADMAP "tags" seam).
+
+**Search** is Postgres full-text search over a **generated, stored `tsvector` column**
+(`to_tsvector('english', title || ' ' || body_md)`) with a GIN index, ranked by
+`ts_rank`. It's a generated column (not computed per query) so the index does the work;
+valid in a generated column because the text-search config is a constant. Workspace-scoped
+and tombstone-aware like every other read. PGlite runs the exact same FTS, so it's fully
+tested in-repo. The client hits `/v1/notes/search` (debounced) with a local substring
+fallback when offline — search stays useful without the network, in keeping with pillar #1.
+
+Both features are pure additions on the existing spine: a migration (`0002`), tags carried
+through the same `recordVersionAndActivity` choke point, and two new read routes
+(`/v1/notes/search`, `/v1/tags`) plus a `?tag=` filter on the notes list.
+
+---
+
 ## Summary: the shape these decisions produce
 
 One TypeScript monorepo → one Fastify service → one Postgres (PGlite locally). Auth,

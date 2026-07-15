@@ -19,7 +19,8 @@ A thin, end-to-end vertical slice that proves the architecture:
 
 - **Multi-tenant auth + workspaces** — sign up → your own isolated workspace.
 - **Notes core** — create/edit/delete Markdown notes in folders, **versioned** (every save
-  keeps history; restore any prior version).
+  keeps history; restore any prior version). **Tags + full-text search** (phase 2, ADR-010):
+  ranked search and tag filtering, both workspace-scoped.
 - **Local-first sync** — edits apply instantly/offline; a change-feed reconciles to
   Postgres; conflicts are **surfaced, never dropped**.
 - **Agent actors + API** — issue scoped, revocable agent tokens; a REST API that agents

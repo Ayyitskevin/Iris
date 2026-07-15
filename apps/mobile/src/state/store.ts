@@ -104,3 +104,14 @@ export function selectVisibleNotes(): Note[] {
     .filter((n) => !n.deletedAt)
     .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
 }
+
+/** Distinct tags across visible notes, with counts — powers the filter chips. */
+export function selectTags(): { tag: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const n of selectVisibleNotes()) {
+    for (const t of n.tags) counts.set(t, (counts.get(t) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([tag, count]) => ({ tag, count }))
+    .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+}

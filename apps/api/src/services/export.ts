@@ -28,6 +28,7 @@ function frontmatter(note: NoteRow): string {
     `id: ${note.id}`,
     `title: ${JSON.stringify(note.title)}`,
     `folder: ${note.folder ? JSON.stringify(note.folder) : 'null'}`,
+    `tags: [${(note.tags ?? []).map((t) => JSON.stringify(t)).join(', ')}]`,
     `createdAt: ${note.createdAt.toISOString()}`,
     `updatedAt: ${note.updatedAt.toISOString()}`,
     `version: ${note.version}`,

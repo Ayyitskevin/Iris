@@ -30,6 +30,7 @@ import { users, workspaces } from './db/schema';
 import { serializeUser, serializeVersion, serializeWorkspace } from './serialize';
 import { forbidden, HttpError, unauthorized } from './lib/errors';
 import * as notesService from './services/notes';
+import * as searchService from './services/search';
 import * as activityService from './services/activity';
 import * as agentService from './services/agents';
 import * as syncService from './services/sync';
@@ -139,7 +140,24 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
   app.get('/v1/notes', guarded, (req) =>
     tenant(req, async (ctx) => {
       requireScope(ctx, 'notes:read');
-      return { notes: await notesService.listNotes(ctx) };
+      const tag = (req.query as { tag?: string }).tag;
+      return { notes: await notesService.listNotes(ctx, tag) };
+    }),
+  );
+
+  // Full-text search. Static path — Fastify routes it ahead of /v1/notes/:id.
+  app.get('/v1/notes/search', guarded, (req) =>
+    tenant(req, async (ctx) => {
+      requireScope(ctx, 'notes:read');
+      const q = (req.query as { q?: string }).q ?? '';
+      return { query: q, results: await searchService.searchNotes(ctx, q) };
+    }),
+  );
+
+  app.get('/v1/tags', guarded, (req) =>
+    tenant(req, async (ctx) => {
+      requireScope(ctx, 'notes:read');
+      return { tags: await searchService.listTags(ctx) };
     }),
   );
 

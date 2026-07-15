@@ -28,7 +28,14 @@ function enqueue(mutation: SyncMutation): void {
 
 // ── Local mutations (optimistic) ─────────────────────────────────────────────
 
-export function createNoteLocal(input: { title: string; bodyMd: string; folder?: string | null }): Note {
+type NotePatch = { title?: string; bodyMd?: string; folder?: string | null; tags?: string[] };
+
+export function createNoteLocal(input: {
+  title: string;
+  bodyMd: string;
+  folder?: string | null;
+  tags?: string[];
+}): Note {
   const session = store$.session.get();
   const id = uuid();
   const note: Note = {
@@ -37,6 +44,7 @@ export function createNoteLocal(input: { title: string; bodyMd: string; folder?:
     title: input.title,
     bodyMd: input.bodyMd,
     folder: input.folder ?? null,
+    tags: input.tags ?? [],
     version: 0, // 0 => created locally, not yet acknowledged by the server
     createdAt: nowIso(),
     updatedAt: nowIso(),
@@ -46,13 +54,13 @@ export function createNoteLocal(input: { title: string; bodyMd: string; folder?:
   enqueue({
     opId: uuid(),
     type: 'upsert',
-    note: { id, title: note.title, bodyMd: note.bodyMd, folder: note.folder },
+    note: { id, title: note.title, bodyMd: note.bodyMd, folder: note.folder, tags: note.tags },
     baseVersion: 0,
   });
   return note;
 }
 
-export function updateNoteLocal(id: string, patch: { title?: string; bodyMd?: string; folder?: string | null }): void {
+export function updateNoteLocal(id: string, patch: NotePatch): void {
   const current = store$.notes[id].get();
   if (!current) return;
   const next: Note = {
@@ -60,13 +68,14 @@ export function updateNoteLocal(id: string, patch: { title?: string; bodyMd?: st
     title: patch.title ?? current.title,
     bodyMd: patch.bodyMd ?? current.bodyMd,
     folder: patch.folder === undefined ? current.folder : patch.folder,
+    tags: patch.tags ?? current.tags,
     updatedAt: nowIso(),
   };
   store$.notes[id].set(next);
   enqueue({
     opId: uuid(),
     type: 'upsert',
-    note: { id, title: next.title, bodyMd: next.bodyMd, folder: next.folder },
+    note: { id, title: next.title, bodyMd: next.bodyMd, folder: next.folder, tags: next.tags },
     baseVersion: current.version,
   });
 }
@@ -78,7 +87,7 @@ export function deleteNoteLocal(id: string): void {
   enqueue({
     opId: uuid(),
     type: 'delete',
-    note: { id, title: current.title, bodyMd: current.bodyMd, folder: current.folder },
+    note: { id, title: current.title, bodyMd: current.bodyMd, folder: current.folder, tags: current.tags },
     baseVersion: current.version,
   });
 }

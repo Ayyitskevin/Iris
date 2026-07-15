@@ -1,33 +1,92 @@
-import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useEffect, useState } from 'react';
+import { FlatList, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { router } from 'expo-router';
+import type { Note } from '@iris/shared';
 import { Button, Muted, Screen } from '../../../src/components/ui';
 import { useObs } from '../../../src/state/hooks';
-import { selectVisibleNotes, store$ } from '../../../src/state/store';
+import { selectTags, selectVisibleNotes, store$ } from '../../../src/state/store';
 import { createNoteLocal } from '../../../src/sync/manager';
+import { api } from '../../../src/api';
 import { theme } from '../../../src/theme';
 
 export default function NotesList() {
-  const notes = useObs(selectVisibleNotes);
+  const allNotes = useObs(selectVisibleNotes);
+  const tags = useObs(selectTags);
   const status = useObs(() => store$.status.get());
   const gated = useObs(() => store$.syncGated.get());
   const pending = useObs(() => store$.outbox.get().length);
 
+  const [query, setQuery] = useState('');
+  const [activeTag, setActiveTag] = useState<string | null>(null);
+  const [results, setResults] = useState<Note[] | null>(null); // null = not searching
+
+  // Debounced full-text search against the server, with an offline local fallback.
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) {
+      setResults(null);
+      return;
+    }
+    const handle = setTimeout(async () => {
+      try {
+        const res = await api.searchNotes(q);
+        setResults(res.results.map((r) => r.note));
+      } catch {
+        const lc = q.toLowerCase();
+        setResults(
+          selectVisibleNotes().filter((n) => `${n.title} ${n.bodyMd}`.toLowerCase().includes(lc)),
+        );
+      }
+    }, 250);
+    return () => clearTimeout(handle);
+  }, [query]);
+
+  const searching = results !== null;
+  const shown = searching
+    ? results!
+    : activeTag
+      ? allNotes.filter((n) => n.tags.includes(activeTag))
+      : allNotes;
+
   function onNew() {
-    const note = createNoteLocal({ title: '', bodyMd: '' });
+    const note = createNoteLocal({ title: '', bodyMd: '', tags: activeTag ? [activeTag] : [] });
     router.push(`/notes/${note.id}`);
   }
 
   return (
     <Screen>
       <View style={styles.header}>
-        <Text style={styles.count}>
-          {notes.length} note{notes.length === 1 ? '' : 's'}
-        </Text>
+        <Text style={styles.count}>Notes</Text>
         <Text style={styles.sync}>
           {gated ? '🔒 sync gated' : status === 'syncing' ? 'syncing…' : status === 'offline' ? 'offline' : 'synced'}
           {pending > 0 ? ` · ${pending} pending` : ''}
         </Text>
       </View>
+
+      <TextInput
+        style={styles.search}
+        placeholder="Search notes…"
+        placeholderTextColor={theme.colors.textDim}
+        value={query}
+        onChangeText={setQuery}
+        autoCapitalize="none"
+        returnKeyType="search"
+      />
+
+      {!searching && tags.length > 0 ? (
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chips} contentContainerStyle={{ gap: theme.space(2) }}>
+          {tags.map(({ tag, count }) => {
+            const on = activeTag === tag;
+            return (
+              <Pressable key={tag} onPress={() => setActiveTag(on ? null : tag)} style={[styles.chip, on && styles.chipOn]}>
+                <Text style={[styles.chipText, on && styles.chipTextOn]}>
+                  #{tag} {count}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+      ) : null}
 
       {gated ? (
         <Text style={styles.gateBanner}>
@@ -36,10 +95,14 @@ export default function NotesList() {
       ) : null}
 
       <FlatList
-        data={notes}
+        data={shown}
         keyExtractor={(n) => n.id}
         ItemSeparatorComponent={() => <View style={{ height: theme.space(2) }} />}
-        ListEmptyComponent={<Muted>No notes yet. Tap “New note” to capture something.</Muted>}
+        ListEmptyComponent={
+          <Muted>
+            {searching ? 'No matches.' : activeTag ? `No notes tagged #${activeTag}.` : 'No notes yet. Tap “New note”.'}
+          </Muted>
+        }
         renderItem={({ item }) => (
           <Pressable style={styles.row} onPress={() => router.push(`/notes/${item.id}`)}>
             <Text style={styles.rowTitle} numberOfLines={1}>
@@ -49,6 +112,7 @@ export default function NotesList() {
               {item.bodyMd || 'No content'}
             </Text>
             <Text style={styles.rowMeta}>
+              {item.tags.length ? item.tags.map((t) => `#${t}`).join(' ') + ' · ' : ''}
               {item.folder ? `${item.folder} · ` : ''}v{item.version}
               {item.version === 0 ? ' (unsynced)' : ''}
             </Text>
@@ -65,9 +129,33 @@ export default function NotesList() {
 }
 
 const styles = StyleSheet.create({
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: theme.space(3) },
-  count: { color: theme.colors.text, fontSize: 20, fontWeight: '700' },
+  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: theme.space(2) },
+  count: { color: theme.colors.text, fontSize: 22, fontWeight: '700' },
   sync: { color: theme.colors.textDim, fontSize: 13 },
+  search: {
+    backgroundColor: theme.colors.surface,
+    borderColor: theme.colors.border,
+    borderWidth: 1,
+    borderRadius: theme.radius,
+    color: theme.colors.text,
+    paddingHorizontal: theme.space(3),
+    paddingVertical: theme.space(2),
+    fontSize: 15,
+    marginBottom: theme.space(2),
+  },
+  chips: { marginBottom: theme.space(2), maxHeight: 40 },
+  chip: {
+    borderColor: theme.colors.border,
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: theme.space(3),
+    paddingVertical: theme.space(1),
+    height: 32,
+    justifyContent: 'center',
+  },
+  chipOn: { backgroundColor: theme.colors.accentDim, borderColor: theme.colors.accent },
+  chipText: { color: theme.colors.textDim, fontSize: 13 },
+  chipTextOn: { color: theme.colors.text },
   gateBanner: {
     color: theme.colors.accent,
     backgroundColor: theme.colors.surfaceAlt,
