@@ -18,6 +18,7 @@ import type { Ctx } from '../context';
 import { serializeNote } from '../serialize';
 import { loadNote, recordVersionAndActivity } from './note-write';
 import { requireRegisteredDevice } from './devices';
+import { normalizeTags } from './notes';
 
 const PAGE = 500;
 
@@ -94,6 +95,7 @@ async function applyUpsert(ctx: Ctx, m: SyncMutation): Promise<ApplyResult> {
         title: m.note.title,
         bodyMd: m.note.bodyMd,
         folder: m.note.folder,
+        tags: normalizeTags(m.note.tags),
         version: 1,
       })
       .returning();
@@ -110,6 +112,7 @@ async function applyUpsert(ctx: Ctx, m: SyncMutation): Promise<ApplyResult> {
       title: m.note.title,
       bodyMd: m.note.bodyMd,
       folder: m.note.folder,
+      tags: normalizeTags(m.note.tags),
       version: existing.version + 1,
       deletedAt: null,
       updatedAt: new Date(),

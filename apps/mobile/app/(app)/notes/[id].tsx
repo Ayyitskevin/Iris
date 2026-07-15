@@ -14,11 +14,32 @@ export default function NoteEditor() {
   const note = useObs(() => (id ? store$.notes[id].get() : undefined));
   const conflict = useObs(() => store$.conflictNoteId.get() === id);
   const [versions, setVersions] = useState<NoteVersion[] | null>(null);
+  const [tagsText, setTagsText] = useState('');
 
   useEffect(() => {
     // Best-effort: pull the latest server state for this note when opening.
     void sync();
   }, [id]);
+
+  // Seed the tags input once the note is available (keyed on note id, not tags, so
+  // the field doesn't fight the user's typing).
+  useEffect(() => {
+    // Seed only when the note identity changes, not on every tag edit.
+    if (note) setTagsText(note.tags.join(', '));
+  }, [note?.id]);
+
+  function commitTags() {
+    if (!id) return;
+    const parsed = [
+      ...new Set(
+        tagsText
+          .split(',')
+          .map((s) => s.trim().toLowerCase())
+          .filter(Boolean),
+      ),
+    ];
+    updateNoteLocal(id, { tags: parsed });
+  }
 
   if (!id || !note) {
     return (
@@ -73,6 +94,17 @@ export default function NoteEditor() {
         {note.version === 0 ? ' (unsynced)' : ''} · Markdown
       </Text>
 
+      <TextInput
+        style={styles.tags}
+        placeholder="tags, comma, separated"
+        placeholderTextColor={theme.colors.textDim}
+        value={tagsText}
+        onChangeText={setTagsText}
+        onBlur={commitTags}
+        onSubmitEditing={commitTags}
+        autoCapitalize="none"
+      />
+
       {/* The editor is a plain view over Markdown — no proprietary block tree (pillar #1). */}
       <TextInput
         style={styles.body}
@@ -122,6 +154,14 @@ const styles = StyleSheet.create({
   },
   title: { color: theme.colors.text, fontSize: 24, fontWeight: '700', paddingVertical: theme.space(2) },
   meta: { color: theme.colors.textDim, fontSize: 12, marginBottom: theme.space(3) },
+  tags: {
+    color: theme.colors.accent,
+    fontSize: 14,
+    paddingVertical: theme.space(2),
+    marginBottom: theme.space(2),
+    borderBottomColor: theme.colors.border,
+    borderBottomWidth: 1,
+  },
   body: {
     color: theme.colors.text,
     fontSize: 16,

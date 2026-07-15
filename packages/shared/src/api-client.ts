@@ -17,11 +17,13 @@ import type {
   NoteVersionListResponse,
   RegisterDeviceRequest,
   RestoreVersionRequest,
+  SearchResponse,
   SignInRequest,
   SignUpRequest,
   SyncChangesResponse,
   SyncPushRequest,
   SyncPushResponse,
+  TagListResponse,
   UndoResponse,
   UpdateNoteRequest,
 } from './schemas';
@@ -103,7 +105,14 @@ export function createApiClient(options: ApiClientOptions) {
     me: () => request<AuthResponse>('GET', '/v1/auth/me'),
 
     // --- Notes ---
-    listNotes: () => request<NoteListResponse>('GET', '/v1/notes'),
+    listNotes: (tag?: string) =>
+      request<NoteListResponse>(
+        'GET',
+        tag ? `/v1/notes?tag=${encodeURIComponent(tag)}` : '/v1/notes',
+      ),
+    searchNotes: (q: string) =>
+      request<SearchResponse>('GET', `/v1/notes/search?q=${encodeURIComponent(q)}`),
+    listTags: () => request<TagListResponse>('GET', '/v1/tags'),
     getNote: (id: string) => request<{ note: Note }>('GET', `/v1/notes/${id}`),
     createNote: (b: CreateNoteRequest) => request<{ note: Note }>('POST', '/v1/notes', b),
     updateNote: (id: string, b: UpdateNoteRequest) =>

@@ -62,10 +62,15 @@ export const notes = pgTable(
     title: text('title').notNull().default(''),
     bodyMd: text('body_md').notNull().default(''),
     folder: text('folder'),
+    // Organizational primitive alongside folders (phase 2). jsonb string array.
+    tags: jsonb('tags').$type<string[]>().notNull().default([]),
     version: integer('version').notNull().default(1),
     createdAt: createdAt(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     deletedAt: timestamp('deleted_at', { withTimezone: true }),
+    // NOTE: a generated `search_vector tsvector` column also exists on this table
+    // (migration 0002) for full-text search. It is DB-managed — never inserted or
+    // selected through Drizzle — so it is deliberately not modeled here.
   },
   // Drives the sync change-feed cursor (updated_at, id). See ADR-005.
   (t) => [index('notes_sync_idx').on(t.workspaceId, t.updatedAt, t.id)],
@@ -84,6 +89,7 @@ export const noteVersions = pgTable(
     version: integer('version').notNull(),
     title: text('title').notNull(),
     bodyMd: text('body_md').notNull(),
+    tags: jsonb('tags').$type<string[]>().notNull().default([]),
     authorType: text('author_type').notNull(),
     authorId: uuid('author_id').notNull(),
     authorName: text('author_name').notNull(),

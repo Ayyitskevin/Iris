@@ -67,6 +67,8 @@ export const Note = z.object({
   title: z.string(),
   bodyMd: z.string(),
   folder: z.string().nullable(),
+  /** Free-form tags — an organizational primitive alongside folders (phase 2). */
+  tags: z.array(z.string()),
   /** Monotonic per-note version. Bumped on every save; matches the latest NoteVersion. */
   version: z.number().int().nonnegative(),
   createdAt: z.string(),
@@ -83,6 +85,7 @@ export const NoteVersion = z.object({
   version: z.number().int().nonnegative(),
   title: z.string(),
   bodyMd: z.string(),
+  tags: z.array(z.string()),
   authorType: ActorType,
   authorId: z.string(),
   authorName: z.string(),
@@ -174,6 +177,7 @@ export const CreateNoteRequest = z.object({
   title: z.string().max(500).default(''),
   bodyMd: z.string().default(''),
   folder: z.string().max(500).nullish(),
+  tags: z.array(z.string().min(1).max(80)).max(50).default([]),
   /** Optional client-supplied id so local-first creates keep a stable identity. */
   id: z.string().optional(),
 });
@@ -183,6 +187,7 @@ export const UpdateNoteRequest = z.object({
   title: z.string().max(500).optional(),
   bodyMd: z.string().optional(),
   folder: z.string().max(500).nullish(),
+  tags: z.array(z.string().min(1).max(80)).max(50).optional(),
   /**
    * The version the edit was based on. If it doesn't match the server's current
    * version, the update is a conflict (HTTP 409) and is surfaced, never dropped.
@@ -205,6 +210,35 @@ export const RestoreVersionRequest = z.object({
   versionId: z.string(),
 });
 export type RestoreVersionRequest = z.infer<typeof RestoreVersionRequest>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tags & search (phase 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A tag plus how many live notes carry it, for the workspace's tag list. */
+export const TagSummary = z.object({
+  tag: z.string(),
+  count: z.number().int().nonnegative(),
+});
+export type TagSummary = z.infer<typeof TagSummary>;
+
+export const TagListResponse = z.object({
+  tags: z.array(TagSummary),
+});
+export type TagListResponse = z.infer<typeof TagListResponse>;
+
+/** A search hit: the note plus its relevance rank (higher = better). */
+export const SearchHit = z.object({
+  note: Note,
+  rank: z.number(),
+});
+export type SearchHit = z.infer<typeof SearchHit>;
+
+export const SearchResponse = z.object({
+  query: z.string(),
+  results: z.array(SearchHit),
+});
+export type SearchResponse = z.infer<typeof SearchResponse>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Agents
@@ -266,6 +300,7 @@ export const SyncMutation = z.object({
     title: z.string(),
     bodyMd: z.string(),
     folder: z.string().nullable(),
+    tags: z.array(z.string()).default([]),
   }),
   /** The version this mutation was derived from (0 for a brand-new note). */
   baseVersion: z.number().int().nonnegative(),
