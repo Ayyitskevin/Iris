@@ -13,7 +13,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "pnpm --filter @iris/api run test",
+    "test": "pnpm --filter @iris/api --filter @iris/mobile run test",
     "dev:api": "pnpm --filter @iris/api run dev",
     "dev:mobile": "pnpm --filter @iris/mobile run start",
     "db:migrate": "pnpm --filter @iris/api run db:migrate",

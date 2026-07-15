@@ -275,6 +275,36 @@ through the same `recordVersionAndActivity` choke point, and two new read routes
 
 ---
 
+## ADR-011 — Lossless reconciliation contract before runtime integration
+
+**Accepted as a pure contract; runtime integration held.**
+
+The first client loop takes an outbox snapshot, awaits the network, and then clears the
+current outbox. An edit created during that await can therefore be erased by an older
+acknowledgement. Its single conflict marker also cannot retain both sides of multiple
+independent conflicts.
+
+`apps/mobile/src/sync/reconcile.ts` is a side-effect-free contract for the replacement:
+
+- only an acknowledged `opId` is removed;
+- a newer operation for the same note is preserved and rebased;
+- each conflict retains the newest local mutation and server head independently; and
+- every pull page is drained, with a fail-loud guard for a stalled cursor.
+
+Focused mobile tests encode those invariants without mutating the application store or
+calling the network. The module is intentionally not imported by the production sync
+manager yet. Runtime wiring requires a separately reviewed session/workspace ownership
+fence plus delayed push, pull, sign-out, and account-switch concurrency tests. Until that
+gate lands, this ADR proves the reconciliation behavior but does not claim the app uses it.
+
+Before release, Sync v2 must also replace the wall-clock cursor with a
+database-monotonic cursor, bind server idempotency records to a request fingerprint, and
+use a generic resource envelope so projects and tasks do not require a second sync
+engine. Native resources and the outbox must move from the size-limited SecureStore blob
+into transactional SQLite while credentials remain in the OS keystore.
+
+---
+
 ## Summary: the shape these decisions produce
 
 One TypeScript monorepo → one Fastify service → one Postgres (PGlite locally). Auth,

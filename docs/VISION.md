@@ -74,6 +74,25 @@ comparison point.
 - **Honest when it can't** — conflicts are surfaced, never silently dropped. Iris would
   rather show you two versions and ask than lose a sentence you wrote.
 
+## The sync wedge is the beginning, not the ceiling
+
+Notes and trustworthy cross-device sync are the entry point. The full product is a
+single operator graph that replaces the parts of Obsidian, Notion, Jira, and Confluence
+that one person actually needs:
+
+- **Knowledge** — Markdown pages, spaces, attachments, typed links/backlinks, search, and
+  portable import/export.
+- **Work** — projects and tasks with status, priority, due dates, dependencies, and one
+  accountable human-or-agent assignee.
+- **Agent control** — durable runs, bounded context, approvals, artifacts, lineage, and a
+  review inbox. Activity is evidence of what happened; it is not allowed to masquerade
+  as liveness or ownership.
+
+These are views over one connected, local-first data model—not four mini-products taped
+together. Iris is not chasing enterprise team administration or feature-count parity.
+It is compressing a solo operator's knowledge, execution, and agent supervision into one
+attention-efficient mobile surface.
+
 ## What "done" feels like
 
 A new user installs Iris on their phone, signs up, and lands in *their own* isolated

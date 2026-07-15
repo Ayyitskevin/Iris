@@ -37,24 +37,37 @@ These were named as out of scope and are staying out until the foundation is pro
 - **Phase 2 — tags + full-text search** (ADR-010): versioned `jsonb` tags with list/filter,
   and ranked Postgres FTS over a generated `tsvector` column. Client: search bar (server FTS
   + offline fallback) and tag chips/input.
+- **Phase 2.1a — lossless reconciliation contract** (ADR-011): a pure client kernel and
+  focused tests encode exact operation acknowledgement, in-flight edit rebasing,
+  multi-conflict retention, and complete pull pagination. Runtime integration is
+  intentionally held behind the reviewed session/workspace isolation gate.
 
 ## Near-term follow-ups (next things)
 
-1. **Managed auth provider** wired for real (Clerk or Supabase) + password reset + OAuth +
+1. **Session/workspace isolation gate**: partition owner state and bind each sync cycle to
+   one immutable session/workspace before applying delayed responses. This requires its
+   own security review and concurrency coverage.
+2. **Sync v2 + transactional local repository**: monotonic database cursor,
+   request-bound server idempotency, generic resource envelopes, SQLite on native,
+   IndexedDB on web, transactional note+outbox writes, and a recoverable v1 migration.
+   The current SecureStore blob and timestamp cursor are explicit release blockers.
+3. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
+   accountable human-or-agent assignee, reversible writes, and the same sync resource
+   envelope. Keep activity, check-in, delegation, and durable claim/run semantics
+   distinct.
+4. **Managed auth provider** wired for real (Clerk or Supabase) + password reset + OAuth +
    email verification — these are the managed provider's job, not `LocalAuthProvider`'s.
-2. **Attachment storage** to object storage (S3/R2) with the same export guarantee;
+5. **Attachment storage** to object storage (S3/R2) with the same export guarantee;
    foundation stores attachment metadata and includes files in export, but a production
    blob store + upload flow is a follow-up.
-3. **Harden the local-first sync**: batching/backoff tuning, tombstone GC, large-workspace
-   initial-sync pagination, and per-field (not per-note) conflict surfacing for long notes.
-4. **Rate limiting** for agent tokens beyond the coarse fixed-window limiter (per-scope
+6. **Rate limiting** for agent tokens beyond the coarse fixed-window limiter (per-scope
    budgets, sliding window, 429 semantics).
-5. **Stripe hardening**: proration, plan changes, dunning, customer portal, tax.
-6. **EAS Build + store submission** pipeline and OTA update channels.
-7. **Editor upgrades**: live Markdown preview, slash-menu, image paste — still emitting
+7. **Stripe hardening**: proration, plan changes, dunning, customer portal, tax.
+8. **EAS Build + store submission** pipeline and OTA update channels.
+9. **Editor upgrades**: live Markdown preview, slash-menu, image paste — still emitting
    plain Markdown.
-8. **Search/tags upgrades**: tag rename/merge, search snippets & highlighting, filter by
-   tag *and* query together, per-field ranking weights.
+10. **Search/tags upgrades**: tag rename/merge, search snippets & highlighting, filter by
+    tag *and* query together, per-field ranking weights.
 
 ## Tempted-but-parked ideas (write here, don't build)
 
@@ -63,3 +76,15 @@ These were named as out of scope and are staying out until the foundation is pro
   extension of the activity log; parked until the single-action feed is proven in use.
 - Per-workspace encryption-at-rest keys for a stronger "you own your data" story.
 - Webhooks so agents can *subscribe* to note changes (today they poll the change-feed).
+
+## Product horizon after Sync v2
+
+1. **Connected work graph** — projects/tasks, typed links between work and knowledge,
+   dependencies, saved views, and a focused mobile Today/Review surface.
+2. **Knowledge graph** — spaces, hierarchical pages, backlinks, attachments, and
+   Obsidian/Notion import through a versioned dry-run/manifest pipeline.
+3. **Agent control plane** — durable run state, claim/lease semantics, approvals,
+   cancellation/resume, bounded context packets, outputs, and lineage.
+
+Each domain must inherit the same ownership guarantees: local-first writes, attributed
+actors, reversible history, bounded permissions, and full portable export.

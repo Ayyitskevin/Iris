@@ -92,7 +92,7 @@ curl -s localhost:4000/v1/activity/<ACTIVITY_ID>/undo -X POST -H "authorization:
 | Command | What it does |
 | --- | --- |
 | `pnpm dev:api` | Run the API (watch mode) on PGlite |
-| `pnpm test` | Run the API test suite (Vitest) |
+| `pnpm test` | Run the API and mobile test suites (Vitest) |
 | `pnpm typecheck` | `tsc --noEmit` across all packages |
 | `pnpm lint` | ESLint across the monorepo |
 | `pnpm format` | Prettier write |
@@ -105,5 +105,8 @@ curl -s localhost:4000/v1/activity/<ACTIVITY_ID>/undo -X POST -H "authorization:
 See the bottom of [`docs/DECISIONS.md`](docs/DECISIONS.md) and
 [`docs/ROADMAP.md`](docs/ROADMAP.md). The backend and its Definition-of-Done tests run and
 pass in-repo. Auth ships a **local** provider behind a managed-provider seam (ADR-004);
-Stripe ships full plumbing tested with a fake client (ADR-007). Device/simulator app runs
-require the standard Expo/EAS toolchain and are a documented follow-up.
+Stripe ships full plumbing tested with a fake client (ADR-007). The mobile suite includes
+a pure lossless-reconciliation contract; production wiring remains intentionally held
+behind reviewed session/workspace isolation and concurrency coverage (ADR-011).
+Device/simulator app runs require the standard Expo/EAS toolchain and are a documented
+follow-up.
