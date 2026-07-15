@@ -145,6 +145,99 @@ describe('push reconciliation', () => {
     expect(result.notes[firstId]).toEqual(firstServer);
     expect(result.notes[secondId]).toEqual(secondServer);
   });
+
+  it('rejects an applied upsert that omits its authoritative note', () => {
+    const sent = mutation('op-sent', 'draft');
+
+    expect(() =>
+      reconcilePush(
+        { notes: { [sent.note.id]: note() }, outbox: [sent], conflicts: {} },
+        [sent],
+        { applied: [{ opId: sent.opId }], conflicts: [] },
+        detectedAt,
+      ),
+    ).toThrow('omitted its authoritative note');
+  });
+
+  it('rejects a same-workspace acknowledgement for another note', () => {
+    const sent = mutation('op-sent', 'draft');
+    const otherId = '33333333-3333-4333-8333-333333333333';
+
+    expect(() =>
+      reconcilePush(
+        { notes: { [sent.note.id]: note() }, outbox: [sent], conflicts: {} },
+        [sent],
+        {
+          applied: [{ opId: sent.opId, note: note({ id: otherId, version: 2 }) }],
+          conflicts: [],
+        },
+        detectedAt,
+      ),
+    ).toThrow('did not match its operation');
+  });
+
+  it('rejects applied notes with semantics opposite to the sent mutation', () => {
+    const upsert = mutation('op-upsert', 'draft');
+    const deletion: SyncMutation = { ...mutation('op-delete', 'delete'), type: 'delete' };
+
+    expect(() =>
+      reconcilePush(
+        { notes: {}, outbox: [upsert], conflicts: {} },
+        [upsert],
+        {
+          applied: [
+            {
+              opId: upsert.opId,
+              note: note({ version: 2, deletedAt: '2026-07-15T12:00:00.000Z' }),
+            },
+          ],
+          conflicts: [],
+        },
+        detectedAt,
+      ),
+    ).toThrow('returned a deleted note');
+
+    expect(() =>
+      reconcilePush(
+        { notes: {}, outbox: [deletion], conflicts: {} },
+        [deletion],
+        { applied: [{ opId: deletion.opId, note: note({ version: 2 }) }], conflicts: [] },
+        detectedAt,
+      ),
+    ).toThrow('returned a live note');
+  });
+
+  it('rejects duplicate and missing operation results', () => {
+    const first = mutation('op-first', 'first');
+    const second = mutation('op-second', 'second', 1, '33333333-3333-4333-8333-333333333333');
+
+    expect(() =>
+      reconcilePush(
+        { notes: {}, outbox: [first, second], conflicts: {} },
+        [first, second],
+        {
+          applied: [{ opId: first.opId, note: note({ version: 2 }) }],
+          conflicts: [
+            {
+              opId: first.opId,
+              reason: 'version_mismatch',
+              serverNote: note({ version: 3 }),
+            },
+          ],
+        },
+        detectedAt,
+      ),
+    ).toThrow('repeated an operation result');
+
+    expect(() =>
+      reconcilePush(
+        { notes: {}, outbox: [first, second], conflicts: {} },
+        [first, second],
+        { applied: [{ opId: first.opId, note: note({ version: 2 }) }], conflicts: [] },
+        detectedAt,
+      ),
+    ).toThrow('omitted an operation result');
+  });
 });
 
 describe('pull pagination', () => {
@@ -177,5 +270,19 @@ describe('pull pagination', () => {
         () => undefined,
       ),
     ).rejects.toThrow('without advancing');
+  });
+
+  it('does not apply a nonempty final page whose cursor did not advance', async () => {
+    const applied: string[] = [];
+    await expect(
+      drainChangePages(
+        'stuck',
+        async () => ({ changes: [note()], cursor: 'stuck', hasMore: false }),
+        (page) => {
+          applied.push(page.cursor);
+        },
+      ),
+    ).rejects.toThrow('without advancing');
+    expect(applied).toEqual([]);
   });
 });

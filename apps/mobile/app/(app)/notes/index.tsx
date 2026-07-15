@@ -4,9 +4,14 @@ import { router } from 'expo-router';
 import type { Note } from '@iris/shared';
 import { Button, Muted, Screen } from '../../../src/components/ui';
 import { useObs } from '../../../src/state/hooks';
-import { selectTags, selectVisibleNotes, store$ } from '../../../src/state/store';
+import {
+  assertCurrentSession,
+  selectTags,
+  selectVisibleNotes,
+  store$,
+} from '../../../src/state/store';
 import { createNoteLocal } from '../../../src/sync/manager';
-import { api } from '../../../src/api';
+import { authenticatedRequest } from '../../../src/api';
 import { theme } from '../../../src/theme';
 
 export default function NotesList() {
@@ -15,23 +20,38 @@ export default function NotesList() {
   const status = useObs(() => store$.status.get());
   const gated = useObs(() => store$.syncGated.get());
   const pending = useObs(() => store$.outbox.get().length);
+  const conflictMap = useObs(() => store$.conflicts.get());
+  const ownerKey = useObs(() => store$.activeOwnerKey.get());
+  const conflicts = new Set(Object.keys(conflictMap));
 
   const [query, setQuery] = useState('');
   const [activeTag, setActiveTag] = useState<string | null>(null);
   const [results, setResults] = useState<Note[] | null>(null); // null = not searching
+  const [searchOwnerKey, setSearchOwnerKey] = useState(ownerKey);
+
+  useEffect(() => {
+    setQuery('');
+    setActiveTag(null);
+    setResults(null);
+    setSearchOwnerKey(ownerKey);
+  }, [ownerKey]);
 
   // Debounced full-text search against the server, with an offline local fallback.
   useEffect(() => {
+    if (searchOwnerKey !== ownerKey) return;
     const q = query.trim();
     if (!q) {
       setResults(null);
       return;
     }
+    const ownerAtStart = ownerKey;
     const handle = setTimeout(async () => {
       try {
-        const res = await api.searchNotes(q);
-        setResults(res.results.map((r) => r.note));
+        const { lease, value } = await authenticatedRequest((api) => api.searchNotes(q));
+        assertCurrentSession(lease);
+        setResults(value.results.map((result) => result.note));
       } catch {
+        if (store$.activeOwnerKey.get() !== ownerAtStart) return;
         const lc = q.toLowerCase();
         setResults(
           selectVisibleNotes().filter((n) => `${n.title} ${n.bodyMd}`.toLowerCase().includes(lc)),
@@ -39,7 +59,7 @@ export default function NotesList() {
       }
     }, 250);
     return () => clearTimeout(handle);
-  }, [query]);
+  }, [ownerKey, query, searchOwnerKey]);
 
   const searching = results !== null;
   const shown = searching
@@ -58,8 +78,19 @@ export default function NotesList() {
       <View style={styles.header}>
         <Text style={styles.count}>Notes</Text>
         <Text style={styles.sync}>
-          {gated ? '🔒 sync gated' : status === 'syncing' ? 'syncing…' : status === 'offline' ? 'offline' : 'synced'}
+          {gated
+            ? '🔒 sync gated'
+            : status === 'syncing'
+              ? 'syncing…'
+              : status === 'offline'
+                ? 'offline'
+                : status === 'error'
+                  ? 'sync error'
+                  : status === 'auth-required'
+                    ? 'sign in required'
+                    : 'synced'}
           {pending > 0 ? ` · ${pending} pending` : ''}
+          {conflicts.size > 0 ? ` · ${conflicts.size} conflicts` : ''}
         </Text>
       </View>
 
@@ -74,11 +105,20 @@ export default function NotesList() {
       />
 
       {!searching && tags.length > 0 ? (
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chips} contentContainerStyle={{ gap: theme.space(2) }}>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={styles.chips}
+          contentContainerStyle={{ gap: theme.space(2) }}
+        >
           {tags.map(({ tag, count }) => {
             const on = activeTag === tag;
             return (
-              <Pressable key={tag} onPress={() => setActiveTag(on ? null : tag)} style={[styles.chip, on && styles.chipOn]}>
+              <Pressable
+                key={tag}
+                onPress={() => setActiveTag(on ? null : tag)}
+                style={[styles.chip, on && styles.chipOn]}
+              >
                 <Text style={[styles.chipText, on && styles.chipTextOn]}>
                   #{tag} {count}
                 </Text>
@@ -100,11 +140,18 @@ export default function NotesList() {
         ItemSeparatorComponent={() => <View style={{ height: theme.space(2) }} />}
         ListEmptyComponent={
           <Muted>
-            {searching ? 'No matches.' : activeTag ? `No notes tagged #${activeTag}.` : 'No notes yet. Tap “New note”.'}
+            {searching
+              ? 'No matches.'
+              : activeTag
+                ? `No notes tagged #${activeTag}.`
+                : 'No notes yet. Tap “New note”.'}
           </Muted>
         }
         renderItem={({ item }) => (
-          <Pressable style={styles.row} onPress={() => router.push(`/notes/${item.id}`)}>
+          <Pressable
+            style={[styles.row, conflicts.has(item.id) && styles.rowConflict]}
+            onPress={() => router.push(`/notes/${item.id}`)}
+          >
             <Text style={styles.rowTitle} numberOfLines={1}>
               {item.title || 'Untitled'}
             </Text>
@@ -112,6 +159,7 @@ export default function NotesList() {
               {item.bodyMd || 'No content'}
             </Text>
             <Text style={styles.rowMeta}>
+              {conflicts.has(item.id) ? '⚠ needs review · ' : ''}
               {item.tags.length ? item.tags.map((t) => `#${t}`).join(' ') + ' · ' : ''}
               {item.folder ? `${item.folder} · ` : ''}v{item.version}
               {item.version === 0 ? ' (unsynced)' : ''}
@@ -129,7 +177,12 @@ export default function NotesList() {
 }
 
 const styles = StyleSheet.create({
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: theme.space(2) },
+  header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: theme.space(2),
+  },
   count: { color: theme.colors.text, fontSize: 22, fontWeight: '700' },
   sync: { color: theme.colors.textDim, fontSize: 13 },
   search: {
@@ -171,8 +224,14 @@ const styles = StyleSheet.create({
     borderRadius: theme.radius,
     padding: theme.space(4),
   },
+  rowConflict: { borderColor: theme.colors.danger },
   rowTitle: { color: theme.colors.text, fontSize: 17, fontWeight: '600' },
   rowPreview: { color: theme.colors.textDim, fontSize: 14, marginTop: theme.space(1) },
   rowMeta: { color: theme.colors.textDim, fontSize: 12, marginTop: theme.space(2) },
-  footer: { position: 'absolute', left: theme.space(4), right: theme.space(4), bottom: theme.space(4) },
+  footer: {
+    position: 'absolute',
+    left: theme.space(4),
+    right: theme.space(4),
+    bottom: theme.space(4),
+  },
 });

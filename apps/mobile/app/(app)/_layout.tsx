@@ -6,8 +6,14 @@ import { theme } from '../../src/theme';
 
 export default function AppLayout() {
   const signedIn = useObs(() => store$.session.get() !== null);
-  if (!signedIn) return <Redirect href="/sign-in" />;
+  const ownerKey = useObs(() => store$.activeOwnerKey.get());
+  const conflictCount = useObs(() => Object.keys(store$.conflicts.get()).length);
+  if (!signedIn || !ownerKey) return <Redirect href="/sign-in" />;
 
+  return <OwnerTabs key={ownerKey} conflictCount={conflictCount} />;
+}
+
+function OwnerTabs({ conflictCount }: { conflictCount: number }) {
   return (
     <Tabs
       screenOptions={{
@@ -20,6 +26,14 @@ export default function AppLayout() {
       <Tabs.Screen
         name="notes"
         options={{ title: 'Notes', tabBarIcon: ({ color }) => <Text style={{ color }}>✎</Text> }}
+      />
+      <Tabs.Screen
+        name="conflicts"
+        options={{
+          title: 'Review',
+          tabBarBadge: conflictCount || undefined,
+          tabBarIcon: ({ color }) => <Text style={{ color }}>⚠</Text>,
+        }}
       />
       <Tabs.Screen
         name="activity"

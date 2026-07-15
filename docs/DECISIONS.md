@@ -1,7 +1,7 @@
 # Iris — Architecture Decisions
 
 This is an append-only log of the load-bearing choices made while building the
-foundation. Each entry states the decision, the alternatives weighed, and *why* — so a
+foundation. Each entry states the decision, the alternatives weighed, and _why_ — so a
 future engineer can tell whether a new requirement should change the answer.
 
 Status legend: **Accepted** (in force), **Superseded**, **Proposed**.
@@ -14,8 +14,8 @@ Status legend: **Accepted** (in force), **Superseded**, **Proposed**.
 
 One pnpm workspace holds everything: `apps/api` (backend), `apps/mobile` (Expo client
 for iOS/Android/web), and `packages/shared` (zod schemas + typed API client used by
-both). One language (TypeScript) end to end so request/response types are *shared, not
-duplicated* — the client imports the exact schema the server validates against.
+both). One language (TypeScript) end to end so request/response types are _shared, not
+duplicated_ — the client imports the exact schema the server validates against.
 
 - **pnpm** workspaces with `node-linker=hoisted` (Metro + pnpm symlinks are still
   fussy; a hoisted layout avoids the known bundler resolution failures).
@@ -56,12 +56,12 @@ from the first migration, and Postgres RLS is the strongest primitive for that.
 
 **Driver strategy (two backends, one schema):**
 
-| Environment | Driver | Why |
-| --- | --- | --- |
-| production | `drizzle-orm/node-postgres` → managed Postgres | real cluster, connection pool |
+| Environment     | Driver                                              | Why                                                   |
+| --------------- | --------------------------------------------------- | ----------------------------------------------------- |
+| production      | `drizzle-orm/node-postgres` → managed Postgres      | real cluster, connection pool                         |
 | dev / test / CI | `drizzle-orm/pglite` → [PGlite](https://pglite.dev) | Postgres compiled to WASM, **in-process, zero infra** |
 
-PGlite runs the *actual Postgres engine* (same source, WASM build) including RLS,
+PGlite runs the _actual Postgres engine_ (same source, WASM build) including RLS,
 triggers, and transactions — so our tenant-isolation tests exercise real Postgres
 semantics without a running server, a Docker daemon, or CI service containers. The
 selection is automatic: `DATABASE_URL` present → node-postgres; absent → PGlite at
@@ -83,7 +83,7 @@ Two layers of defense:
 1. **Application layer.** Every tenant-owned table carries a non-null `workspace_id`.
    All data access goes through repository functions that take a `workspaceId` and filter
    by it; there is no query path that omits it. The authenticated principal (user session
-   *or* agent token) resolves to exactly one `workspace_id`, set per request.
+   _or_ agent token) resolves to exactly one `workspace_id`, set per request.
 2. **Database layer (defense in depth).** RLS policies on tenant tables gate every row by
    a `current_setting('app.current_workspace')` GUC that the request sets inside its
    transaction. Even a buggy query that forgets the `WHERE` clause returns nothing across
@@ -108,10 +108,10 @@ default and makes the entire foundation **runnable and testable offline, with ze
 external accounts or native build dependencies.**
 
 **Why we deviated from "managed provider now":** the Definition of Done requires that we
-*actually ran* the sign-up → note → sync → agent-undo flow — "'should work' is not
+_actually ran_ the sign-up → note → sync → agent-undo flow — "'should work' is not
 'works.'" Wiring Clerk/Supabase as the only auth path would make that flow un-runnable in
 this environment (no tenant keys, no hosted callback). So we shipped a working local
-provider *behind a seam* and left the managed provider as a drop-in.
+provider _behind a seam_ and left the managed provider as a drop-in.
 
 **The seam is the point.** `AuthProvider` is small and provider-shaped on purpose: a
 `ClerkAuthProvider` / `SupabaseAuthProvider` implements the same three methods and is
@@ -131,29 +131,29 @@ stays for tests and offline dev.
 
 ### Requirement
 
-Offline-first; per-user/per-workspace partitioned sync; works in **React Native *and*
+Offline-first; per-user/per-workspace partitioned sync; works in **React Native _and_
 web**; "conflicts are detected and surfaced, never silently dropped"; and — critically —
-must not force extra backend infrastructure, because ADR-006 commits us to *single
-service, single Postgres, one-command deploy.*
+must not force extra backend infrastructure, because ADR-006 commits us to _single
+service, single Postgres, one-command deploy._
 
 ### Candidates evaluated
 
-| Engine | Offline-first | RN + Web | Extra infra required | Verdict |
-| --- | --- | --- | --- | --- |
-| **Legend-State** | yes (observable + persistence plugins) | yes (MMKV/AsyncStorage on RN, IndexedDB on web) | **none** — sync transport is ours | **Chosen** |
-| WatermelonDB | yes (SQLite) | RN strong; web via LokiJS is weaker | none (custom sync endpoints) | Runner-up |
-| PowerSync | yes | yes | **yes** — hosted/sidecar sync service + Postgres replication | Rejected for foundation |
-| ElectricSQL | yes | yes | **yes** — Electric sync service in front of Postgres | Rejected for foundation |
+| Engine           | Offline-first                          | RN + Web                                        | Extra infra required                                         | Verdict                 |
+| ---------------- | -------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------ | ----------------------- |
+| **Legend-State** | yes (observable + persistence plugins) | yes (MMKV/AsyncStorage on RN, IndexedDB on web) | **none** — sync transport is ours                            | **Chosen**              |
+| WatermelonDB     | yes (SQLite)                           | RN strong; web via LokiJS is weaker             | none (custom sync endpoints)                                 | Runner-up               |
+| PowerSync        | yes                                    | yes                                             | **yes** — hosted/sidecar sync service + Postgres replication | Rejected for foundation |
+| ElectricSQL      | yes                                    | yes                                             | **yes** — Electric sync service in front of Postgres         | Rejected for foundation |
 
 ### Decision & rationale
 
-**Client: Legend-State** as the local-first layer — a fine-grained observable store with
-pluggable offline persistence (react-native-mmkv on device, IndexedDB on web). Local
-edits mutate the observable synchronously, so the editor never waits on the network.
-Legend-State's persistence + retry primitives give us the "instant, offline, reconciles
-later" behavior without us reimplementing an observable/persistence engine.
+**Client: Legend-State** as the local-first observable layer. Local edits mutate the
+observable synchronously, so the editor never waits on the network. The foundation
+currently persists owner replicas through a small SecureStore/localStorage adapter;
+transactional SQLite on native and IndexedDB on web are required before release (ADR-011
+and ROADMAP). Legend-State remains independent of that repository choice.
 
-**Server: a custom change-feed** — the sync *transport* is a small, boring REST protocol
+**Server: a custom change-feed** — the sync _transport_ is a small, boring REST protocol
 we own:
 
 - `GET /v1/sync/changes?since=<cursor>` — pull rows changed since a monotonic cursor
@@ -164,7 +164,7 @@ we own:
   server row. The client surfaces the conflict — it never silently overwrites.
 
 **Why not adopt a heavier engine.** PowerSync and ElectricSQL are excellent, but both
-introduce a *second piece of infrastructure* (a sync service, and in Electric's case
+introduce a _second piece of infrastructure_ (a sync service, and in Electric's case
 Postgres logical replication). That directly violates ADR-006's "no extra infra."
 WatermelonDB is the closest runner-up and would also work, but its web target (LokiJS)
 is the weakest of its adapters and it couples the client to a mirrored SQLite schema; for
@@ -176,7 +176,7 @@ concurrency with surfacing**: last writer must have seen the current version, or
 write is rejected and shown to the user. This is exactly the "detect and surface, never
 silently drop" the brief demands, without the complexity/opacity of CRDT merge for a
 single-operator product. If real-time multi-human co-editing ever becomes a goal (it is a
-stated non-goal), *that* is when a CRDT text type earns its keep — noted in ROADMAP.
+stated non-goal), _that_ is when a CRDT text type earns its keep — noted in ROADMAP.
 
 **Version note.** We pin Legend-State at **v2 stable** and use only its core primitives
 (`observable`, `observe`) for reactive local state, binding to React through
@@ -191,7 +191,7 @@ API is still stabilizing) is a low-risk, isolated change when it lands.
 
 **Accepted.** No microservices, no Kubernetes, no queue, no second datastore. The API is
 one Fastify process; state lives in one Postgres. Target platforms: Fly.io / Railway /
-Render. This constraint is *upstream* of ADR-005 (it is why we rejected PowerSync/Electric).
+Render. This constraint is _upstream_ of ADR-005 (it is why we rejected PowerSync/Electric).
 
 ---
 
@@ -206,7 +206,7 @@ workspace has an active subscription.
 
 Stripe plumbing (Checkout session creation, customer/subscription mapping, webhook →
 subscription state machine) is built and unit-tested with an injected fake Stripe client,
-so the *gate logic* is proven without live keys. Live test-mode requires
+so the _gate logic_ is proven without live keys. Live test-mode requires
 `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET`; see `.env.example` and ROADMAP.
 
 ---
@@ -222,7 +222,7 @@ foundation — one is enough; the other is a documented follow-up.
 **Every save writes a `note_versions` row** (immutable snapshot: body, title, author
 principal, timestamp, monotonically increasing `version`). The live `notes` row is a
 denormalized pointer to the current state for fast reads. This makes versioning
-*load-bearing for pillar #2* (reversibility) rather than a feature to add later:
+_load-bearing for pillar #2_ (reversibility) rather than a feature to add later:
 
 - Restore = write the old snapshot's content as a new version (history is never rewritten).
 - Undo of an agent action = restore the version that preceded it, logged as a compensating
@@ -238,7 +238,7 @@ denormalized pointer to the current state for fast reads. This makes versioning
 - **Token** = issued once, returned in plaintext exactly once, stored only as a scrypt
   hash. Carries **scopes** (`notes:read`, `notes:write`) and is **revocable** (soft
   delete + revoked_at). Presented as `Authorization: Bearer <token>`.
-- **Every write** (by a user *or* an agent) appends to `activity_log` (actor type + id,
+- **Every write** (by a user _or_ an agent) appends to `activity_log` (actor type + id,
   action, target note, resulting version, timestamp). The log is **append-only** — undo
   does not delete history, it appends a compensating action.
 - The **activity feed** screen reads this log; **undo** restores the pre-action version.
@@ -258,7 +258,7 @@ table because tags then travel with the note for free — through sync (part of 
 payload), export (frontmatter), and history — with no joins. Membership filtering uses the
 jsonb `?` operator, backed by a GIN index; the tag list is aggregated (small workspaces).
 Tags are normalized (trim / lowercase / de-dupe) at the service boundary so `Work` and
-` work ` collapse. Folders remain the primary org primitive; tags are orthogonal and
+`work` collapse. Folders remain the primary org primitive; tags are orthogonal and
 additive (they close the ROADMAP "tags" seam).
 
 **Search** is Postgres full-text search over a **generated, stored `tsvector` column**
@@ -275,9 +275,9 @@ through the same `recordVersionAndActivity` choke point, and two new read routes
 
 ---
 
-## ADR-011 — Lossless reconciliation contract before runtime integration
+## ADR-011 — Lossless reconciliation behind owner-bound session leases
 
-**Accepted as a pure contract; runtime integration held.**
+**Accepted and integrated.**
 
 The first client loop takes an outbox snapshot, awaits the network, and then clears the
 current outbox. An edit created during that await can therefore be erased by an older
@@ -291,17 +291,35 @@ independent conflicts.
 - each conflict retains the newest local mutation and server head independently; and
 - every pull page is drained, with a fail-loud guard for a stalled cursor.
 
-Focused mobile tests encode those invariants without mutating the application store or
-calling the network. The module is intentionally not imported by the production sync
-manager yet. Runtime wiring requires a separately reviewed session/workspace ownership
-fence plus delayed push, pull, sign-out, and account-switch concurrency tests. Until that
-gate lands, this ADR proves the reconciliation behavior but does not claim the app uses it.
+Runtime integration is permitted only behind the accompanying ownership fence:
+
+- credentials are persisted separately from replicas;
+- every replica is keyed by immutable workspace + user identity;
+- v1 migration preserves attributable known-owner drafts plus a token-free recovery copy,
+  while quarantining mixed or ownerless data and replacing the global cursor/device
+  identity with fresh owner-scoped values;
+- each sync cycle captures one immutable token, owner, device, and generation;
+- account transition aborts the old generation, and every network await is checked before
+  its response can mutate state;
+- voluntary sign-out commits a same-key, token-free tombstone before the UI reports
+  signed-out; a current 401 fences the UI immediately, then commits the same tombstone,
+  with temporary total storage failure surfaced distinctly and retried by the root loop;
+- current 401, billing gate, network failure, and stale cancellation are distinct states;
+  and
+- conflict decisions include the rendered owner and operation id, so stale UI callbacks
+  cannot resolve another account's draft.
+
+The production coordinator now imports this pure contract. Focused mobile tests cover its
+pure transforms plus delayed push and pull pages, sign-out, A-to-B switching, stale and
+current 401s, cursor isolation, cross-workspace response rejection, A-outbox/B-token
+separation, verified/quarantined recovery copies, storage failpoints, save ordering, and
+stale conflict decisions.
 
 Before release, Sync v2 must also replace the wall-clock cursor with a
 database-monotonic cursor, bind server idempotency records to a request fingerprint, and
 use a generic resource envelope so projects and tasks do not require a second sync
-engine. Native resources and the outbox must move from the size-limited SecureStore blob
-into transactional SQLite while credentials remain in the OS keystore.
+engine. Native resources and the outbox must move from the size-limited per-owner
+SecureStore value into transactional SQLite while credentials remain in the OS keystore.
 
 ---
 

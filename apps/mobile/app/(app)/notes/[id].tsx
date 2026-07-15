@@ -4,15 +4,29 @@ import { router, useLocalSearchParams } from 'expo-router';
 import type { NoteVersion } from '@iris/shared';
 import { Button, Muted } from '../../../src/components/ui';
 import { useObs } from '../../../src/state/hooks';
-import { store$ } from '../../../src/state/store';
-import { deleteNoteLocal, sync, updateNoteLocal } from '../../../src/sync/manager';
-import { api } from '../../../src/api';
+import {
+  assertCurrentSession,
+  isCurrentSession,
+  setStatusForLease,
+  store$,
+  type SessionLease,
+  updateReplicaForLease,
+} from '../../../src/state/store';
+import {
+  deleteNoteLocal,
+  keepLocalConflict,
+  sync,
+  updateNoteLocal,
+  useServerConflict,
+} from '../../../src/sync/manager';
+import { authenticatedRequest } from '../../../src/api';
 import { theme } from '../../../src/theme';
 
 export default function NoteEditor() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const note = useObs(() => (id ? store$.notes[id].get() : undefined));
-  const conflict = useObs(() => store$.conflictNoteId.get() === id);
+  const conflict = useObs(() => (id ? store$.conflicts.get()[id] : undefined));
+  const ownerKey = useObs(() => store$.activeOwnerKey.get());
   const [versions, setVersions] = useState<NoteVersion[] | null>(null);
   const [tagsText, setTagsText] = useState('');
 
@@ -26,7 +40,8 @@ export default function NoteEditor() {
   useEffect(() => {
     // Seed only when the note identity changes, not on every tag edit.
     if (note) setTagsText(note.tags.join(', '));
-  }, [note?.id]);
+    setVersions(null);
+  }, [note?.id, ownerKey]);
 
   function commitTags() {
     if (!id) return;
@@ -50,36 +65,76 @@ export default function NoteEditor() {
   }
 
   async function loadHistory() {
+    const ownerAtStart = ownerKey;
     try {
-      const res = await api.listVersions(id);
-      setVersions(res.versions);
+      const { lease, value } = await authenticatedRequest((api) => api.listVersions(id));
+      assertCurrentSession(lease);
+      setVersions(value.versions);
     } catch {
-      setVersions([]);
+      if (store$.activeOwnerKey.get() === ownerAtStart) setVersions([]);
     }
   }
 
   async function restore(versionId: string) {
+    if (conflict) return;
+    let restoreLease: SessionLease | null = null;
     try {
-      const res = await api.restoreVersion(id, { versionId });
-      store$.notes[id].set(res.note);
-      store$.conflictNoteId.set(null);
+      const { lease, value } = await authenticatedRequest((api) =>
+        api.restoreVersion(id, { versionId }),
+      );
+      restoreLease = lease;
+      await updateReplicaForLease(lease, (current) => ({
+        ...current,
+        notes: { ...current.notes, [id]: value.note },
+      }));
+      assertCurrentSession(lease);
       setVersions(null);
     } catch {
-      // surfaced via status
+      if (restoreLease && isCurrentSession(restoreLease)) {
+        setStatusForLease(restoreLease, 'error');
+      }
     }
   }
 
   function onDelete() {
-    deleteNoteLocal(id);
-    router.back();
+    if (deleteNoteLocal(id)) router.back();
   }
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={{ padding: theme.space(4) }}>
       {conflict ? (
-        <Text style={styles.conflict}>
-          This note changed elsewhere. The server version is shown below — re-apply your edit if needed.
-        </Text>
+        <View style={styles.conflict}>
+          <Text style={styles.conflictTitle}>This note changed elsewhere</Text>
+          <Text style={styles.conflictText}>
+            Your draft is retained in this account. Review it, then choose which version to keep.
+          </Text>
+          <Text style={styles.conflictPreview}>
+            {conflict.localMutation.type === 'delete'
+              ? 'Your pending change deleted this note.'
+              : (conflict.localMutation.note.title || 'Untitled') +
+                '\n' +
+                conflict.localMutation.note.bodyMd.slice(0, 240)}
+          </Text>
+          <View style={styles.conflictActions}>
+            <Button
+              label="Keep my edit"
+              onPress={() => {
+                if (ownerKey) {
+                  keepLocalConflict(ownerKey, id, conflict.localMutation.opId);
+                }
+              }}
+            />
+            <Button
+              label="Use server"
+              variant="ghost"
+              onPress={() => {
+                if (ownerKey) {
+                  useServerConflict(ownerKey, id, conflict.localMutation.opId);
+                }
+              }}
+            />
+          </View>
+        </View>
       ) : null}
 
       <TextInput
@@ -88,6 +143,7 @@ export default function NoteEditor() {
         placeholderTextColor={theme.colors.textDim}
         value={note.title}
         onChangeText={(t) => updateNoteLocal(id, { title: t })}
+        editable={!conflict}
       />
       <Text style={styles.meta}>
         v{note.version}
@@ -103,6 +159,7 @@ export default function NoteEditor() {
         onBlur={commitTags}
         onSubmitEditing={commitTags}
         autoCapitalize="none"
+        editable={!conflict}
       />
 
       {/* The editor is a plain view over Markdown — no proprietary block tree (pillar #1). */}
@@ -114,11 +171,22 @@ export default function NoteEditor() {
         onChangeText={(t) => updateNoteLocal(id, { bodyMd: t })}
         multiline
         textAlignVertical="top"
+        editable={!conflict}
       />
 
       <View style={styles.actions}>
-        <Button label={versions ? 'Hide history' : 'View history'} variant="ghost" onPress={() => (versions ? setVersions(null) : loadHistory())} />
-        <Button label="Delete note" variant="danger" onPress={onDelete} />
+        <Button
+          label={versions ? 'Hide history' : 'View history'}
+          variant="ghost"
+          disabled={Boolean(conflict)}
+          onPress={() => (versions ? setVersions(null) : loadHistory())}
+        />
+        <Button
+          label="Delete note"
+          variant="danger"
+          disabled={Boolean(conflict)}
+          onPress={onDelete}
+        />
       </View>
 
       {versions ? (
@@ -134,7 +202,12 @@ export default function NoteEditor() {
                 </Text>
                 <Text style={styles.versionMeta}>{new Date(v.createdAt).toLocaleString()}</Text>
               </View>
-              <Button label="Restore" variant="ghost" onPress={() => restore(v.id)} />
+              <Button
+                label="Restore"
+                variant="ghost"
+                disabled={Boolean(conflict)}
+                onPress={() => restore(v.id)}
+              />
             </View>
           ))}
         </View>
@@ -146,13 +219,34 @@ export default function NoteEditor() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: theme.colors.bg },
   conflict: {
-    color: theme.colors.danger,
     backgroundColor: theme.colors.surfaceAlt,
+    borderColor: theme.colors.danger,
+    borderWidth: 1,
     borderRadius: theme.radius,
     padding: theme.space(3),
     marginBottom: theme.space(3),
   },
-  title: { color: theme.colors.text, fontSize: 24, fontWeight: '700', paddingVertical: theme.space(2) },
+  conflictTitle: { color: theme.colors.danger, fontSize: 15, fontWeight: '700' },
+  conflictText: { color: theme.colors.text, fontSize: 13, marginTop: theme.space(1) },
+  conflictPreview: {
+    color: theme.colors.textDim,
+    fontSize: 12,
+    marginTop: theme.space(2),
+    padding: theme.space(2),
+    backgroundColor: theme.colors.bg,
+    borderRadius: theme.radius,
+  },
+  conflictActions: {
+    flexDirection: 'row',
+    gap: theme.space(2),
+    marginTop: theme.space(2),
+  },
+  title: {
+    color: theme.colors.text,
+    fontSize: 24,
+    fontWeight: '700',
+    paddingVertical: theme.space(2),
+  },
   meta: { color: theme.colors.textDim, fontSize: 12, marginBottom: theme.space(3) },
   tags: {
     color: theme.colors.accent,
@@ -171,7 +265,12 @@ const styles = StyleSheet.create({
   },
   actions: { flexDirection: 'row', gap: theme.space(2), marginTop: theme.space(4) },
   history: { marginTop: theme.space(4) },
-  historyTitle: { color: theme.colors.text, fontSize: 16, fontWeight: '600', marginBottom: theme.space(2) },
+  historyTitle: {
+    color: theme.colors.text,
+    fontSize: 16,
+    fontWeight: '600',
+    marginBottom: theme.space(2),
+  },
   versionRow: {
     flexDirection: 'row',
     alignItems: 'center',

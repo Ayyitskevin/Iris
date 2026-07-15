@@ -1,30 +1,46 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Linking, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router, useFocusEffect } from 'expo-router';
-import type { AgentToken, BillingStatus } from '@iris/shared';
+import { ApiRequestError, type AgentToken, type BillingStatus } from '@iris/shared';
 import { Button, Card, Field, Muted, Screen, Title } from '../../src/components/ui';
-import { api } from '../../src/api';
+import { authenticatedRequest } from '../../src/api';
 import { signOut } from '../../src/auth/session';
-import { store$ } from '../../src/state/store';
+import { assertCurrentSession, store$ } from '../../src/state/store';
 import { useObs } from '../../src/state/hooks';
 import { theme } from '../../src/theme';
 
 export default function Settings() {
   const email = useObs(() => store$.session.get()?.email ?? '');
+  const ownerKey = useObs(() => store$.activeOwnerKey.get());
   const [billing, setBilling] = useState<BillingStatus | null>(null);
   const [tokens, setTokens] = useState<AgentToken[]>([]);
   const [newAgentName, setNewAgentName] = useState('');
   const [issuedToken, setIssuedToken] = useState<string | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState(false);
+
+  useEffect(() => {
+    setBilling(null);
+    setTokens([]);
+    setNewAgentName('');
+    setIssuedToken(null);
+    setSigningOut(false);
+    setSignOutError(false);
+  }, [ownerKey]);
 
   const load = useCallback(async () => {
     try {
-      const [b, t] = await Promise.all([api.billingStatus(), api.listAgentTokens()]);
+      const { lease, value } = await authenticatedRequest((api) =>
+        Promise.all([api.billingStatus(), api.listAgentTokens()]),
+      );
+      assertCurrentSession(lease);
+      const [b, t] = value;
       setBilling(b);
       setTokens(t.tokens);
     } catch {
       // offline
     }
-  }, []);
+  }, [ownerKey]);
 
   useFocusEffect(
     useCallback(() => {
@@ -34,8 +50,10 @@ export default function Settings() {
 
   async function subscribe() {
     try {
-      const { url } = await api.createCheckout();
-      await Linking.openURL(url);
+      const { lease, value } = await authenticatedRequest((api) => api.createCheckout());
+      assertCurrentSession(lease);
+      await Linking.openURL(value.url);
+      assertCurrentSession(lease);
     } catch {
       // ignore
     }
@@ -43,11 +61,14 @@ export default function Settings() {
 
   async function issueToken() {
     try {
-      const res = await api.issueAgentToken({
-        agentName: newAgentName.trim() || 'Agent',
-        scopes: ['notes:read', 'notes:write'],
-      });
-      setIssuedToken(res.token);
+      const { lease, value } = await authenticatedRequest((api) =>
+        api.issueAgentToken({
+          agentName: newAgentName.trim() || 'Agent',
+          scopes: ['notes:read', 'notes:write'],
+        }),
+      );
+      assertCurrentSession(lease);
+      setIssuedToken(value.token);
       setNewAgentName('');
       await load();
     } catch {
@@ -57,7 +78,8 @@ export default function Settings() {
 
   async function revoke(id: string) {
     try {
-      await api.revokeAgentToken(id);
+      const { lease } = await authenticatedRequest((api) => api.revokeAgentToken(id));
+      assertCurrentSession(lease);
       await load();
     } catch {
       // ignore
@@ -65,10 +87,24 @@ export default function Settings() {
   }
 
   async function exportData() {
-    const token = store$.session.get()?.token;
     try {
-      const res = await fetch(api.exportUrl(), { headers: { authorization: `Bearer ${token}` } });
+      const { lease, value: res } = await authenticatedRequest((api, currentLease) =>
+        fetch(api.exportUrl(), {
+          headers: { authorization: 'Bearer ' + currentLease.token },
+          signal: currentLease.signal,
+        }).then((response) => {
+          if (!response.ok) {
+            throw new ApiRequestError(
+              response.status,
+              'export_failed',
+              'Export failed with ' + response.status,
+            );
+          }
+          return response;
+        }),
+      );
       const blob = await res.blob();
+      assertCurrentSession(lease);
       if (Platform.OS === 'web') {
         const g = globalThis as unknown as {
           URL: { createObjectURL: (b: Blob) => string; revokeObjectURL: (u: string) => void };
@@ -104,7 +140,9 @@ export default function Settings() {
               </Text>
               {billing.plan === 'free' ? (
                 <>
-                  <Muted>Local use is free. Sync across more than one device with Iris Sync (~$5/mo).</Muted>
+                  <Muted>
+                    Local use is free. Sync across more than one device with Iris Sync (~$5/mo).
+                  </Muted>
                   <View style={{ height: theme.space(2) }} />
                   <Button label="Subscribe to Iris Sync" onPress={subscribe} />
                 </>
@@ -121,7 +159,11 @@ export default function Settings() {
           <Text style={styles.cardTitle}>Agents</Text>
           <Muted>Issue a scoped token so an agent can read and write via the API.</Muted>
           <View style={{ height: theme.space(2) }} />
-          <Field placeholder="Agent name (e.g. Researcher)" value={newAgentName} onChangeText={setNewAgentName} />
+          <Field
+            placeholder="Agent name (e.g. Researcher)"
+            value={newAgentName}
+            onChangeText={setNewAgentName}
+          />
           <Button label="Issue agent token" variant="ghost" onPress={issueToken} />
           {issuedToken ? (
             <View style={styles.tokenBox}>
@@ -141,7 +183,9 @@ export default function Settings() {
                   {t.scopes.join(', ')} {t.revokedAt ? '· revoked' : ''}
                 </Text>
               </View>
-              {!t.revokedAt ? <Button label="Revoke" variant="danger" onPress={() => revoke(t.id)} /> : null}
+              {!t.revokedAt ? (
+                <Button label="Revoke" variant="danger" onPress={() => revoke(t.id)} />
+              ) : null}
             </View>
           ))}
         </Card>
@@ -156,12 +200,26 @@ export default function Settings() {
           ) : null}
         </Card>
 
+        {signOutError ? (
+          <Text style={styles.signOutError}>
+            Sign-out could not be saved. Your account remains active; try again.
+          </Text>
+        ) : null}
         <Button
           label="Sign out"
           variant="danger"
+          loading={signingOut}
           onPress={async () => {
-            await signOut();
-            router.replace('/sign-in');
+            setSigningOut(true);
+            setSignOutError(false);
+            try {
+              await signOut();
+              router.replace('/sign-in');
+            } catch {
+              setSignOutError(true);
+            } finally {
+              setSigningOut(false);
+            }
           }}
         />
       </ScrollView>
@@ -170,7 +228,12 @@ export default function Settings() {
 }
 
 const styles = StyleSheet.create({
-  cardTitle: { color: theme.colors.text, fontSize: 17, fontWeight: '700', marginBottom: theme.space(2) },
+  cardTitle: {
+    color: theme.colors.text,
+    fontSize: 17,
+    fontWeight: '700',
+    marginBottom: theme.space(2),
+  },
   line: { color: theme.colors.text, fontSize: 14, marginBottom: theme.space(1) },
   strong: { fontWeight: '700', color: theme.colors.accent },
   tokenBox: {
@@ -189,4 +252,9 @@ const styles = StyleSheet.create({
     paddingVertical: theme.space(2),
   },
   tokenMeta: { color: theme.colors.textDim, fontSize: 12 },
+  signOutError: {
+    color: theme.colors.danger,
+    fontSize: 13,
+    marginBottom: theme.space(2),
+  },
 });

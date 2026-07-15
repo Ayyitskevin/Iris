@@ -1,9 +1,8 @@
 /**
  * Pure Sync v1 reconciliation contract.
  *
- * This module deliberately has no store or network side effects and is not wired into
- * the runtime sync manager yet. Integration waits for the separately reviewed
- * session/workspace ownership fence and delayed-response concurrency tests (ADR-011).
+ * This module has no store or network side effects. The runtime coordinator applies it
+ * only while holding a checked session/workspace lease (ADR-011).
  */
 import type { Note, SyncChangesResponse, SyncMutation, SyncPushResponse } from '@iris/shared';
 
@@ -19,6 +18,60 @@ export interface PushReconcileState {
   notes: Record<string, Note>;
   outbox: SyncMutation[];
   conflicts: Record<string, SyncConflictDraft>;
+}
+
+export class SyncProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SyncProtocolError';
+  }
+}
+
+export function validatePushResponse(sent: SyncMutation[], response: SyncPushResponse): void {
+  const sentByOp = new Map<string, SyncMutation>();
+  for (const mutation of sent) {
+    if (sentByOp.has(mutation.opId)) {
+      throw new SyncProtocolError('Sync push request contained a duplicate operation id');
+    }
+    sentByOp.set(mutation.opId, mutation);
+  }
+
+  const seen = new Set<string>();
+  const bindResult = (opId: string): SyncMutation => {
+    const mutation = sentByOp.get(opId);
+    if (!mutation)
+      throw new SyncProtocolError('Sync push response referenced an unknown operation');
+    if (seen.has(opId)) {
+      throw new SyncProtocolError('Sync push response repeated an operation result');
+    }
+    seen.add(opId);
+    return mutation;
+  };
+
+  for (const applied of response.applied) {
+    const mutation = bindResult(applied.opId);
+    if (!applied.note && mutation.type !== 'delete') {
+      throw new SyncProtocolError('Applied upsert response omitted its authoritative note');
+    }
+    if (applied.note && applied.note.id !== mutation.note.id) {
+      throw new SyncProtocolError('Applied response note did not match its operation');
+    }
+    if (applied.note && mutation.type === 'upsert' && applied.note.deletedAt !== null) {
+      throw new SyncProtocolError('Applied upsert response returned a deleted note');
+    }
+    if (applied.note && mutation.type === 'delete' && applied.note.deletedAt === null) {
+      throw new SyncProtocolError('Applied delete response returned a live note');
+    }
+  }
+  for (const conflict of response.conflicts) {
+    const mutation = bindResult(conflict.opId);
+    if (conflict.serverNote.id !== mutation.note.id) {
+      throw new SyncProtocolError('Conflict response note did not match its operation');
+    }
+  }
+  if (seen.size !== sent.length) {
+    throw new SyncProtocolError('Sync push response omitted an operation result');
+  }
 }
 
 function localNoteRebasedOnto(
@@ -51,6 +104,7 @@ export function reconcilePush(
   response: SyncPushResponse,
   detectedAt: string,
 ): PushReconcileState {
+  validatePushResponse(sent, response);
   const notes = { ...state.notes };
   let outbox = [...state.outbox];
   const conflicts = { ...state.conflicts };
@@ -118,12 +172,12 @@ export async function drainChangePages(
 
   for (;;) {
     const page = await fetchPage(cursor);
+    if (page.cursor === cursor && (page.hasMore || page.changes.length > 0)) {
+      throw new SyncProtocolError('Sync change-feed returned changes without advancing its cursor');
+    }
     await applyPage(page);
 
     if (!page.hasMore) return page.cursor;
-    if (page.cursor === cursor) {
-      throw new Error('Sync change-feed returned hasMore without advancing its cursor');
-    }
     cursor = page.cursor;
   }
 }

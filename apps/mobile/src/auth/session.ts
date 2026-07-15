@@ -1,32 +1,27 @@
 import type { AuthResponse } from '@iris/shared';
-import { api } from '../api';
-import { saveState, store$ } from '../state/store';
+import { publicApi } from '../api';
+import { adoptSession, signOutSession } from '../state/store';
+import { sync } from '../sync/manager';
 
 async function adopt(res: AuthResponse): Promise<void> {
-  store$.session.set({
+  await adoptSession({
     token: res.token,
     userId: res.user.id,
     workspaceId: res.workspace.id,
     email: res.user.email,
     displayName: res.user.displayName,
   });
-  await saveState();
+  void sync();
 }
 
 export async function signIn(email: string, password: string): Promise<void> {
-  await adopt(await api.signIn({ email, password }));
+  await adopt(await publicApi.signIn({ email, password }));
 }
 
 export async function signUp(email: string, password: string, displayName: string): Promise<void> {
-  await adopt(await api.signUp({ email, password, displayName }));
+  await adopt(await publicApi.signUp({ email, password, displayName }));
 }
 
 export async function signOut(): Promise<void> {
-  store$.session.set(null);
-  store$.notes.set({});
-  store$.outbox.set([]);
-  store$.syncCursor.set('');
-  store$.syncGated.set(false);
-  store$.conflictNoteId.set(null);
-  await saveState();
+  await signOutSession();
 }

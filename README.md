@@ -21,8 +21,9 @@ A thin, end-to-end vertical slice that proves the architecture:
 - **Notes core** — create/edit/delete Markdown notes in folders, **versioned** (every save
   keeps history; restore any prior version). **Tags + full-text search** (phase 2, ADR-010):
   ranked search and tag filtering, both workspace-scoped.
-- **Local-first sync** — edits apply instantly/offline; a change-feed reconciles to
-  Postgres; conflicts are **surfaced, never dropped**.
+- **Owner-isolated local-first sync** — edits apply instantly/offline; each user/workspace
+  has a private replica and fixed-token sync lease; a change-feed reconciles to Postgres;
+  conflicts retain both versions in a dedicated Review inbox.
 - **Agent actors + API** — issue scoped, revocable agent tokens; a REST API that agents
   and the app share; every agent write lands in an **append-only activity log** and creates
   a version; an **activity feed** where the operator can **undo** an action.
@@ -89,24 +90,26 @@ curl -s localhost:4000/v1/activity/<ACTIVITY_ID>/undo -X POST -H "authorization:
 
 ## Scripts
 
-| Command | What it does |
-| --- | --- |
-| `pnpm dev:api` | Run the API (watch mode) on PGlite |
-| `pnpm test` | Run the API and mobile test suites (Vitest) |
-| `pnpm typecheck` | `tsc --noEmit` across all packages |
-| `pnpm lint` | ESLint across the monorepo |
-| `pnpm format` | Prettier write |
-| `pnpm dev:mobile` | Expo dev server (iOS / Android / web) |
-| `pnpm db:generate` | Generate Drizzle SQL migration from schema |
-| `pnpm db:migrate` | Apply migrations |
+| Command            | What it does                                |
+| ------------------ | ------------------------------------------- |
+| `pnpm dev:api`     | Run the API (watch mode) on PGlite          |
+| `pnpm test`        | Run the API and mobile test suites (Vitest) |
+| `pnpm typecheck`   | `tsc --noEmit` across all packages          |
+| `pnpm lint`        | ESLint across the monorepo                  |
+| `pnpm format`      | Prettier write                              |
+| `pnpm dev:mobile`  | Expo dev server (iOS / Android / web)       |
+| `pnpm db:generate` | Generate Drizzle SQL migration from schema  |
+| `pnpm db:migrate`  | Apply migrations                            |
 
 ## Status & honesty note
 
 See the bottom of [`docs/DECISIONS.md`](docs/DECISIONS.md) and
 [`docs/ROADMAP.md`](docs/ROADMAP.md). The backend and its Definition-of-Done tests run and
 pass in-repo. Auth ships a **local** provider behind a managed-provider seam (ADR-004);
-Stripe ships full plumbing tested with a fake client (ADR-007). The mobile suite includes
-a pure lossless-reconciliation contract; production wiring remains intentionally held
-behind reviewed session/workspace isolation and concurrency coverage (ADR-011).
-Device/simulator app runs require the standard Expo/EAS toolchain and are a documented
-follow-up.
+Stripe ships full plumbing tested with a fake client (ADR-007). The production mobile
+loop now uses the lossless reconciliation contract behind owner-keyed replicas and
+immutable session leases; focused tests cover delayed push/pull, pagination, sign-out,
+account switch, stale 401, cursor isolation, migration recovery, and A-outbox/B-token
+separation (ADR-011). Sync v2's database-monotonic cursor, request-bound idempotency, and
+transactional SQLite/IndexedDB repository remain explicit release blockers. Device and
+simulator runs require the standard Expo/EAS toolchain and are a documented follow-up.

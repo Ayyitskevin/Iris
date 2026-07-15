@@ -1,9 +1,11 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { FlatList, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import type { ActivityEntry } from '@iris/shared';
 import { Button, Muted, Screen, Title } from '../../src/components/ui';
-import { api } from '../../src/api';
+import { authenticatedRequest } from '../../src/api';
+import { useObs } from '../../src/state/hooks';
+import { assertCurrentSession, store$ } from '../../src/state/store';
 import { sync } from '../../src/sync/manager';
 import { theme } from '../../src/theme';
 
@@ -16,20 +18,27 @@ const ACTION_LABEL: Record<string, string> = {
 };
 
 export default function Activity() {
+  const ownerKey = useObs(() => store$.activeOwnerKey.get());
   const [items, setItems] = useState<ActivityEntry[]>([]);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    setItems([]);
+    setLoading(false);
+  }, [ownerKey]);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await api.listActivity();
-      setItems(res.activity);
+      const { lease, value } = await authenticatedRequest((api) => api.listActivity());
+      assertCurrentSession(lease);
+      setItems(value.activity);
     } catch {
       // offline — keep last feed
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [ownerKey]);
 
   useFocusEffect(
     useCallback(() => {
@@ -39,7 +48,8 @@ export default function Activity() {
 
   async function undo(entry: ActivityEntry) {
     try {
-      await api.undoActivity(entry.id);
+      const { lease } = await authenticatedRequest((api) => api.undoActivity(entry.id));
+      assertCurrentSession(lease);
       await load();
       void sync();
     } catch {
@@ -55,7 +65,9 @@ export default function Activity() {
         style={{ marginTop: theme.space(3) }}
         data={items}
         keyExtractor={(a) => a.id}
-        refreshControl={<RefreshControl refreshing={loading} onRefresh={load} tintColor={theme.colors.accent} />}
+        refreshControl={
+          <RefreshControl refreshing={loading} onRefresh={load} tintColor={theme.colors.accent} />
+        }
         ItemSeparatorComponent={() => <View style={{ height: theme.space(2) }} />}
         ListEmptyComponent={<Muted>No activity yet.</Muted>}
         renderItem={({ item }) => {
@@ -64,7 +76,12 @@ export default function Activity() {
           return (
             <View style={styles.row}>
               <View style={styles.rowMain}>
-                <Text style={[styles.actor, { color: isAgent ? theme.colors.agent : theme.colors.text }]}>
+                <Text
+                  style={[
+                    styles.actor,
+                    { color: isAgent ? theme.colors.agent : theme.colors.text },
+                  ]}
+                >
                   {isAgent ? '🤖 ' : '🧑 '}
                   {item.actorName}
                 </Text>

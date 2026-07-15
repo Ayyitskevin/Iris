@@ -1,8 +1,8 @@
 /**
  * A tiny key/value persistence adapter — the local-first substrate. On web it uses
- * localStorage; on native, expo-secure-store for the small session blob. Durable
- * on-device note storage (MMKV / expo-sqlite) is a documented ROADMAP follow-up; the
- * app is structured so swapping the adapter is all it takes.
+ * localStorage; on native, expo-secure-store. Credentials and owner replicas use
+ * separate keys. Transactional SQLite/IndexedDB replica storage remains a documented
+ * release follow-up; persistence failures are surfaced by the owner store.
  */
 import { Platform } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
@@ -26,8 +26,8 @@ const webStore: KVStore = {
   },
 };
 
-// SecureStore has a ~2KB per-key limit; fine for the session token + cursor. Larger
-// note payloads are chunked by the caller or belong in a native DB (ROADMAP).
+// SecureStore has a small per-value ceiling. It protects credentials, but larger owner
+// replicas belong in the planned native database; callers must surface write failure.
 const nativeStore: KVStore = {
   get: (key) => SecureStore.getItemAsync(sanitize(key)),
   set: (key, value) => SecureStore.setItemAsync(sanitize(key), value),
