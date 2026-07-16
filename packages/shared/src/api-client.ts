@@ -9,6 +9,8 @@ import {
   RestoreVersionResponse as RestoreVersionResponseSchema,
   SyncChangesResponse as SyncChangesResponseSchema,
   SyncPushResponse as SyncPushResponseSchema,
+  SyncV2ChangesResponse as SyncV2ChangesResponseSchema,
+  SyncV2PushResponse as SyncV2PushResponseSchema,
   UndoResponse as UndoResponseSchema,
 } from './schemas';
 import type {
@@ -32,6 +34,10 @@ import type {
   SyncChangesResponse,
   SyncPushRequest,
   SyncPushResponse,
+  SyncV2ChangesRequest,
+  SyncV2ChangesResponse,
+  SyncV2PushRequest,
+  SyncV2PushResponse,
   TagListResponse,
   UndoResponse,
   UpdateNoteRequest,
@@ -205,6 +211,18 @@ export function createApiClient(options: ApiClientOptions) {
     syncPush: (b: SyncPushRequest) =>
       request<SyncPushResponse>('POST', '/v1/sync/push', b, undefined, (value) =>
         SyncPushResponseSchema.parse(value),
+      ),
+    syncV2Changes: (query: SyncV2ChangesRequest) =>
+      request<SyncV2ChangesResponse>(
+        'GET',
+        `/v2/sync/changes?resourceSet=${encodeURIComponent(query.resourceSet)}&cursor=${encodeURIComponent(query.cursor)}&deviceId=${encodeURIComponent(query.deviceId)}`,
+        undefined,
+        undefined,
+        (value) => SyncV2ChangesResponseSchema.parse(value),
+      ),
+    syncV2Push: (body: SyncV2PushRequest) =>
+      request<SyncV2PushResponse>('POST', '/v2/sync/push', body, undefined, (value) =>
+        SyncV2PushResponseSchema.parse(value),
       ),
 
     // --- Devices & billing ---

@@ -434,7 +434,7 @@ export const SyncMutation = z.object({
 export type SyncMutation = z.infer<typeof SyncMutation>;
 
 function validateUniqueOperationIds(
-  request: { mutations: SyncMutation[] },
+  request: { mutations: Array<{ opId: string }> },
   ctx: z.RefinementCtx,
 ): void {
   const seen = new Set<string>();
@@ -502,6 +502,182 @@ export const SyncPushResponse = z.object({
   conflicts: z.array(SyncConflict),
 });
 export type SyncPushResponse = z.infer<typeof SyncPushResponse>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sync v2 resource envelope (additive note-backed boundary)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Immutable membership for the first generic feed. A future notes+work feed must use
+ * a new resource-set id and start from genesis; widening this set would let its cursor
+ * skip resources that predate the capability.
+ */
+export const SYNC_V2_RESOURCE_SET = 'notes-v1' as const;
+export const SyncV2ResourceSet = z.literal(SYNC_V2_RESOURCE_SET);
+export type SyncV2ResourceSet = z.infer<typeof SyncV2ResourceSet>;
+
+const SyncV2OperationId = PostgreSqlText.pipe(z.string().min(1).max(200));
+
+export const SyncV2NoteWriteData = z.strictObject({
+  title: NoteTitleInput,
+  bodyMd: NoteBodyInput,
+  folder: NoteFolderInput.nullable(),
+  // Required rather than defaulted: every v2 receipt projection is explicit.
+  tags: NoteTagsInput,
+});
+export type SyncV2NoteWriteData = z.infer<typeof SyncV2NoteWriteData>;
+
+export const SyncV2NoteMutationResource = z.strictObject({
+  type: z.literal('note'),
+  id: PostgresUuid,
+  data: SyncV2NoteWriteData,
+});
+export type SyncV2NoteMutationResource = z.infer<typeof SyncV2NoteMutationResource>;
+
+export const SyncV2Mutation = z.strictObject({
+  opId: SyncV2OperationId,
+  type: z.enum(['upsert', 'delete', 'resurrect']),
+  resource: SyncV2NoteMutationResource,
+  baseVersion: z.number().int().nonnegative(),
+});
+export type SyncV2Mutation = z.infer<typeof SyncV2Mutation>;
+
+/** Server-authoritative note data. Body size is intentionally unbounded on reads so a
+ * recognized pre-limit note remains recoverable losslessly. */
+export const SyncV2NoteResourceData = z.strictObject({
+  workspaceId: PostgresUuid,
+  title: z.string(),
+  bodyMd: z.string(),
+  folder: z.string().nullable(),
+  tags: z.array(z.string()),
+  version: z.number().int().nonnegative(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  deletedAt: z.string().nullable(),
+});
+export type SyncV2NoteResourceData = z.infer<typeof SyncV2NoteResourceData>;
+
+export const SyncV2NoteResource = z.strictObject({
+  type: z.literal('note'),
+  id: PostgresUuid,
+  data: SyncV2NoteResourceData,
+});
+export type SyncV2NoteResource = z.infer<typeof SyncV2NoteResource>;
+
+/** Input cursors stay opaque so the service can return the durable `invalid_sync_cursor`
+ * recovery code for malformed, foreign, ahead, or route-mismatched values. */
+export const SyncV2ChangesRequest = z.strictObject({
+  resourceSet: SyncV2ResourceSet,
+  cursor: z.string().max(200),
+  deviceId: PostgreSqlText.pipe(z.string().min(1).max(200)),
+});
+export type SyncV2ChangesRequest = z.infer<typeof SyncV2ChangesRequest>;
+
+const SyncV2ResourceCursor = z
+  .string()
+  .max(200)
+  .refine((cursor) => {
+    const match = /^resource-v1:notes-v1:([^:]+):(0|[1-9][0-9]*)$/.exec(cursor);
+    return match !== null && PostgresUuid.safeParse(match[1]).success;
+  }, 'Invalid notes-v1 resource cursor');
+
+export const SyncV2ChangesResponse = z.strictObject({
+  resourceSet: SyncV2ResourceSet,
+  resources: z.array(SyncV2NoteResource).max(SYNC_PULL_PAGE_LIMIT),
+  cursor: SyncV2ResourceCursor,
+  hasMore: z.boolean(),
+});
+export type SyncV2ChangesResponse = z.infer<typeof SyncV2ChangesResponse>;
+
+export function syncV2PushRequestByteLength(request: {
+  resourceSet: SyncV2ResourceSet;
+  deviceId: string;
+  mutations: SyncV2Mutation[];
+}): number {
+  return utf8ByteLength(JSON.stringify(request));
+}
+
+function validateSyncV2PushByteEnvelope(
+  request: {
+    resourceSet: SyncV2ResourceSet;
+    deviceId: string;
+    mutations: SyncV2Mutation[];
+  },
+  ctx: z.RefinementCtx,
+): void {
+  if (syncV2PushRequestByteLength(request) > SYNC_PUSH_MAX_BYTES) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['mutations'],
+      message: `Serialized sync request must be at most ${SYNC_PUSH_MAX_BYTES} UTF-8 bytes`,
+    });
+  }
+}
+
+export const SyncV2PushRequest = z
+  .strictObject({
+    resourceSet: SyncV2ResourceSet,
+    deviceId: PostgreSqlText.pipe(z.string().min(1).max(200)),
+    mutations: z.array(SyncV2Mutation).max(SYNC_PUSH_LIMIT),
+  })
+  .superRefine((request, ctx) => {
+    validateUniqueOperationIds(request, ctx);
+    validateSyncV2PushByteEnvelope(request, ctx);
+  });
+export type SyncV2PushRequest = z.infer<typeof SyncV2PushRequest>;
+
+export const SyncV2Applied = z.strictObject({
+  opId: SyncV2OperationId,
+  // Absent only for an idempotent delete of a note that never existed here.
+  resource: SyncV2NoteResource.optional(),
+});
+export type SyncV2Applied = z.infer<typeof SyncV2Applied>;
+
+export const SyncV2Conflict = z.strictObject({
+  opId: SyncV2OperationId,
+  reason: z.literal('version_mismatch'),
+  serverResource: SyncV2NoteResource,
+});
+export type SyncV2Conflict = z.infer<typeof SyncV2Conflict>;
+
+function validateSyncV2PushResults(
+  response: { applied: SyncV2Applied[]; conflicts: SyncV2Conflict[] },
+  ctx: z.RefinementCtx,
+): void {
+  const results = [...response.applied, ...response.conflicts];
+  if (results.length > SYNC_PUSH_LIMIT) {
+    ctx.addIssue({
+      code: 'custom',
+      path: [],
+      message: `Sync response must contain at most ${SYNC_PUSH_LIMIT} results`,
+    });
+  }
+  const seen = new Set<string>();
+  results.forEach((result, index) => {
+    if (seen.has(result.opId)) {
+      const inApplied = index < response.applied.length;
+      ctx.addIssue({
+        code: 'custom',
+        path: [
+          inApplied ? 'applied' : 'conflicts',
+          inApplied ? index : index - response.applied.length,
+          'opId',
+        ],
+        message: 'opId values must be unique across a sync response',
+      });
+    }
+    seen.add(result.opId);
+  });
+}
+
+export const SyncV2PushResponse = z
+  .strictObject({
+    resourceSet: SyncV2ResourceSet,
+    applied: z.array(SyncV2Applied).max(SYNC_PUSH_LIMIT),
+    conflicts: z.array(SyncV2Conflict).max(SYNC_PUSH_LIMIT),
+  })
+  .superRefine(validateSyncV2PushResults);
+export type SyncV2PushResponse = z.infer<typeof SyncV2PushResponse>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Devices & billing

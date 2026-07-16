@@ -94,18 +94,30 @@ These were named as out of scope and are staying out until the foundation is pro
   successful revival records reversible `note.restore` activity, and old/new binaries
   reject or retain the intent without silently reinterpreting it. Mobile queue collapse
   preserves unstaged resurrection intent and rebases edits made after durable staging.
+- **Phase 2.6 — additive generic resource transport seam** (ADR-016): strict
+  `/v2/sync/changes` and `/v2/sync/push` routes expose the immutable `notes-v1` resource
+  set without changing `/v1`. Set/workspace-bound cursors advance through one captured
+  commit high-water mark, full wrapped pages remain byte-bounded, and note envelopes
+  project losslessly into frozen receipt version 1 so exact retries can cross routes
+  without another resource mutation, receipt, or logical cursor advance. The shared API
+  client validates the new responses, but the
+  production mobile coordinator intentionally remains on `/v1` pending transactional
+  platform repositories; no project/task resource or migration was added.
 
 ## Near-term follow-ups (next things)
 
-1. **Complete Sync v2's resource/repository boundary and release gates**: generic resource envelopes,
-   SQLite on native, IndexedDB plus cross-tab session coordination on web,
-   transactional resource+outbox writes, and a user-facing recovery/import path for
-   quarantined legacy `iris:state:v1` data, followed by native iOS/Android device or
-   simulator acceptance. The owner-bound repository contract and atomically published
-   in-memory note+outbox reducer are integrated, but its current adapter still uses one
-   size-limited per-owner SecureStore/localStorage value. That interim backend, the
-   note-only wire contract, missing web cross-tab ownership, missing recovery import, and
-   unrun native acceptance are explicit blockers before the work queue.
+1. **Complete Sync v2's platform repository/runtime cutover and release gates**: SQLite
+   on native, IndexedDB plus cross-tab session coordination on web, transactional
+   resource+outbox writes, request-correlated push-result reconciliation, and a
+   user-facing recovery/import path for quarantined legacy `iris:state:v1` data, followed
+   by native iOS/Android device or simulator acceptance.
+   The owner-bound repository/root reducer and additive generic resource transport are
+   integrated, but the current adapter still stores one size-limited per-owner
+   SecureStore/localStorage value and the production coordinator still dispatches the
+   frozen `/v1` payload. Persisting the exact `/v2` resource set, cursor, and pending
+   envelope belongs in the transactional platform cutover. That interim backend,
+   missing web cross-tab ownership, missing recovery import, and unrun native acceptance
+   are explicit blockers before the work queue.
 2. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
    accountable human-or-agent assignee, reversible writes, and the same sync resource
    envelope. Keep activity, check-in, delegation, and durable claim/run semantics

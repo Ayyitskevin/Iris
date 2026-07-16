@@ -25,7 +25,9 @@ A thin, end-to-end vertical slice that proves the architecture:
   instead of pretending it was captured (ADR-013/014).
 - **Owner-isolated local-first sync** — edits apply instantly/offline; each user/workspace
   has a private replica and fixed-token sync lease; a change-feed reconciles to Postgres;
-  conflicts retain both versions in a dedicated Review inbox.
+  conflicts retain both versions in a dedicated Review inbox. A strict, note-backed
+  generic resource envelope is available additively on `/v2/sync/*` for the future work
+  graph while the current mobile coordinator stays on the frozen `/v1` transport.
 - **Agent actors + API** — issue scoped, revocable agent tokens; a REST API that agents
   and the app share; every agent note write lands in an **append-only activity log** and
   creates a version; an **activity feed** where the operator can undo recorded content
@@ -129,10 +131,16 @@ every applied additive safety signature, including Sync v2 and organizational-hi
 artifacts, on later runs. Focused tests cover transport bounds, lost
 responses, persistence races, exact applied/conflict replay, non-`BYPASSRLS`
 upgrade-with-data, delayed push/pull, pagination, sign-out, account switch, stale 401,
-cross-workspace cursor rejection, and A-outbox/B-token separation (ADR-011/012). Generic
-resource envelopes, SQLite/IndexedDB implementations behind the integrated owner-replica
-repository contract, web cross-tab coordination, recovery import, and native
-device/simulator acceptance remain explicit release blockers.
+cross-workspace cursor rejection, and A-outbox/B-token separation (ADR-011/012). The
+strict `notes-v1` resource envelope now coexists on `/v2/sync/*`: its immutable
+resource-set cursor cannot cross routes or workspaces, and exact note operations replay
+the frozen receipt-v1 outcome across `/v1` and `/v2` without another resource mutation,
+receipt, or logical cursor advance (ADR-016).
+The production mobile coordinator intentionally remains on `/v1` until SQLite/IndexedDB
+repositories can persist the resource-set cursor and exact pending envelope
+transactionally. Those platform repositories, web cross-tab coordination, recovery
+import, request-correlated push-result reconciliation, and native device/simulator
+acceptance remain explicit release blockers.
 GitHub Actions run `29506816638` passed the PostgreSQL 16
 independent-connection commit-order and concurrent device-gate gate for commit
 `8a8785114623d3e601f26ddf7b6eed21b23415cf`.
@@ -155,3 +163,11 @@ edit now retains an authoritative tombstone as a conflict; only “Restore my dr
 create a live head, recorded as reversible `note.restore` activity. Exact retries replay,
 old/new binaries fail closed, and edits on either side of durable request staging keep
 their intended lifecycle and newest Markdown payload.
+
+ADR-016 adds strict `/v2/sync/changes` and `/v2/sync/push` resource envelopes without
+changing `/v1`, the database, or receipt storage. `notes-v1` membership is immutable;
+its cursor binds the set, workspace, and commit-serialized high-water mark. Generic note
+pushes project losslessly into receipt version 1, so a lost response can retry through
+either route exactly once. Wrapped pull and push responses retain the finite transport
+budgets and the single recognized legacy-oversize exception. This is the generic
+protocol seam, not the mobile runtime cutover or a claim that projects/tasks exist.

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiRequestError, ApiResponseValidationError } from '@iris/shared';
+import { ApiRequestError, ApiResponseValidationError, SYNC_V2_RESOURCE_SET } from '@iris/shared';
 
 const memory = vi.hoisted(() => ({ values: new Map<string, string>() }));
 vi.mock('expo-constants', () => ({ default: { expoConfig: null } }));
@@ -159,6 +159,22 @@ describe('API error classification', () => {
 });
 
 describe('successful sync response validation', () => {
+  const syncedResource = {
+    type: 'note' as const,
+    id: '33333333-3333-4333-8333-333333333333',
+    data: {
+      workspaceId: sessionA.workspaceId,
+      title: 'Resource note',
+      bodyMd: 'Markdown',
+      folder: null,
+      tags: [],
+      version: 1,
+      createdAt: '2026-07-16T12:00:00.000Z',
+      updatedAt: '2026-07-16T12:00:00.000Z',
+      deletedAt: null,
+    },
+  };
+
   it('rejects a malformed push payload with the dedicated response error', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({ applied: 'not-an-array', conflicts: [] }), { status: 200 }),
@@ -195,6 +211,132 @@ describe('successful sync response validation', () => {
 
     await expect(
       apiForLease(openSessionLease()!).syncPush({
+        deviceId: store$.deviceId.get(),
+        mutations: [],
+      }),
+    ).rejects.toBeInstanceOf(ApiResponseValidationError);
+  });
+
+  it('uses only the explicit v2 routes and validates their resource capability', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          resourceSet: SYNC_V2_RESOURCE_SET,
+          resources: [syncedResource],
+          cursor: `resource-v1:notes-v1:${sessionA.workspaceId}:1`,
+          hasMore: false,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const client = apiForLease(openSessionLease()!);
+    const pulled = await client.syncV2Changes({
+      resourceSet: SYNC_V2_RESOURCE_SET,
+      cursor: '',
+      deviceId: store$.deviceId.get(),
+    });
+    expect(pulled.resources).toEqual([syncedResource]);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
+      '/v2/sync/changes?resourceSet=notes-v1&cursor=&deviceId=',
+    );
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          resourceSet: SYNC_V2_RESOURCE_SET,
+          applied: [{ opId: 'resource-op', resource: syncedResource }],
+          conflicts: [],
+        }),
+        { status: 200 },
+      ),
+    );
+    const body = {
+      resourceSet: SYNC_V2_RESOURCE_SET,
+      deviceId: store$.deviceId.get(),
+      mutations: [
+        {
+          opId: 'resource-op',
+          type: 'upsert' as const,
+          resource: {
+            type: 'note' as const,
+            id: syncedResource.id,
+            data: { title: 'Resource note', bodyMd: 'Markdown', folder: null, tags: [] },
+          },
+          baseVersion: 0,
+        },
+      ],
+    };
+    await expect(client.syncV2Push(body)).resolves.toMatchObject({
+      resourceSet: SYNC_V2_RESOURCE_SET,
+      applied: [{ opId: 'resource-op' }],
+    });
+    expect(String(fetchMock.mock.calls[1]?.[0])).toMatch(/\/v2\/sync\/push$/);
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects malformed or widened successful v2 responses', async () => {
+    const client = apiForLease(openSessionLease()!);
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    const invalidResponses = [
+      {
+        resourceSet: 'workspace-v1',
+        resources: [],
+        cursor: `resource-v1:notes-v1:${sessionA.workspaceId}:0`,
+        hasMore: false,
+      },
+      {
+        resourceSet: SYNC_V2_RESOURCE_SET,
+        resources: [{ ...syncedResource, data: { ...syncedResource.data, unbound: true } }],
+        cursor: `resource-v1:notes-v1:${sessionA.workspaceId}:1`,
+        hasMore: false,
+      },
+      {
+        resourceSet: SYNC_V2_RESOURCE_SET,
+        resources: [],
+        cursor: `v2:${sessionA.workspaceId}:1`,
+        hasMore: false,
+      },
+      {
+        resourceSet: SYNC_V2_RESOURCE_SET,
+        resources: [],
+        cursor: 'resource-v1:notes-v1:not-a-uuid:1',
+        hasMore: false,
+      },
+    ];
+
+    for (const payload of invalidResponses) {
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(payload), { status: 200 }));
+      await expect(
+        client.syncV2Changes({
+          resourceSet: SYNC_V2_RESOURCE_SET,
+          cursor: '',
+          deviceId: store$.deviceId.get(),
+        }),
+      ).rejects.toBeInstanceOf(ApiResponseValidationError);
+    }
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          resourceSet: SYNC_V2_RESOURCE_SET,
+          applied: [
+            { opId: 'duplicate-result', resource: syncedResource },
+            { opId: 'duplicate-result', resource: syncedResource },
+          ],
+          conflicts: [],
+        }),
+        { status: 200 },
+      ),
+    );
+    await expect(
+      client.syncV2Push({
+        resourceSet: SYNC_V2_RESOURCE_SET,
         deviceId: store$.deviceId.get(),
         mutations: [],
       }),

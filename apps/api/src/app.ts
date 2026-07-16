@@ -20,6 +20,8 @@ import {
   SYNC_HTTP_BODY_LIMIT_BYTES,
   SyncChangesRequest,
   SyncPushRequest,
+  SyncV2ChangesRequest,
+  SyncV2PushRequest,
   UNDO_PROTOCOL_VERSION,
   UpdateNoteRequest,
   type AuthResponse,
@@ -39,6 +41,7 @@ import * as searchService from './services/search';
 import * as activityService from './services/activity';
 import * as agentService from './services/agents';
 import * as syncService from './services/sync';
+import * as syncV2Service from './services/sync-v2';
 import * as deviceService from './services/devices';
 import * as billingService from './services/billing';
 import { collectExport } from './services/export';
@@ -364,6 +367,22 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
       requireScope(ctx, 'notes:write');
       const body = SyncPushRequest.parse(req.body);
       return syncService.syncPush(ctx, body.deviceId, body.mutations);
+    }),
+  );
+
+  // The additive generic boundary is intentionally note-only. `/v1` stays frozen so
+  // mixed clients can replay the same receipt through either route without fallback.
+  app.get('/v2/sync/changes', guarded, (req) =>
+    tenant(req, async (ctx) => {
+      requireScope(ctx, 'notes:read');
+      return syncV2Service.syncV2Changes(ctx, SyncV2ChangesRequest.parse(req.query));
+    }),
+  );
+
+  app.post('/v2/sync/push', guarded, (req) =>
+    tenant(req, async (ctx) => {
+      requireScope(ctx, 'notes:write');
+      return syncV2Service.syncV2Push(ctx, SyncV2PushRequest.parse(req.body));
     }),
   );
 

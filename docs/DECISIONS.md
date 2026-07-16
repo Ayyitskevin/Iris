@@ -409,8 +409,9 @@ authenticated actor, device, and a SHA-256 fingerprint of the parsed payload. A
 `receipt_version` freezes both that fingerprint algorithm and the stored-outcome
 parser; unknown versions fail closed before note mutation. The applied-or-conflict
 outcome is written in the same tenant transaction as note history and activity. An
-exact retry replays that validated outcome without another write; any other reuse fails
-loud, and a collision rolls back the full request batch. Pushes take the workspace
+exact retry replays that validated outcome without another resource mutation,
+history/activity entry, receipt, or logical cursor advance; any other reuse fails loud,
+and a collision rolls back the full request batch. Pushes take the workspace
 cursor lock before any operation receipt so reversed operation orders cannot deadlock
 receipt rows against the cursor row.
 
@@ -566,6 +567,63 @@ its reviewed base. Once that exact resurrection is durably staged, newer edits r
 separate upsert and are rebased onto the authoritative revived version after response.
 This preserves both explicit lifecycle intent and post-dispatch drafts without adding a
 replica or database migration.
+
+---
+
+## ADR-016 — Additive generic sync envelope with immutable resource-set cursors
+
+**Accepted as a server/shared-client seam; the production mobile coordinator is not yet
+cut over.**
+
+Projects and tasks must share one owner-isolated sync engine with notes rather than grow
+a parallel transport. Iris therefore adds strict `GET /v2/sync/changes` and
+`POST /v2/sync/push` routes while leaving every `/v1` request, response, cursor, client
+method, and service behavior unchanged. The first resource set is the literal
+`notes-v1`; each resource envelope has a literal `note` type, a UUID id, and strict data.
+Unknown fields, missing write fields, unknown sets, and future resource types fail before
+any receipt or note write. The typed client exposes explicit `syncV2Changes` and
+`syncV2Push` methods with runtime response validation and no silent route fallback.
+
+`notes-v1` membership is immutable. Its opaque cursor is
+`resource-v1:notes-v1:<workspace-id>:<sequence>` and is rejected by `/v1`; legacy
+timestamp, bound-v1, and malformed/foreign/ahead cursors are rejected by `/v2`. Pull
+captures the workspace counter's high-water mark, selects only notes above the caller's
+sequence and at or below that mark, and advances an exhausted page to the captured high
+water. This can cross sequence slots allocated by resources outside the set without
+skipping them, because a future notes+projects+tasks superset must use a new set id and
+start from genesis. The complete wrapped envelope—not the inner note alone—is measured
+against the 50-resource/1 MiB page budget.
+
+Generic note mutations project losslessly to the frozen receipt-v1 object
+`{opId,type,note,baseVersion}` and call the existing atomic push service. Receipt version
+1 is deliberate: its fingerprint already binds actor, device, operation type, every note
+field, and base version, while its stored applied/conflict outcome contains the complete
+authoritative note. A `/v2` operation can therefore replay through `/v1` (or the reverse)
+after a lost response without another resource mutation, history/activity entry, receipt,
+or logical cursor advance. The existing no-op cursor-row update still acquires the
+workspace serialization lock.
+Writing receipt version 2 now would make a rolled-back old binary throw on an already
+committed outcome and strand the exact retry. A second resource type, another resource
+set, or any behavior-bearing metadata requires receipt version 2 before its schema is
+admitted.
+
+Push still accepts at most six operations and 1,900,000 serialized bytes. The complete
+generic result is checked against the same 1,900,000-byte response budget. If multiple
+legacy resources would exceed it, the tenant transaction rolls back and the caller must
+split the exact operations; one recognized pre-limit oversized resource remains a
+lossless exception for both push and pull. Focused tests prove both cross-route replay
+directions, frozen pre-generic receipt parsing, applied/conflict/lifecycle projection,
+strict zero-write rejection, tenant/device/scope fences, route/set/workspace cursor
+isolation, excluded-resource high-water advancement, atomic collision and response-size
+rollback, bounded multi-page drains, and strict client response parsing.
+
+This ADR adds no database table, migration, project/task model, or mobile state change.
+The current coordinator remains on `/v1` until SQLite/IndexedDB repositories can persist
+the resource-set id, cursor, pending envelope, resources, and outbox transactionally.
+Before that cutover, request-aware reconciliation must also prove that every push result
+names exactly one submitted operation and returns the expected resource/lifecycle shape;
+the additive client method currently validates the standalone response schema only.
+Cross-tab web ownership, recovery import, and native acceptance remain release gates.
 
 ---
 
