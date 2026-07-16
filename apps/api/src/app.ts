@@ -239,21 +239,37 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
   app.get('/v1/notes/:id/versions', guarded, (req) =>
     tenant(req, async (ctx) => {
       requireScope(ctx, 'notes:read');
-      const versions = await notesService.listVersions(ctx, (req.params as { id: string }).id);
-      return { versions: versions.map(serializeVersion) };
+      const history = await notesService.listVersions(ctx, (req.params as { id: string }).id);
+      return {
+        versions: history.versions.map(serializeVersion),
+        headVersion: history.headVersion,
+        restoreProtocolVersion: 1,
+      };
     }),
   );
 
   app.post('/v1/notes/:id/restore', guarded, (req) =>
     tenant(req, async (ctx) => {
       requireScope(ctx, 'notes:write');
-      const { versionId } = RestoreVersionRequest.parse(req.body);
-      const note = await notesService.restoreVersion(
+      if (
+        !req.body ||
+        typeof req.body !== 'object' ||
+        !Object.prototype.hasOwnProperty.call(req.body, 'baseVersion')
+      ) {
+        throw new HttpError(
+          428,
+          'restore_precondition_required',
+          'Reload version history with a current Iris client before restoring',
+        );
+      }
+      const input = RestoreVersionRequest.parse(req.body);
+      return notesService.restoreVersion(
         ctx,
         (req.params as { id: string }).id,
-        versionId,
+        input.versionId,
+        input.baseVersion,
+        input.preserveCurrentFolderIfUnknown,
       );
-      return { note };
     }),
   );
 
@@ -290,7 +306,7 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
   app.get('/v1/activity', guarded, (req) =>
     tenant(req, async (ctx) => {
       requireScope(ctx, 'notes:read');
-      return { activity: await activityService.listActivity(ctx) };
+      return { activity: await activityService.listActivity(ctx), undoProtocolVersion: 1 };
     }),
   );
 

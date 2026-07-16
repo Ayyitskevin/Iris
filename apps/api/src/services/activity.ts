@@ -7,7 +7,7 @@ import { and, desc, eq, inArray } from 'drizzle-orm';
 import type { ActivityEntry, Note } from '@iris/shared';
 import { activityLog, noteVersions, notes } from '../db/schema';
 import type { Ctx } from '../context';
-import { badRequest, notFound } from '../lib/errors';
+import { badRequest, conflict, notFound } from '../lib/errors';
 import { serializeActivity, serializeNote } from '../serialize';
 import { loadNote, recordVersionAndActivity, throwConcurrentNoteChange } from './note-write';
 
@@ -30,6 +30,7 @@ export async function listActivity(ctx: Ctx): Promise<ActivityEntry[]> {
 export interface UndoResult {
   undo: ActivityEntry;
   note: Note | null;
+  folderRestored: boolean;
 }
 
 export async function undoActivity(ctx: Ctx, activityId: string): Promise<UndoResult> {
@@ -58,11 +59,20 @@ export async function undoActivity(ctx: Ctx, activityId: string): Promise<UndoRe
 
   const note = await loadNote(ctx, target.noteId);
   if (!note) throw notFound('Note not found');
+  if (note.version !== target.resultingVersion) {
+    throw conflict(
+      "This action is no longer the note's current head and cannot be safely undone",
+      serializeNote(note),
+    );
+  }
 
   const priorVersion = target.resultingVersion - 1;
   let newTitle = note.title;
   let newBody = note.bodyMd;
-  let newDeletedAt: Date | null = note.deletedAt;
+  let newFolder = note.folder;
+  let newTags = note.tags ?? [];
+  let newDeletedAt: Date | null;
+  let folderRestored = true;
 
   if (priorVersion >= 1) {
     // Restore the snapshot that preceded the undone action.
@@ -77,11 +87,18 @@ export async function undoActivity(ctx: Ctx, activityId: string): Promise<UndoRe
         ),
       );
     const prior = priorRows[0];
-    if (prior) {
-      newTitle = prior.title;
-      newBody = prior.bodyMd;
-      newDeletedAt = null; // undoing back to a live state revives the note
+    if (!prior) {
+      throw badRequest(
+        'The snapshot required to undo this action is missing',
+        'incomplete_history',
+      );
     }
+    newTitle = prior.title;
+    newBody = prior.bodyMd;
+    newTags = prior.tags ?? [];
+    folderRestored = prior.folderSnapshotKnown;
+    if (folderRestored) newFolder = prior.folder;
+    newDeletedAt = null; // undoing back to a live state revives the note
   } else {
     // Undoing the very first create => the note should cease to exist.
     newDeletedAt = new Date();
@@ -92,6 +109,8 @@ export async function undoActivity(ctx: Ctx, activityId: string): Promise<UndoRe
     .set({
       title: newTitle,
       bodyMd: newBody,
+      folder: newFolder,
+      tags: newTags,
       deletedAt: newDeletedAt,
       version: note.version + 1,
       updatedAt: new Date(),
@@ -115,5 +134,6 @@ export async function undoActivity(ctx: Ctx, activityId: string): Promise<UndoRe
   return {
     undo: serializeActivity(undoRows[0]!, false),
     note: head.deletedAt ? null : serializeNote(head),
+    folderRestored,
   };
 }

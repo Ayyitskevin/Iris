@@ -4,8 +4,12 @@
  * workspace-scoped implicitly by the bearer token.
  */
 import {
+  ActivityListResponse as ActivityListResponseSchema,
+  NoteVersionListResponse as NoteVersionListResponseSchema,
+  RestoreVersionResponse as RestoreVersionResponseSchema,
   SyncChangesResponse as SyncChangesResponseSchema,
   SyncPushResponse as SyncPushResponseSchema,
+  UndoResponse as UndoResponseSchema,
 } from './schemas';
 import type {
   ActivityListResponse,
@@ -21,6 +25,7 @@ import type {
   NoteVersionListResponse,
   RegisterDeviceRequest,
   RestoreVersionRequest,
+  RestoreVersionResponse,
   SearchResponse,
   SignInRequest,
   SignUpRequest,
@@ -160,9 +165,17 @@ export function createApiClient(options: ApiClientOptions) {
 
     // --- Versions ---
     listVersions: (id: string) =>
-      request<NoteVersionListResponse>('GET', `/v1/notes/${id}/versions`),
+      request<NoteVersionListResponse>(
+        'GET',
+        `/v1/notes/${id}/versions`,
+        undefined,
+        undefined,
+        (value) => NoteVersionListResponseSchema.parse(value),
+      ),
     restoreVersion: (id: string, b: RestoreVersionRequest) =>
-      request<{ note: Note }>('POST', `/v1/notes/${id}/restore`, b),
+      request<RestoreVersionResponse>('POST', `/v1/notes/${id}/restore`, b, undefined, (value) =>
+        RestoreVersionResponseSchema.parse(value),
+      ),
 
     // --- Agents ---
     issueAgentToken: (b: IssueAgentTokenRequest) =>
@@ -171,8 +184,14 @@ export function createApiClient(options: ApiClientOptions) {
     revokeAgentToken: (id: string) => request<void>('DELETE', `/v1/agents/tokens/${id}`),
 
     // --- Activity ---
-    listActivity: () => request<ActivityListResponse>('GET', '/v1/activity'),
-    undoActivity: (id: string) => request<UndoResponse>('POST', `/v1/activity/${id}/undo`),
+    listActivity: () =>
+      request<ActivityListResponse>('GET', '/v1/activity', undefined, undefined, (value) =>
+        ActivityListResponseSchema.parse(value),
+      ),
+    undoActivity: (id: string) =>
+      request<UndoResponse>('POST', `/v1/activity/${id}/undo`, undefined, undefined, (value) =>
+        UndoResponseSchema.parse(value),
+      ),
 
     // --- Sync ---
     syncChanges: (since: string, deviceId: string) =>

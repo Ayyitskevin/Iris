@@ -231,16 +231,24 @@ A note's canonical content is a **Markdown string** (`body_md`) plus light metad
 (title, folder). **Folders** (not tags) are the organizational primitive for the
 foundation — one is enough; the other is a documented follow-up.
 
-**Every save writes a `note_versions` row** (immutable snapshot: body, title, author
-principal, timestamp, monotonically increasing `version`; tags were added in ADR-010,
-while folder is not yet snapshotted). The live `notes` row is a
-denormalized pointer to the current state for fast reads. This makes versioning
-_load-bearing for pillar #2_ (reversibility) rather than a feature to add later:
+**Every save writes a `note_versions` row** (immutable snapshot: body, title, folder,
+tags, author principal, timestamp, monotonically increasing `version`). Migration `0004`
+adds explicit folder-snapshot knownness so a historical SQL `NULL` (the real root folder)
+cannot be confused with a legacy snapshot that never captured folder at all (ADR-013).
+The live `notes` row is a denormalized pointer to the current state for fast reads. This
+makes versioning _load-bearing for pillar #2_ (reversibility) rather than a feature to
+add later:
 
 - Restore = write the recorded snapshot fields as a new version (history is never rewritten).
-- Undo of an agent action = restore the currently supported pre-action content fields,
-  logged as a compensating entry in the activity log. Exact folder/tag parity is the
-  separate ROADMAP correctness slice described under ADR-010.
+- Undo of an agent action = restore the pre-action content and organization fields only
+  while that action is still the note's head, logged as a compensating entry in the
+  activity log. A later committed action makes whole-snapshot undo conflict instead of
+  erasing the newer work.
+- A direct restore includes the rendered head version as `baseVersion`; a stale history
+  choice conflicts instead of overwriting a newer committed head.
+
+Deleted/tombstone state is not yet included in these snapshots. Exact reversal of a note
+revival is therefore a separate ROADMAP correctness gate rather than an implied claim.
 
 ---
 
@@ -255,8 +263,11 @@ _load-bearing for pillar #2_ (reversibility) rather than a feature to add later:
 - **Every note write** (by a user _or_ an agent) appends to `activity_log` (actor type +
   id, action, target note, resulting version, timestamp). The log is **append-only** —
   undo does not delete history, it appends a compensating action.
-- The **activity feed** screen reads this log; **undo** restores the currently supported
-  pre-action content fields as a new head version.
+- The **activity feed** screen reads this log; **undo** restores title, body, folder, and
+  tags as a new head version only when the target action remains current. A legacy
+  snapshot with unknown folder state preserves the current folder and returns that
+  partial result explicitly; missing required history and stale target actions fail
+  loud. Deleted/tombstone-state reversal remains open in ROADMAP.
 
 Agent-token rate limiting is not implemented yet; it remains an explicit ROADMAP item.
 
@@ -266,13 +277,11 @@ Agent-token rate limiting is not implemented yet; it remains an explicit ROADMAP
 
 **Accepted.**
 
-**Tags** are a `jsonb` string array on `notes` and on every `note_versions` snapshot.
-They are versioned and direct version restore carries them forward, but activity undo
-does not yet restore tags and version snapshots do not yet include folders. Closing that
-organizational-field reversibility gap is a separate next correctness slice in ROADMAP.
-Chosen over a normalized `note_tags` join table because tags then travel with the note
-through sync (part of the note payload), export (frontmatter), and history — with no
-joins. Membership filtering uses the
+**Tags** are a `jsonb` string array on `notes` and on every new `note_versions` snapshot.
+They are versioned and both direct restore and activity undo carry them forward alongside
+folders (ADR-013). Chosen over a normalized `note_tags` join table because tags then
+travel with the note through sync (part of the note payload), export (frontmatter), and
+history — with no joins. Membership filtering uses the
 jsonb `?` operator, backed by a GIN index; the tag list is aggregated (small workspaces).
 Tags are normalized (trim / lowercase / de-dupe) at the service boundary so `Work` and
 `work` collapse. Folders remain the primary org primitive; tags are orthogonal and
@@ -369,16 +378,16 @@ The runner owns a checksummed migration ledger. It recognizes only frozen legacy
 or 0001+0002 safety-critical structural signatures—including exact RLS policies, column
 shapes, critical indexes, and foundation constraints—records that baseline, and then
 applies each pending SQL file plus receipt atomically. It also verifies the current-head
-0003 safety-critical artifacts against that receipt on later runs; a receipt alone is
-not accepted as proof. Partial or drifted signatures, checksum drift, history gaps,
-unknown receipts, and unledgered or mismatched 0003 artifacts fail loud. Real Postgres
-runs are serialized by one same-session advisory lock.
+additive safety-critical artifacts for every applied migration against their receipts on
+later runs: migration `0003` remains checked after `0004` adds version-organization
+columns and defaults. A receipt alone is not accepted as proof. Partial or drifted
+signatures, checksum drift, history gaps, unknown receipts, and unledgered or mismatched
+artifacts fail loud. Real Postgres runs are serialized by one same-session advisory lock.
 
-CI now provisions a dedicated PostgreSQL 16 service and is configured to run the
-independent-connection concurrency gate for commit-ordered note sequences and
-serialized free-plan device claims. This integration did not supply a local
-`IRIS_TEST_POSTGRES_URL`, so it does not claim a green real-Postgres execution before
-the first pushed CI run.
+CI provisions a dedicated PostgreSQL 16 service and runs the independent-connection
+concurrency gate for commit-ordered note sequences and serialized free-plan device
+claims. GitHub Actions run `29506816638` passed that gate for exact commit
+`8a8785114623d3e601f26ddf7b6eed21b23415cf`.
 
 Client-chosen note and device ids now identify rows only together with their workspace;
 the same local id can therefore exist safely in two workspaces. A signed-in user must
@@ -425,6 +434,50 @@ request, or retry without discarding the exact pending payload.
 This closes the durable transport half, but it does not make the current
 SecureStore/localStorage replica transactional; the remaining Sync v2 and release
 boundaries are tracked in ROADMAP.
+
+---
+
+## ADR-013 — Exact organizational history with explicit legacy uncertainty
+
+**Accepted.**
+
+Migration `0004` adds `folder` and `folder_snapshot_known` to `note_versions`. The
+knownness marker defaults to `false`, so a rolling old binary that omits both fields
+creates an explicitly incomplete snapshot rather than falsely recording root. During
+upgrade, only a snapshot whose version is provably the live note's current version is
+backfilled from `notes.folder`; older snapshots remain unknown. The migration suspends
+and restores FORCE RLS transactionally for that backfill, and its exact columns,
+defaults, and existing RLS policies join the migration runner's additive artifact gate.
+Every new write supplies the folder explicitly and marks it known.
+
+Version-history responses carry an authoritative `headVersion` and
+`restoreProtocolVersion`. Direct restore requires that head as `baseVersion` alongside
+`versionId`; it restores title, body, tags, and an exact known folder into a new head
+version. A stale base receives the ordinary authoritative version conflict. A new client
+can display but disables restore against any non-current protocol (including an unknown
+future version), and a new server returns `428 restore_precondition_required` before
+mutation when an old client omits the base. This is a fail-closed mixed-deployment
+cutover, not silent compatibility. A legacy unknown folder fails closed unless the
+caller explicitly chooses to preserve the current folder; the response reports
+`folderRestored` so that choice cannot masquerade as an exact restore.
+
+Activity responses similarly advertise `undoProtocolVersion`; a new client leaves undo
+disabled while still showing activity from a non-current protocol. On the current
+protocol, undo restores the prior title, body, tags, and exact known folder as a
+compensating write only if the target action is still the note's head. A later head
+returns an authoritative conflict. For legacy unknown folders it preserves the current
+folder and reports the partial result; if the required prior snapshot is missing, it
+records no fake success and returns `incomplete_history`. Version-list, activity-list,
+restore, and undo responses are runtime validated by the shared client. A focused mobile
+safety kernel tests frozen-head gating, route/request invalidation, latest-per-note undo,
+and ambiguous completion classification. The screens distinguish load failure from an
+empty list, announce errors, label legacy content-only restores, refresh the tag editor
+after restore, and surface any unproven organization state.
+
+This ADR does **not** claim full state reversibility. `note_versions` still omits the
+deleted/tombstone bit, so restoring or syncing a write over a deleted note can revive it
+without leaving enough history for a later undo to reconstruct the prior tombstone. That
+separate correctness gate remains explicit in ROADMAP.
 
 ---
 

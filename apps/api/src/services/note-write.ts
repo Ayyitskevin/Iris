@@ -46,6 +46,8 @@ export async function recordVersionAndActivity(
     version: note.version,
     title: note.title,
     bodyMd: note.bodyMd,
+    folder: note.folder,
+    folderSnapshotKnown: true,
     tags: note.tags ?? [],
     authorType: ctx.principal.type,
     authorId: ctx.principal.id,

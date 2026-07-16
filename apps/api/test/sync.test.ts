@@ -32,7 +32,13 @@ describe('local-first sync', () => {
           {
             opId: 'op1',
             type: 'upsert',
-            note: { id: noteId, title: 'Offline note', bodyMd: 'made offline', folder: null },
+            note: {
+              id: noteId,
+              title: 'Offline note',
+              bodyMd: 'made offline',
+              folder: 'offline/inbox',
+              tags: ['Local', 'local'],
+            },
             baseVersion: 0,
           },
         ],
@@ -42,6 +48,10 @@ describe('local-first sync', () => {
     expect(push1.json.applied).toHaveLength(1);
     expect(push1.json.conflicts).toHaveLength(0);
     expect(push1.json.applied[0].note.version).toBe(1);
+    expect(push1.json.applied[0].note).toMatchObject({
+      folder: 'offline/inbox',
+      tags: ['local'],
+    });
 
     // Pull from genesis returns the note and advances the cursor.
     const pull1 = await call(t.app, 'GET', `/v1/sync/changes?since=&deviceId=${deviceId}`, {
@@ -61,13 +71,42 @@ describe('local-first sync', () => {
           {
             opId: 'op2',
             type: 'upsert',
-            note: { id: noteId, title: 'Offline note', bodyMd: 'edited on device', folder: null },
+            note: {
+              id: noteId,
+              title: 'Offline note',
+              bodyMd: 'edited on device',
+              folder: 'offline/archive',
+              tags: ['Edited'],
+            },
             baseVersion: 1,
           },
         ],
       },
     });
     expect(push2.json.applied[0].note.version).toBe(2);
+    expect(push2.json.applied[0].note).toMatchObject({
+      folder: 'offline/archive',
+      tags: ['edited'],
+    });
+    const history = await call(t.app, 'GET', `/v1/notes/${noteId}/versions`, {
+      token: u.token,
+    });
+    expect(history.json.versions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          version: 1,
+          folder: 'offline/inbox',
+          folderSnapshotKnown: true,
+          tags: ['local'],
+        }),
+        expect.objectContaining({
+          version: 2,
+          folder: 'offline/archive',
+          folderSnapshotKnown: true,
+          tags: ['edited'],
+        }),
+      ]),
+    );
 
     // A stale update (baseVersion 1 again) conflicts and returns the server state.
     const push3 = await call(t.app, 'POST', '/v1/sync/push', {
@@ -96,7 +135,15 @@ describe('local-first sync', () => {
       `/v1/sync/changes?since=${encodeURIComponent(cursor)}&deviceId=${deviceId}`,
       { token: u.token },
     );
-    expect(pull2.json.changes.some((n: any) => n.id === noteId && n.version === 2)).toBe(true);
+    expect(
+      pull2.json.changes.some(
+        (note: any) =>
+          note.id === noteId &&
+          note.version === 2 &&
+          note.folder === 'offline/archive' &&
+          note.tags.join(',') === 'edited',
+      ),
+    ).toBe(true);
   });
 
   it('accepts UUIDs without RFC version bits across REST, push, and V1 cursors', async () => {

@@ -20,8 +20,9 @@ A thin, end-to-end vertical slice that proves the architecture:
 - **Multi-tenant auth + workspaces** — sign up → your own isolated workspace.
 - **Notes core** — create/edit/delete Markdown notes in folders, with versioned content
   history and forward-only restore. **Tags + full-text search** (phase 2, ADR-010):
-  ranked search and tag filtering, both workspace-scoped. Exact folder/tag restore and
-  undo semantics remain a tracked correctness slice.
+  ranked search and tag filtering, both workspace-scoped. New history snapshots restore
+  folders and tags exactly; legacy snapshots expose unknown folder state instead of
+  pretending it was captured (ADR-013).
 - **Owner-isolated local-first sync** — edits apply instantly/offline; each user/workspace
   has a private replica and fixed-token sync lease; a change-feed reconciles to Postgres;
   conflicts retain both versions in a dedicated Review inbox.
@@ -124,13 +125,22 @@ payload + frozen receipt version; cursors bind a commit-serialized sequence to o
 workspace. Terminal protocol failures persist an owner-local hold and require a visible
 manual recovery action before networking resumes.
 A checksummed migration ledger adopts only recognized legacy postconditions and verifies
-current-head artifacts on later runs. Focused tests cover transport bounds, lost
+every applied additive safety signature, including Sync v2 and organizational-history
+artifacts, on later runs. Focused tests cover transport bounds, lost
 responses, persistence races, exact applied/conflict replay, non-`BYPASSRLS`
 upgrade-with-data, delayed push/pull, pagination, sign-out, account switch, stale 401,
 cross-workspace cursor rejection, and A-outbox/B-token separation (ADR-011/012). Generic
 resource envelopes, transactional SQLite/IndexedDB replicas, web cross-tab coordination,
 recovery import, and native device/simulator acceptance remain explicit release blockers.
-CI now provisions PostgreSQL 16 and is configured to run the independent-connection
-commit-order and concurrent device-gate test. This local integration did not provide
-`IRIS_TEST_POSTGRES_URL`, so a green pushed CI run is still required before claiming
-that real-Postgres gate passed.
+GitHub Actions run `29506816638` passed the PostgreSQL 16
+independent-connection commit-order and concurrent device-gate gate for commit
+`8a8785114623d3e601f26ddf7b6eed21b23415cf`.
+
+ADR-013 adds migration `0004` and closes folder/tag parity for new version snapshots,
+direct restore, and head-safe activity undo. History responses bind restore to one
+authoritative head and advertise the safe protocol. New clients disable mutation against
+non-current protocol while retaining read-only history/activity; the new server rejects
+old restore requests that lack a precondition. Old snapshots preserve a visibly
+unknown folder rather than silently treating SQL `NULL` as historical root.
+Deleted/tombstone state is not yet part of version snapshots, so exact undo of a restore
+or sync revival remains a tracked correctness gap in ROADMAP.

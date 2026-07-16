@@ -615,6 +615,39 @@ END`,
   ],
 };
 
+/**
+ * Exact 0004 delta. Existing notes/note_versions policies are preexisting evidence:
+ * they must still be exact after the RLS-suspended backfill, but cannot make an
+ * unledgered 0004 appear present before either new column exists.
+ */
+const NOTE_VERSION_ORGANIZATION_SIGNATURE: LegacySignature = {
+  name: '0004_note_version_organization.sql',
+  columnDefinitions: [
+    {
+      table: 'note_versions',
+      column: 'folder',
+      dataType: 'text',
+      nullable: true,
+    },
+    {
+      table: 'note_versions',
+      column: 'folder_snapshot_known',
+      dataType: 'boolean',
+      nullable: false,
+      defaultExpression: 'false',
+    },
+  ],
+  policies: [
+    workspaceIsolationPolicy('notes', true),
+    workspaceIsolationPolicy('note_versions', true),
+  ],
+};
+
+// Additive successors retain earlier load-bearing artifacts. Every receipt in this
+// list is therefore re-proven on startup; a future superseding migration must replace
+// its signature deliberately rather than disabling verification by accident.
+const MIGRATION_ARTIFACT_SIGNATURES = [SYNC_V2_SIGNATURE, NOTE_VERSION_ORGANIZATION_SIGNATURE];
+
 const pgliteMigrationQueues = new WeakMap<PGlite, Promise<void>>();
 
 export function migrationSql(): { name: string; sql: string }[] {
@@ -1043,19 +1076,20 @@ async function signatureState(
   };
 }
 
-async function assertSyncV2ArtifactConsistency(
+async function assertMigrationArtifactConsistency(
   client: QueryClient,
+  signature: LegacySignature,
   expectedState: 'absent' | 'current',
 ): Promise<void> {
-  const state = await signatureState(client, SYNC_V2_SIGNATURE);
+  const state = await signatureState(client, signature);
   if (expectedState === 'absent' && state.any) {
     throw new Error(
-      `Database contains unledgered 0003_sync_v2.sql artifacts; refusing to guess: ${state.evidence.join(', ')}`,
+      `Database contains unledgered ${signature.name} artifacts; refusing to guess: ${state.evidence.join(', ')}`,
     );
   }
   if (expectedState === 'current' && !state.complete) {
     throw new Error(
-      `Database migration 0003_sync_v2.sql receipt does not match its schema artifacts: ${state.failures.join(', ')}`,
+      `Database migration ${signature.name} receipt does not match its schema artifacts: ${state.failures.join(', ')}`,
     );
   }
 }
@@ -1097,7 +1131,9 @@ async function baselineLegacyDatabase(
     applied.push(signature.name);
   }
 
-  await assertSyncV2ArtifactConsistency(client, 'absent');
+  for (const signature of MIGRATION_ARTIFACT_SIGNATURES) {
+    await assertMigrationArtifactConsistency(client, signature, 'absent');
+  }
 
   if (applied.length === 0) return;
   const values: unknown[] = [];
@@ -1152,13 +1188,12 @@ async function prepareMigrationState(
     }
   }
 
-  const appliedNames = migrations
-    .map((migration) => migration.name)
-    .filter((name) => applied.has(name));
-  if (!applied.has(SYNC_V2_SIGNATURE.name)) {
-    await assertSyncV2ArtifactConsistency(client, 'absent');
-  } else if (appliedNames.at(-1) === SYNC_V2_SIGNATURE.name) {
-    await assertSyncV2ArtifactConsistency(client, 'current');
+  for (const signature of MIGRATION_ARTIFACT_SIGNATURES) {
+    await assertMigrationArtifactConsistency(
+      client,
+      signature,
+      applied.has(signature.name) ? 'current' : 'absent',
+    );
   }
 
   return new Set(applied.keys());
@@ -1180,8 +1215,9 @@ async function applyMigrationsPgliteUnlocked(client: PGlite): Promise<void> {
     await client.transaction(async (tx) => {
       await tx.exec(migration.sql);
       await recordMigration(tx, migration.name, migration.sql);
-      if (migration.name === SYNC_V2_SIGNATURE.name) {
-        await assertSyncV2ArtifactConsistency(tx, 'current');
+      for (const signature of MIGRATION_ARTIFACT_SIGNATURES) {
+        if (signature.name > migration.name) continue;
+        await assertMigrationArtifactConsistency(tx, signature, 'current');
       }
     });
   }
@@ -1217,8 +1253,9 @@ export async function applyMigrationsPostgres(connectionString: string): Promise
       try {
         await client.query(migration.sql);
         await recordMigration(client, migration.name, migration.sql);
-        if (migration.name === SYNC_V2_SIGNATURE.name) {
-          await assertSyncV2ArtifactConsistency(client, 'current');
+        for (const signature of MIGRATION_ARTIFACT_SIGNATURES) {
+          if (signature.name > migration.name) continue;
+          await assertMigrationArtifactConsistency(client, signature, 'current');
         }
         await client.query('COMMIT');
       } catch (error) {

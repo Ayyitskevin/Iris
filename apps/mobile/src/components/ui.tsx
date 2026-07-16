@@ -40,12 +40,14 @@ export function Button({
   variant = 'primary',
   loading,
   disabled,
+  accessibilityLabel,
 }: {
   label: string;
   onPress: () => void;
   variant?: 'primary' | 'ghost' | 'danger';
   loading?: boolean;
   disabled?: boolean;
+  accessibilityLabel?: string;
 }) {
   const bg =
     variant === 'primary'
@@ -58,6 +60,8 @@ export function Button({
     <Pressable
       onPress={onPress}
       disabled={disabled || loading}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel ?? label}
       style={({ pressed }) => [
         styles.button,
         { backgroundColor: bg, opacity: disabled ? 0.5 : pressed ? 0.85 : 1 },
@@ -80,7 +84,12 @@ export function Card({ children, style }: { children: ReactNode; style?: ViewPro
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: theme.colors.bg },
   screenInner: { flex: 1, padding: theme.space(4) },
-  title: { color: theme.colors.text, fontSize: 26, fontWeight: '700', marginBottom: theme.space(2) },
+  title: {
+    color: theme.colors.text,
+    fontSize: 26,
+    fontWeight: '700',
+    marginBottom: theme.space(2),
+  },
   muted: { color: theme.colors.textDim, fontSize: 14 },
   field: {
     backgroundColor: theme.colors.surface,

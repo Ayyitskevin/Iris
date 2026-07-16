@@ -24,6 +24,14 @@ describe('tenant isolation', () => {
     expect(created.status).toBe(201);
     const noteId = created.json.note.id;
     expect(created.json.note.workspaceId).toBe(alice.workspaceId);
+    const aliceHistory = await call(t.app, 'GET', `/v1/notes/${noteId}/versions`, {
+      token: alice.token,
+    });
+    const aliceVersionId = aliceHistory.json.versions[0].id;
+    const aliceActivity = await call(t.app, 'GET', '/v1/activity', { token: alice.token });
+    const aliceActivityId = aliceActivity.json.activity.find(
+      (entry: any) => entry.noteId === noteId,
+    ).id;
 
     // Bob's list never contains Alice's note.
     const bobList = await call(t.app, 'GET', '/v1/notes', { token: bob.token });
@@ -47,13 +55,28 @@ describe('tenant isolation', () => {
     });
     expect(bobDelete.status).toBe(404);
 
+    // History, restore, and activity undo preserve the same boundary.
+    const bobHistory = await call(t.app, 'GET', `/v1/notes/${noteId}/versions`, {
+      token: bob.token,
+    });
+    expect(bobHistory.status).toBe(404);
+    const bobRestore = await call(t.app, 'POST', `/v1/notes/${noteId}/restore`, {
+      token: bob.token,
+      body: { versionId: aliceVersionId, baseVersion: 1 },
+    });
+    expect(bobRestore.status).toBe(404);
+    const bobUndo = await call(t.app, 'POST', `/v1/activity/${aliceActivityId}/undo`, {
+      token: bob.token,
+    });
+    expect(bobUndo.status).toBe(404);
+
     // Alice still sees exactly her one note, unchanged.
     const aliceList = await call(t.app, 'GET', '/v1/notes', { token: alice.token });
     expect(aliceList.json.notes).toHaveLength(1);
     expect(aliceList.json.notes[0].bodyMd).toBe('private to alice');
   });
 
-  it("an agent token is scoped to its own workspace and cannot cross the boundary", async () => {
+  it('an agent token is scoped to its own workspace and cannot cross the boundary', async () => {
     const alice = await signUp(t.app);
     const bob = await signUp(t.app);
 

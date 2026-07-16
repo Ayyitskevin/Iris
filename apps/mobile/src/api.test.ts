@@ -201,3 +201,224 @@ describe('successful sync response validation', () => {
     ).rejects.toBeInstanceOf(ApiResponseValidationError);
   });
 });
+
+describe('successful version-history response validation', () => {
+  const legacyVersion = {
+    id: 'version-1',
+    noteId: 'note-1',
+    workspaceId: sessionA.workspaceId,
+    version: 1,
+    title: 'Legacy title',
+    bodyMd: 'Legacy body',
+    authorType: 'user',
+    authorId: sessionA.userId,
+    authorName: sessionA.displayName,
+    createdAt: '2026-07-16T12:00:00.000Z',
+  };
+
+  it('normalizes fields omitted by an older server to honest legacy values', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ versions: [legacyVersion] }), { status: 200 }),
+    );
+
+    const result = await apiForLease(openSessionLease()!).listVersions('note-1');
+    expect(result.restoreProtocolVersion).toBe(0);
+    expect(result.headVersion).toBeUndefined();
+    expect(result.versions[0]).toMatchObject({
+      folder: null,
+      folderSnapshotKnown: false,
+      tags: [],
+    });
+  });
+
+  it('rejects malformed organization metadata instead of rendering invented history', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          versions: [
+            {
+              ...legacyVersion,
+              folder: 'projects',
+              folderSnapshotKnown: 'yes',
+              tags: [],
+            },
+          ],
+          headVersion: 1,
+          restoreProtocolVersion: 1,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    await expect(apiForLease(openSessionLease()!).listVersions('note-1')).rejects.toBeInstanceOf(
+      ApiResponseValidationError,
+    );
+  });
+
+  it('rejects a claimed known folder when the folder value is omitted', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          versions: [
+            {
+              ...legacyVersion,
+              folderSnapshotKnown: true,
+              tags: [],
+            },
+          ],
+          headVersion: 1,
+          restoreProtocolVersion: 1,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    await expect(apiForLease(openSessionLease()!).listVersions('note-1')).rejects.toBeInstanceOf(
+      ApiResponseValidationError,
+    );
+  });
+
+  it('rejects restore protocol 1 without its authoritative head', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ versions: [legacyVersion], restoreProtocolVersion: 1 }), {
+        status: 200,
+      }),
+    );
+
+    await expect(apiForLease(openSessionLease()!).listVersions('note-1')).rejects.toBeInstanceOf(
+      ApiResponseValidationError,
+    );
+  });
+
+  it('rejects legacy field omissions under restore protocol 1', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          versions: [{ ...legacyVersion, tags: [] }],
+          headVersion: 1,
+          restoreProtocolVersion: 1,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    await expect(apiForLease(openSessionLease()!).listVersions('note-1')).rejects.toBeInstanceOf(
+      ApiResponseValidationError,
+    );
+  });
+
+  it('keeps a future restore protocol readable but distinguishable', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          versions: [
+            {
+              ...legacyVersion,
+              folder: null,
+              folderSnapshotKnown: false,
+              tags: [],
+            },
+          ],
+          headVersion: 1,
+          restoreProtocolVersion: 2,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const result = await apiForLease(openSessionLease()!).listVersions('note-1');
+    expect(result.restoreProtocolVersion).toBe(2);
+    expect(result.versions).toHaveLength(1);
+  });
+
+  it('rejects an older restore response that cannot prove its folder result', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          note: {
+            id: 'note-1',
+            workspaceId: sessionA.workspaceId,
+            title: 'Restored',
+            bodyMd: 'Body',
+            folder: 'current/folder',
+            tags: ['legacy'],
+            version: 2,
+            createdAt: '2026-07-16T12:00:00.000Z',
+            updatedAt: '2026-07-16T12:01:00.000Z',
+            deletedAt: null,
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+
+    await expect(
+      apiForLease(openSessionLease()!).restoreVersion('note-1', {
+        versionId: 'version-1',
+        baseVersion: 1,
+        preserveCurrentFolderIfUnknown: true,
+      }),
+    ).rejects.toBeInstanceOf(ApiResponseValidationError);
+  });
+});
+
+describe('successful activity response validation', () => {
+  const activity = {
+    id: 'activity-1',
+    workspaceId: sessionA.workspaceId,
+    actorType: 'user',
+    actorId: sessionA.userId,
+    actorName: sessionA.displayName,
+    action: 'note.update',
+    noteId: 'note-1',
+    noteVersionId: 'version-2',
+    resultingVersion: 2,
+    createdAt: '2026-07-16T12:01:00.000Z',
+    undone: false,
+    undoOfId: null,
+  };
+
+  it('marks an older activity server as lacking head-guarded undo', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ activity: [activity] }), { status: 200 }),
+    );
+
+    const result = await apiForLease(openSessionLease()!).listActivity();
+    expect(result.undoProtocolVersion).toBe(0);
+    expect(result.activity).toHaveLength(1);
+  });
+
+  it('keeps a future undo protocol readable but distinguishable', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ activity: [activity], undoProtocolVersion: 2 }), {
+        status: 200,
+      }),
+    );
+
+    const result = await apiForLease(openSessionLease()!).listActivity();
+    expect(result.undoProtocolVersion).toBe(2);
+    expect(result.activity).toHaveLength(1);
+  });
+
+  it('rejects an older undo response that cannot prove its organization result', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ undo: activity, note: null }), { status: 200 }),
+    );
+
+    await expect(apiForLease(openSessionLease()!).undoActivity(activity.id)).rejects.toBeInstanceOf(
+      ApiResponseValidationError,
+    );
+  });
+
+  it('rejects malformed undo organization metadata', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ undo: activity, note: null, folderRestored: 'yes' }), {
+        status: 200,
+      }),
+    );
+
+    await expect(apiForLease(openSessionLease()!).undoActivity(activity.id)).rejects.toBeInstanceOf(
+      ApiResponseValidationError,
+    );
+  });
+});

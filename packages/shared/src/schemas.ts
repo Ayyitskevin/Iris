@@ -120,19 +120,44 @@ export const Note = z.object({
 });
 export type Note = z.infer<typeof Note>;
 
-export const NoteVersion = z.object({
+const NoteVersionBase = z.object({
   id: z.string(),
   noteId: z.string(),
   workspaceId: z.string(),
   version: z.number().int().nonnegative(),
   title: z.string(),
   bodyMd: z.string(),
-  tags: z.array(z.string()),
+  tags: z.array(z.string()).default([]),
   authorType: ActorType,
   authorId: z.string(),
   authorName: z.string(),
   createdAt: z.string(),
 });
+
+/**
+ * Pre-0004 servers omit both folder fields. Accept that pair as explicitly unknown,
+ * but reject a partial current payload: `known: true` without `folder` would invent an
+ * exact root snapshot, which is the ambiguity migration 0004 exists to eliminate.
+ */
+const CurrentNoteVersion = NoteVersionBase.extend({
+  // Protocol-1 servers must send the complete captured shape. Defaults are reserved
+  // for a negotiated protocol-0 response, never for a current safety claim.
+  folder: z.string().nullable(),
+  folderSnapshotKnown: z.boolean(),
+  tags: z.array(z.string()),
+});
+
+export const NoteVersion = z.union([
+  CurrentNoteVersion,
+  NoteVersionBase.extend({
+    folder: z.undefined().optional(),
+    folderSnapshotKnown: z.undefined().optional(),
+  }).transform((value) => ({
+    ...value,
+    folder: null,
+    folderSnapshotKnown: false as const,
+  })),
+]);
 export type NoteVersion = z.infer<typeof NoteVersion>;
 
 /** Public metadata about an agent token. The secret itself is returned exactly once. */
@@ -243,15 +268,42 @@ export const NoteListResponse = z.object({
 });
 export type NoteListResponse = z.infer<typeof NoteListResponse>;
 
-export const NoteVersionListResponse = z.object({
-  versions: z.array(NoteVersion),
-});
+export const NoteVersionListResponse = z.union([
+  z.object({
+    versions: z.array(CurrentNoteVersion),
+    restoreProtocolVersion: z.literal(1),
+    /** The authoritative server head against which every restore from this list is bound. */
+    headVersion: z.number().int().nonnegative(),
+  }),
+  z.object({
+    versions: z.array(NoteVersion),
+    /** Unknown/non-current protocols remain readable, while mutation stays disabled. */
+    restoreProtocolVersion: z
+      .number()
+      .int()
+      .nonnegative()
+      .refine((version) => version !== 1)
+      .default(0),
+    headVersion: z.number().int().nonnegative().optional(),
+  }),
+]);
 export type NoteVersionListResponse = z.infer<typeof NoteVersionListResponse>;
 
 export const RestoreVersionRequest = z.object({
   versionId: z.string(),
+  /** The current note version the operator saw before choosing this restore. */
+  baseVersion: z.number().int().nonnegative(),
+  /** Explicit consent to preserve today's folder when legacy history never captured it. */
+  preserveCurrentFolderIfUnknown: z.boolean().optional(),
 });
 export type RestoreVersionRequest = z.infer<typeof RestoreVersionRequest>;
+
+export const RestoreVersionResponse = z.object({
+  note: Note,
+  /** False only when an explicitly accepted legacy restore kept the current folder. */
+  folderRestored: z.boolean(),
+});
+export type RestoreVersionResponse = z.infer<typeof RestoreVersionResponse>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tags & search (phase 2)
@@ -310,6 +362,8 @@ export type AgentTokenListResponse = z.infer<typeof AgentTokenListResponse>;
 
 export const ActivityListResponse = z.object({
   activity: z.array(ActivityEntry),
+  /** Anything except 1 is read-only until this client understands its undo contract. */
+  undoProtocolVersion: z.number().int().nonnegative().default(0),
 });
 export type ActivityListResponse = z.infer<typeof ActivityListResponse>;
 
@@ -318,6 +372,8 @@ export const UndoResponse = z.object({
   undo: ActivityEntry,
   /** The note as it stands after the undo. Null if the undo re-deleted the note. */
   note: Note.nullable(),
+  /** False when legacy history could not prove the pre-action folder and kept it. */
+  folderRestored: z.boolean(),
 });
 export type UndoResponse = z.infer<typeof UndoResponse>;
 

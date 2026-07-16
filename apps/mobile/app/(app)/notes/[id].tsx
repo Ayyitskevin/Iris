@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import type { NoteVersion } from '@iris/shared';
@@ -20,6 +20,11 @@ import {
   useServerConflict,
 } from '../../../src/sync/manager';
 import { authenticatedRequest } from '../../../src/api';
+import {
+  canRestoreHistory,
+  classifyMutationFailure,
+  requestStillCurrent,
+} from '../../../src/history-safety';
 import { theme } from '../../../src/theme';
 
 export default function NoteEditor() {
@@ -28,7 +33,17 @@ export default function NoteEditor() {
   const conflict = useObs(() => (id ? store$.conflicts.get()[id] : undefined));
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
   const [versions, setVersions] = useState<NoteVersion[] | null>(null);
+  const [historyBaseVersion, setHistoryBaseVersion] = useState<number | null>(null);
+  const [restoreProtocolVersion, setRestoreProtocolVersion] = useState<number | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
+  const [restoringVersionId, setRestoringVersionId] = useState<string | null>(null);
   const [tagsText, setTagsText] = useState('');
+  const historyRequestRef = useRef(0);
+  const restoreRequestRef = useRef(0);
+  const routeIdentity = `${ownerKey ?? ''}:${id ?? ''}`;
+  const routeIdentityRef = useRef(routeIdentity);
+  routeIdentityRef.current = routeIdentity;
 
   useEffect(() => {
     // Best-effort: pull the latest server state for this note when opening.
@@ -40,7 +55,14 @@ export default function NoteEditor() {
   useEffect(() => {
     // Seed only when the note identity changes, not on every tag edit.
     if (note) setTagsText(note.tags.join(', '));
+    historyRequestRef.current += 1;
+    restoreRequestRef.current += 1;
     setVersions(null);
+    setHistoryBaseVersion(null);
+    setRestoreProtocolVersion(null);
+    setHistoryError(null);
+    setRestoreNotice(null);
+    setRestoringVersionId(null);
   }, [note?.id, ownerKey]);
 
   function commitTags() {
@@ -66,34 +88,128 @@ export default function NoteEditor() {
 
   async function loadHistory() {
     const ownerAtStart = ownerKey;
+    const pendingRequest = {
+      identity: routeIdentityRef.current,
+      requestId: ++historyRequestRef.current,
+    };
+    setHistoryError(null);
+    setRestoreNotice(null);
     try {
       const { lease, value } = await authenticatedRequest((api) => api.listVersions(id));
       assertCurrentSession(lease);
+      if (
+        !requestStillCurrent(pendingRequest, routeIdentityRef.current, historyRequestRef.current)
+      ) {
+        return;
+      }
       setVersions(value.versions);
+      setRestoreProtocolVersion(value.restoreProtocolVersion);
+      setHistoryBaseVersion(value.headVersion ?? null);
+      if (
+        value.restoreProtocolVersion === 1 &&
+        store$.notes[id].get()?.version !== value.headVersion
+      ) {
+        void sync();
+      }
     } catch {
-      if (store$.activeOwnerKey.get() === ownerAtStart) setVersions([]);
+      if (
+        requestStillCurrent(pendingRequest, routeIdentityRef.current, historyRequestRef.current) &&
+        store$.activeOwnerKey.get() === ownerAtStart
+      ) {
+        setVersions(null);
+        setHistoryBaseVersion(null);
+        setRestoreProtocolVersion(null);
+        setHistoryError('Version history could not be loaded. Your note is unchanged.');
+      }
     }
   }
 
-  async function restore(versionId: string) {
-    if (conflict) return;
+  const historyHeadMismatch = historyBaseVersion !== null && note.version !== historyBaseVersion;
+  const restoreAllowed = canRestoreHistory({
+    protocolVersion: restoreProtocolVersion,
+    historyHeadVersion: historyBaseVersion,
+    localHeadVersion: note.version,
+    blocked: Boolean(conflict || restoringVersionId),
+  });
+
+  async function restore(version: NoteVersion) {
+    if (!restoreAllowed || historyBaseVersion === null) return;
+    const ownerAtStart = ownerKey;
+    const pendingRequest = {
+      identity: routeIdentityRef.current,
+      requestId: ++restoreRequestRef.current,
+    };
+    const baseVersion = historyBaseVersion;
     let restoreLease: SessionLease | null = null;
+    setRestoringVersionId(version.id);
+    setHistoryError(null);
+    setRestoreNotice(null);
     try {
-      const { lease, value } = await authenticatedRequest((api) =>
-        api.restoreVersion(id, { versionId }),
-      );
-      restoreLease = lease;
+      const { lease, value } = await authenticatedRequest((api, requestLease) => {
+        restoreLease = requestLease;
+        return api.restoreVersion(id, {
+          versionId: version.id,
+          baseVersion,
+          preserveCurrentFolderIfUnknown: !version.folderSnapshotKnown,
+        });
+      });
       await updateReplicaForLease(lease, (current) => ({
         ...current,
         notes: { ...current.notes, [id]: value.note },
       }));
       assertCurrentSession(lease);
+      if (
+        !requestStillCurrent(pendingRequest, routeIdentityRef.current, restoreRequestRef.current)
+      ) {
+        return;
+      }
+      setTagsText(value.note.tags.join(', '));
+      setRestoreNotice(
+        value.folderRestored
+          ? null
+          : 'This legacy version restored its content and tags while keeping the current folder.',
+      );
       setVersions(null);
-    } catch {
-      if (restoreLease && isCurrentSession(restoreLease)) {
+      setHistoryBaseVersion(null);
+      setRestoreProtocolVersion(null);
+    } catch (error) {
+      const currentRoute =
+        requestStillCurrent(pendingRequest, routeIdentityRef.current, restoreRequestRef.current) &&
+        store$.activeOwnerKey.get() === ownerAtStart;
+      const failureKind = classifyMutationFailure(error);
+      if (restoreLease && isCurrentSession(restoreLease) && failureKind === 'unconfirmed') {
         setStatusForLease(restoreLease, 'error');
       }
+      if (currentRoute) {
+        if (failureKind === 'conflict') {
+          setVersions(null);
+          setHistoryBaseVersion(null);
+          setRestoreProtocolVersion(null);
+          setHistoryError('This note changed after history was loaded. Sync and reopen history.');
+          void sync();
+        } else if (failureKind === 'confirmed-rejection') {
+          setHistoryError('The server rejected that restore. The note was not changed.');
+        } else {
+          setHistoryError(
+            'Iris could not confirm whether the restore completed. Sync before editing or retrying.',
+          );
+          void sync();
+        }
+      }
+    } finally {
+      if (
+        requestStillCurrent(pendingRequest, routeIdentityRef.current, restoreRequestRef.current)
+      ) {
+        setRestoringVersionId(null);
+      }
     }
+  }
+
+  function closeHistory() {
+    historyRequestRef.current += 1;
+    setVersions(null);
+    setHistoryBaseVersion(null);
+    setRestoreProtocolVersion(null);
   }
 
   function onDelete() {
@@ -179,7 +295,7 @@ export default function NoteEditor() {
           label={versions ? 'Hide history' : 'View history'}
           variant="ghost"
           disabled={Boolean(conflict)}
-          onPress={() => (versions ? setVersions(null) : loadHistory())}
+          onPress={() => (versions ? closeHistory() : loadHistory())}
         />
         <Button
           label="Delete note"
@@ -188,10 +304,40 @@ export default function NoteEditor() {
           onPress={onDelete}
         />
       </View>
+      {historyError ? (
+        <Text
+          style={styles.historyWarning}
+          accessibilityRole="alert"
+          accessibilityLiveRegion="polite"
+        >
+          {historyError}
+        </Text>
+      ) : null}
+      {restoreNotice ? (
+        <Text
+          style={styles.historyWarning}
+          accessibilityRole="alert"
+          accessibilityLiveRegion="polite"
+        >
+          {restoreNotice}
+        </Text>
+      ) : null}
 
       {versions ? (
         <View style={styles.history}>
           <Text style={styles.historyTitle}>Version history</Text>
+          {restoreProtocolVersion !== null && restoreProtocolVersion !== 1 ? (
+            <Text style={styles.historyWarning} accessibilityRole="alert">
+              This client can show history but does not support the server's restore protocol.
+              Update Iris before restoring.
+            </Text>
+          ) : null}
+          {historyHeadMismatch ? (
+            <Text style={styles.historyWarning} accessibilityRole="alert">
+              The local note and loaded history are on different heads. Iris is syncing; reopen
+              history if they do not converge.
+            </Text>
+          ) : null}
           {versions.length === 0 ? <Muted>No history yet.</Muted> : null}
           {versions.map((v) => (
             <View key={v.id} style={styles.versionRow}>
@@ -201,12 +347,20 @@ export default function NoteEditor() {
                   {v.authorName}
                 </Text>
                 <Text style={styles.versionMeta}>{new Date(v.createdAt).toLocaleString()}</Text>
+                <Text style={styles.versionMeta}>
+                  {v.folderSnapshotKnown
+                    ? `Folder: ${v.folder === null ? 'Root' : v.folder}`
+                    : 'Folder was not captured; restore keeps the current folder'}
+                  {` · Tags: ${v.tags.length > 0 ? v.tags.join(', ') : 'None'}`}
+                </Text>
               </View>
               <Button
-                label="Restore"
+                label={v.folderSnapshotKnown ? 'Restore' : 'Restore content'}
                 variant="ghost"
-                disabled={Boolean(conflict)}
-                onPress={() => restore(v.id)}
+                loading={restoringVersionId === v.id}
+                disabled={!restoreAllowed}
+                accessibilityLabel={`${v.folderSnapshotKnown ? 'Restore' : 'Restore content from'} version ${v.version}`}
+                onPress={() => restore(v)}
               />
             </View>
           ))}
@@ -283,4 +437,9 @@ const styles = StyleSheet.create({
   },
   versionText: { color: theme.colors.text, fontSize: 14 },
   versionMeta: { color: theme.colors.textDim, fontSize: 12 },
+  historyWarning: {
+    color: theme.colors.accent,
+    fontSize: 12,
+    marginTop: theme.space(2),
+  },
 });

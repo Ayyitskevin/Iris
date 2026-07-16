@@ -8,6 +8,7 @@
 import { sql } from 'drizzle-orm';
 import {
   bigint,
+  boolean,
   check,
   foreignKey,
   index,
@@ -145,6 +146,10 @@ export const noteVersions = pgTable(
     version: integer('version').notNull(),
     title: text('title').notNull(),
     bodyMd: text('body_md').notNull(),
+    // false means this pre-0004 snapshot never recorded folder state. Keep the DB
+    // default false so an older rolled-back server cannot manufacture a known root.
+    folder: text('folder'),
+    folderSnapshotKnown: boolean('folder_snapshot_known').notNull().default(false),
     tags: jsonb('tags').$type<string[]>().notNull().default([]),
     authorType: text('author_type').notNull(),
     authorId: uuid('author_id').notNull(),

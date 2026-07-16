@@ -7,10 +7,15 @@
  * per-request tenant transaction from runTenant(), and use ctx.db throughout.
  */
 import { and, desc, eq, isNull, sql } from 'drizzle-orm';
-import type { CreateNoteRequest, Note, UpdateNoteRequest } from '@iris/shared';
+import type {
+  CreateNoteRequest,
+  Note,
+  RestoreVersionResponse,
+  UpdateNoteRequest,
+} from '@iris/shared';
 import { noteVersions, notes } from '../db/schema';
 import type { Ctx } from '../context';
-import { conflict, notFound } from '../lib/errors';
+import { badRequest, conflict, notFound } from '../lib/errors';
 import { isUuid, newId } from '../lib/ids';
 import { serializeNote } from '../serialize';
 import { loadNote, recordVersionAndActivity, throwConcurrentNoteChange } from './note-write';
@@ -127,9 +132,18 @@ export async function deleteNote(ctx: Ctx, id: string, baseVersion: number): Pro
  * Restore a prior version's content as a new head version. History is never rewritten
  * (append-only) — restore writes a fresh version and activity entry.
  */
-export async function restoreVersion(ctx: Ctx, id: string, versionId: string): Promise<Note> {
+export async function restoreVersion(
+  ctx: Ctx,
+  id: string,
+  versionId: string,
+  baseVersion: number,
+  preserveCurrentFolderIfUnknown = false,
+): Promise<RestoreVersionResponse> {
   const current = await loadNote(ctx, id);
   if (!current) throw notFound('Note not found');
+  if (current.version !== baseVersion) {
+    throw conflict('This note changed since you opened its history', serializeNote(current));
+  }
 
   const targetRows = await ctx.db
     .select()
@@ -143,12 +157,20 @@ export async function restoreVersion(ctx: Ctx, id: string, versionId: string): P
     );
   const target = targetRows[0];
   if (!target) throw notFound('Version not found');
+  if (!target.folderSnapshotKnown && !preserveCurrentFolderIfUnknown) {
+    throw badRequest(
+      'This legacy version did not capture its folder; explicitly preserve the current folder to restore its other fields',
+      'incomplete_version_snapshot',
+    );
+  }
+  const folderRestored = target.folderSnapshotKnown;
 
   const updated = await ctx.db
     .update(notes)
     .set({
       title: target.title,
       bodyMd: target.bodyMd,
+      folder: folderRestored ? target.folder : current.folder,
       tags: target.tags ?? [],
       version: current.version + 1,
       deletedAt: null,
@@ -164,16 +186,25 @@ export async function restoreVersion(ctx: Ctx, id: string, versionId: string): P
     .returning();
   const note = updated[0] ?? (await throwConcurrentNoteChange(ctx, id));
   await recordVersionAndActivity(ctx, note, 'note.restore');
-  return serializeNote(note);
+  return { note: serializeNote(note), folderRestored };
 }
 
 export async function listVersions(ctx: Ctx, id: string) {
-  const note = await loadNote(ctx, id);
+  // Keep the advertised head and the returned snapshots on one database state. Without
+  // the share lock, READ COMMITTED could observe the note before a concurrent save and
+  // its version row after that save, producing a history capability bound to the wrong
+  // list even though restore itself would still fail safe.
+  const noteRows = await ctx.db
+    .select()
+    .from(notes)
+    .where(and(eq(notes.id, id), eq(notes.workspaceId, ctx.workspaceId)))
+    .for('share');
+  const note = noteRows[0];
   if (!note) throw notFound('Note not found');
   const rows = await ctx.db
     .select()
     .from(noteVersions)
     .where(and(eq(noteVersions.noteId, id), eq(noteVersions.workspaceId, ctx.workspaceId)))
     .orderBy(desc(noteVersions.version));
-  return rows;
+  return { versions: rows, headVersion: note.version };
 }

@@ -64,10 +64,20 @@ These were named as out of scope and are staying out until the foundation is pro
   durable terminal issues stop network work until a visible manual recovery action.
   Upgrade-with-data, RLS-role, collision, rollback, transport-bound, lost-response,
   failed-save interleaving, restart, large-outbox, and newer-edit rebasing tests cover
-  the PGlite/mobile boundary. CI now provisions PostgreSQL 16 and is configured to run
-  the independent-connection commit-order and device-gate concurrency test; this local
-  integration did not execute that opt-in real-Postgres file, so a green pushed CI run
-  remains required evidence.
+  the PGlite/mobile boundary. GitHub Actions run `29506816638` passed the PostgreSQL 16
+  independent-connection commit-order and device-gate concurrency test for commit
+  `8a8785114623d3e601f26ddf7b6eed21b23415cf`.
+- **Phase 2.3 — organizational history parity** (ADR-013): new version snapshots capture
+  folders and tags exactly; direct restore and activity undo restore both fields while
+  preserving append-only history. Migration `0004` backfills only the provably matching
+  current-head snapshot and marks older folders unknown. Legacy uncertainty is visible,
+  direct restore requires the authoritative head returned with history, and whole-note
+  undo refuses to overwrite a later action. Versioned restore/undo capabilities disable
+  unsafe mutation across a mixed old/new deployment while leaving unknown future
+  protocols readable; response payloads are runtime validated. Focused tests cover exact
+  root/folder distinctions, stale restores and undos, route/request invalidation,
+  unconfirmed mutation outcomes, explicit legacy preservation, tenant isolation, and
+  fail-loud incomplete undo history.
 
 ## Near-term follow-ups (next things)
 
@@ -78,10 +88,11 @@ These were named as out of scope and are staying out until the foundation is pro
    simulator acceptance. The current note-only wire contract and size-limited per-owner
    SecureStore value, missing web cross-tab ownership, missing recovery import, and
    unrun native acceptance are explicit blockers before the work queue.
-2. **Restore/undo organizational-field correctness**: add folders to version snapshots,
-   restore folder and tags consistently in both direct restore and activity undo, and
-   prove the behavior with focused history/undo tests. This reversibility gap is tracked;
-   Phase 2.2a does not silently claim it as shipped.
+2. **Complete tombstone-state reversibility**: include deleted/live state in version
+   snapshots and make direct restore plus activity undo reconstruct it exactly. Today a
+   restore or sync update can revive a tombstoned note, but its prior deleted state is
+   not represented in `note_versions`, so a later compensating undo cannot recreate that
+   tombstone without guessing.
 3. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
    accountable human-or-agent assignee, reversible writes, and the same sync resource
    envelope. Keep activity, check-in, delegation, and durable claim/run semantics

@@ -20,7 +20,12 @@ describe('agent actors, activity feed, and undo', () => {
     const note = (
       await call(t.app, 'POST', '/v1/notes', {
         token: user.token,
-        body: { title: 'Roadmap', bodyMd: 'original by operator' },
+        body: {
+          title: 'Roadmap',
+          bodyMd: 'original by operator',
+          folder: 'operator/folder',
+          tags: ['operator'],
+        },
       })
     ).json.note;
 
@@ -36,7 +41,12 @@ describe('agent actors, activity feed, and undo', () => {
     // The AGENT edits the note through the same API the app uses.
     const agentEdit = await call(t.app, 'PATCH', `/v1/notes/${note.id}`, {
       token: agentToken,
-      body: { bodyMd: 'rewritten by the agent', baseVersion: 1 },
+      body: {
+        bodyMd: 'rewritten by the agent',
+        folder: 'agent/folder',
+        tags: ['agent'],
+        baseVersion: 1,
+      },
     });
     expect(agentEdit.status).toBe(200);
     expect(agentEdit.json.note.version).toBe(2);
@@ -56,11 +66,27 @@ describe('agent actors, activity feed, and undo', () => {
     });
     expect(undo.status).toBe(200);
     expect(undo.json.note.bodyMd).toBe('original by operator'); // version restored
+    expect(undo.json.note.folder).toBe('operator/folder');
+    expect(undo.json.note.tags).toEqual(['operator']);
+    expect(undo.json.folderRestored).toBe(true);
     expect(undo.json.note.version).toBe(3); // append-only: a new head version
 
     // The note really is back to the operator's text.
     const after = await call(t.app, 'GET', `/v1/notes/${note.id}`, { token: user.token });
-    expect(after.json.note.bodyMd).toBe('original by operator');
+    expect(after.json.note).toMatchObject({
+      bodyMd: 'original by operator',
+      folder: 'operator/folder',
+      tags: ['operator'],
+    });
+    const versions = await call(t.app, 'GET', `/v1/notes/${note.id}/versions`, {
+      token: user.token,
+    });
+    expect(versions.json.versions[0]).toMatchObject({
+      version: 3,
+      folder: 'operator/folder',
+      folderSnapshotKnown: true,
+      tags: ['operator'],
+    });
 
     // The feed now marks the agent action undone and records a compensating undo entry.
     const feed2 = await call(t.app, 'GET', '/v1/activity', { token: user.token });
@@ -103,6 +129,133 @@ describe('agent actors, activity feed, and undo', () => {
 
     const list = await call(t.app, 'GET', '/v1/notes', { token: user.token });
     expect(list.json.notes.find((n: any) => n.id === created.json.note.id)).toBeUndefined();
+  });
+
+  it('preserves an unknown legacy folder visibly while restoring captured tags', async () => {
+    const user = await signUp(t.app);
+    const note = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: user.token,
+        body: {
+          title: 'Legacy',
+          bodyMd: 'before',
+          folder: 'before/folder',
+          tags: ['before'],
+        },
+      })
+    ).json.note;
+    await t.client.query(
+      `UPDATE note_versions
+       SET folder = NULL, folder_snapshot_known = false
+       WHERE workspace_id = $1 AND note_id = $2 AND version = 1`,
+      [user.workspaceId, note.id],
+    );
+    const changed = await call(t.app, 'PATCH', `/v1/notes/${note.id}`, {
+      token: user.token,
+      body: { bodyMd: 'after', folder: 'after/folder', tags: ['after'], baseVersion: 1 },
+    });
+    const feed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    const update = feed.json.activity.find(
+      (entry: any) => entry.action === 'note.update' && entry.resultingVersion === 2,
+    );
+
+    const undo = await call(t.app, 'POST', `/v1/activity/${update.id}/undo`, {
+      token: user.token,
+    });
+    expect(changed.json.note.folder).toBe('after/folder');
+    expect(undo.status).toBe(200);
+    expect(undo.json.folderRestored).toBe(false);
+    expect(undo.json.note).toMatchObject({
+      bodyMd: 'before',
+      folder: 'after/folder',
+      tags: ['before'],
+    });
+  });
+
+  it('fails closed when the snapshot required for undo is missing', async () => {
+    const user = await signUp(t.app);
+    const note = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: user.token,
+        body: { title: 'History', bodyMd: 'before', folder: 'safe', tags: ['safe'] },
+      })
+    ).json.note;
+    await call(t.app, 'PATCH', `/v1/notes/${note.id}`, {
+      token: user.token,
+      body: { bodyMd: 'after', folder: 'changed', tags: ['changed'], baseVersion: 1 },
+    });
+    const feed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    const update = feed.json.activity.find(
+      (entry: any) => entry.action === 'note.update' && entry.resultingVersion === 2,
+    );
+    await t.client.query(
+      'DELETE FROM note_versions WHERE workspace_id = $1 AND note_id = $2 AND version = 1',
+      [user.workspaceId, note.id],
+    );
+
+    const undo = await call(t.app, 'POST', `/v1/activity/${update.id}/undo`, {
+      token: user.token,
+    });
+    expect(undo.status).toBe(400);
+    expect(undo.json.error.code).toBe('incomplete_history');
+    const unchanged = await call(t.app, 'GET', `/v1/notes/${note.id}`, { token: user.token });
+    expect(unchanged.json.note).toMatchObject({
+      bodyMd: 'after',
+      folder: 'changed',
+      tags: ['changed'],
+      version: 2,
+    });
+    const afterFeed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    expect(afterFeed.json.activity.find((entry: any) => entry.id === update.id).undone).toBe(false);
+  });
+
+  it('refuses to apply an old whole-snapshot undo over a newer head', async () => {
+    const user = await signUp(t.app);
+    const note = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: user.token,
+        body: { title: 'Head guard', bodyMd: 'v1', folder: 'v1', tags: ['v1'] },
+      })
+    ).json.note;
+    await call(t.app, 'PATCH', `/v1/notes/${note.id}`, {
+      token: user.token,
+      body: { bodyMd: 'v2', folder: 'v2', tags: ['v2'], baseVersion: 1 },
+    });
+    const afterV2 = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    expect(afterV2.json.undoProtocolVersion).toBe(1);
+    const target = afterV2.json.activity.find(
+      (entry: any) => entry.action === 'note.update' && entry.resultingVersion === 2,
+    );
+    await call(t.app, 'PATCH', `/v1/notes/${note.id}`, {
+      token: user.token,
+      body: { bodyMd: 'v3', folder: 'v3', tags: ['v3'], baseVersion: 2 },
+    });
+
+    const refused = await call(t.app, 'POST', `/v1/activity/${target.id}/undo`, {
+      token: user.token,
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.json.error.code).toBe('version_conflict');
+    expect(refused.json.error.conflict).toMatchObject({
+      bodyMd: 'v3',
+      folder: 'v3',
+      tags: ['v3'],
+      version: 3,
+    });
+
+    const unchanged = await call(t.app, 'GET', `/v1/notes/${note.id}`, { token: user.token });
+    expect(unchanged.json.note).toMatchObject({
+      bodyMd: 'v3',
+      folder: 'v3',
+      tags: ['v3'],
+      version: 3,
+    });
+    const history = await call(t.app, 'GET', `/v1/notes/${note.id}/versions`, {
+      token: user.token,
+    });
+    expect(history.json.versions).toHaveLength(3);
+    const afterFeed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    expect(afterFeed.json.activity.find((entry: any) => entry.id === target.id).undone).toBe(false);
   });
 
   it('enforces token scopes and revocation', async () => {

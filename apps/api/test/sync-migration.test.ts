@@ -9,7 +9,11 @@ describe('Sync v2 migration', () => {
     try {
       const migrations = migrationSql();
       const syncV2 = migrations.find((migration) => migration.name === '0003_sync_v2.sql');
+      const organization = migrations.find(
+        (migration) => migration.name === '0004_note_version_organization.sql',
+      );
       expect(syncV2).toBeDefined();
+      expect(organization).toBeDefined();
       for (const migration of migrations.filter((item) => item.name < '0003_sync_v2.sql')) {
         await client.exec(migration.sql);
       }
@@ -42,9 +46,23 @@ describe('Sync v2 migration', () => {
           '2026-01-03T00:00:00.000Z',
         ],
       );
+      await client.query(
+        'UPDATE notes SET folder = $1, version = 2 WHERE workspace_id = $2 AND id = $3',
+        ['projects/current', workspaceA, noteA1],
+      );
+      const authorId = randomUUID();
+      await client.query(
+        `INSERT INTO note_versions
+           (id, note_id, workspace_id, version, title, body_md, tags,
+            author_type, author_id, author_name)
+         VALUES
+           ($1, $2, $3, 1, 'A old', 'old body', '["old"]'::jsonb, 'user', $4, 'Owner'),
+           ($5, $2, $3, 2, 'A one', 'current body', '["current"]'::jsonb, 'user', $4, 'Owner')`,
+        [randomUUID(), noteA1, workspaceA, authorId, randomUUID()],
+      );
 
       // This is the supported upgrade path: the ledger baselines a recognized legacy
-      // schema instead of replaying shipped migrations, then applies only 0003.
+      // schema instead of replaying shipped migrations, then applies 0003 and 0004.
       await applyMigrationsPglite(client);
       const firstLedger = (
         await client.query(
@@ -64,6 +82,7 @@ describe('Sync v2 migration', () => {
         '0001_init.sql',
         '0002_search_and_tags.sql',
         '0003_sync_v2.sql',
+        '0004_note_version_organization.sql',
       ]);
       const receiptColumn = (
         await client.query(
@@ -83,6 +102,42 @@ describe('Sync v2 migration', () => {
         is_nullable: 'NO',
         column_default: '1',
       });
+      const organizationHistory = (
+        await client.query(
+          `SELECT version, folder, folder_snapshot_known
+           FROM note_versions
+           WHERE workspace_id = $1 AND note_id = $2
+           ORDER BY version`,
+          [workspaceA, noteA1],
+        )
+      ).rows as Array<{
+        version: number;
+        folder: string | null;
+        folder_snapshot_known: boolean;
+      }>;
+      expect(organizationHistory).toEqual([
+        { version: 1, folder: null, folder_snapshot_known: false },
+        { version: 2, folder: 'projects/current', folder_snapshot_known: true },
+      ]);
+
+      // An old rolled-back server omitting both 0004 columns stays fail-safe.
+      await client.query(
+        `INSERT INTO note_versions
+           (id, note_id, workspace_id, version, title, body_md, tags,
+            author_type, author_id, author_name)
+         VALUES ($1, $2, $3, 3, 'Old binary', 'omitted folder', '[]'::jsonb,
+                 'user', $4, 'Owner')`,
+        [randomUUID(), noteA1, workspaceA, authorId],
+      );
+      const oldBinary = (
+        await client.query(
+          `SELECT folder, folder_snapshot_known
+           FROM note_versions
+           WHERE workspace_id = $1 AND note_id = $2 AND version = 3`,
+          [workspaceA, noteA1],
+        )
+      ).rows[0] as { folder: string | null; folder_snapshot_known: boolean };
+      expect(oldBinary).toEqual({ folder: null, folder_snapshot_known: false });
 
       const backfilled = (
         await client.query(
@@ -147,6 +202,7 @@ describe('Sync v2 migration', () => {
         '0001_init.sql',
         '0002_search_and_tags.sql',
         '0003_sync_v2.sql',
+        '0004_note_version_organization.sql',
       ]);
 
       await client.query(
@@ -193,6 +249,7 @@ describe('Sync v2 migration', () => {
         '0001_init.sql',
         '0002_search_and_tags.sql',
         '0003_sync_v2.sql',
+        '0004_note_version_organization.sql',
       ]);
     } finally {
       await client.close();
@@ -271,12 +328,29 @@ describe('Sync v2 migration', () => {
     try {
       await applyMigrationsPglite(client);
       await client.exec(`
-        DELETE FROM iris_schema_migrations WHERE name = '0003_sync_v2.sql';
+        DELETE FROM iris_schema_migrations
+        WHERE name IN ('0003_sync_v2.sql', '0004_note_version_organization.sql');
         DROP TRIGGER notes_sync_seq_assign ON notes;
       `);
 
       await expect(applyMigrationsPglite(client)).rejects.toThrow(
         'Database contains unledgered 0003_sync_v2.sql artifacts',
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('rejects unledgered 0004 artifacts in a nonempty ledger', async () => {
+    const client = new PGlite();
+    try {
+      await applyMigrationsPglite(client);
+      await client.exec(
+        `DELETE FROM iris_schema_migrations WHERE name = '0004_note_version_organization.sql'`,
+      );
+
+      await expect(applyMigrationsPglite(client)).rejects.toThrow(
+        'Database contains unledgered 0004_note_version_organization.sql artifacts',
       );
     } finally {
       await client.close();
@@ -381,7 +455,35 @@ describe('Sync v2 migration', () => {
       `,
       artifact: 'function iris_assign_note_sync_seq drifted',
     },
-  ])('rejects $kind while 0003 is the migration head', async ({ sql, artifact }) => {
+  ])('rejects $kind after the additive 0004 migration', async ({ sql, artifact }) => {
+    const client = new PGlite();
+    try {
+      await applyMigrationsPglite(client);
+      await client.exec(sql);
+
+      await expect(applyMigrationsPglite(client)).rejects.toThrow(artifact);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it.each([
+    {
+      kind: 'dropped folder snapshot column',
+      sql: 'ALTER TABLE note_versions DROP COLUMN folder',
+      artifact: 'column definition note_versions.folder missing',
+    },
+    {
+      kind: 'changed folder-known default',
+      sql: 'ALTER TABLE note_versions ALTER COLUMN folder_snapshot_known SET DEFAULT true',
+      artifact: 'column definition note_versions.folder_snapshot_known drifted',
+    },
+    {
+      kind: 'changed folder column type',
+      sql: 'ALTER TABLE note_versions ALTER COLUMN folder TYPE varchar(255)',
+      artifact: 'column definition note_versions.folder drifted',
+    },
+  ])('rejects 0004 $kind', async ({ sql, artifact }) => {
     const client = new PGlite();
     try {
       await applyMigrationsPglite(client);
@@ -544,11 +646,18 @@ describe('Sync v2 migration', () => {
         workspaceId,
         'RLS workspace',
       ]);
-      await client.query('INSERT INTO notes (id, workspace_id, title) VALUES ($1, $2, $3)', [
-        noteId,
-        workspaceId,
-        'RLS legacy note',
-      ]);
+      await client.query(
+        'INSERT INTO notes (id, workspace_id, title, folder) VALUES ($1, $2, $3, $4)',
+        [noteId, workspaceId, 'RLS legacy note', 'rls/folder'],
+      );
+      await client.query(
+        `INSERT INTO note_versions
+           (id, note_id, workspace_id, version, title, body_md, tags,
+            author_type, author_id, author_name)
+         VALUES ($1, $2, $3, 1, 'RLS legacy note', '', '[]'::jsonb,
+                 'user', $4, 'Owner')`,
+        [randomUUID(), noteId, workspaceId, randomUUID()],
+      );
 
       await client.exec(`
         CREATE ROLE iris_migrator NOLOGIN;
@@ -575,6 +684,15 @@ describe('Sync v2 migration', () => {
         await client.query('SELECT sync_seq::text AS sync_seq FROM notes WHERE id = $1', [noteId])
       ).rows[0] as { sync_seq: string };
       expect(note.sync_seq).toBe('1');
+      const version = (
+        await client.query(
+          `SELECT folder, folder_snapshot_known
+           FROM note_versions
+           WHERE workspace_id = $1 AND note_id = $2 AND version = 1`,
+          [workspaceId, noteId],
+        )
+      ).rows[0] as { folder: string | null; folder_snapshot_known: boolean };
+      expect(version).toEqual({ folder: 'rls/folder', folder_snapshot_known: true });
       const rls = (
         await client.query(
           `SELECT relrowsecurity AS enabled, relforcerowsecurity AS forced
