@@ -99,10 +99,12 @@ These were named as out of scope and are staying out until the foundation is pro
 
 1. **Complete Sync v2's resource/repository boundary and release gates**: generic resource envelopes,
    SQLite on native, IndexedDB plus cross-tab session coordination on web,
-   transactional note+outbox writes, and a user-facing recovery/import path for
+   transactional resource+outbox writes, and a user-facing recovery/import path for
    quarantined legacy `iris:state:v1` data, followed by native iOS/Android device or
-   simulator acceptance. The current note-only wire contract and size-limited per-owner
-   SecureStore value, missing web cross-tab ownership, missing recovery import, and
+   simulator acceptance. The owner-bound repository contract and atomically published
+   in-memory note+outbox reducer are integrated, but its current adapter still uses one
+   size-limited per-owner SecureStore/localStorage value. That interim backend, the
+   note-only wire contract, missing web cross-tab ownership, missing recovery import, and
    unrun native acceptance are explicit blockers before the work queue.
 2. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
    accountable human-or-agent assignee, reversible writes, and the same sync resource

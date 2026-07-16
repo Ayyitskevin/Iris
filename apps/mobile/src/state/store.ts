@@ -8,6 +8,7 @@
 import { observable } from '@legendapp/state';
 import type { Note, SyncMutation } from '@iris/shared';
 import type { SyncConflictDraft } from '../sync/reconcile';
+import { ownerReplicaRepository, replicaStorageKey } from './replica-repository';
 import { storage } from './storage';
 
 export interface Session {
@@ -104,7 +105,7 @@ export const stateStorageKeys = {
   session: SESSION_KEY,
   migration: MIGRATION_KEY,
   recovery: RECOVERY_KEY,
-  replica: (ownerKey: string) => 'iris.replica.v2.' + ownerKey,
+  replica: replicaStorageKey,
 };
 
 function blankState(status: SyncStatus = 'idle'): AppState {
@@ -129,7 +130,6 @@ let generation = 0;
 let generationController = new AbortController();
 let sessionTransitioning = false;
 let sessionRejected = false;
-const replicaSaveQueues = new Map<string, Promise<void>>();
 let sessionSaveQueue: Promise<void> = Promise.resolve();
 let sessionTransitionQueue: Promise<void> = Promise.resolve();
 let hydrationPromise: Promise<void> | null = null;
@@ -345,33 +345,15 @@ function snapshotActiveReplica(): PersistedReplica | null {
   return replica;
 }
 
-function enqueueReplicaSave(replica: PersistedReplica): Promise<void> {
+async function enqueueReplicaSave(replica: PersistedReplica): Promise<void> {
   assertReplicaIntegrity(replica);
   const snapshot = cloneReplica(replica);
   const raw = JSON.stringify(snapshot);
-  const previous = replicaSaveQueues.get(replica.ownerKey) ?? Promise.resolve();
-  const next = previous
-    .catch(() => undefined)
-    .then(async () => {
-      const key = stateStorageKeys.replica(snapshot.ownerKey);
-      let operationError: unknown;
-      try {
-        await storage.set(key, raw);
-      } catch (error) {
-        operationError = error;
-      }
-      try {
-        if ((await storage.get(key)) !== raw) {
-          throw new StatePersistenceError('Owner replica write could not be verified');
-        }
-      } catch (cause) {
-        throw new StatePersistenceError('Could not persist the owner replica', {
-          cause: operationError ?? cause,
-        });
-      }
-    });
-  replicaSaveQueues.set(replica.ownerKey, next);
-  return next;
+  try {
+    await ownerReplicaRepository.commit(snapshot.ownerKey, raw);
+  } catch (cause) {
+    throw new StatePersistenceError('Could not persist the owner replica', { cause });
+  }
 }
 
 function enqueueSessionWrite(task: () => Promise<void>): Promise<void> {
@@ -484,9 +466,7 @@ function activate(session: Session, replica: PersistedReplica): void {
 
 async function loadReplica(session: Session): Promise<PersistedReplica> {
   const ownerKey = ownerKeyFor(session);
-  await (replicaSaveQueues.get(ownerKey) ?? Promise.resolve()).catch(() => undefined);
-
-  const raw = await storage.get(stateStorageKeys.replica(ownerKey));
+  const raw = await ownerReplicaRepository.read(ownerKey);
   const replica = raw ? parseReplica(raw, session) : emptyReplica(session);
   if (!raw) await enqueueReplicaSave(replica);
   return replica;
@@ -533,7 +513,7 @@ async function migrateLegacy(
   const legacySession = isSession(legacy.session) ? legacy.session : null;
   const legacyOwnerKey = legacySession ? ownerKeyFor(legacySession) : null;
   const unmarkedReplicaRaw = legacyOwnerKey
-    ? await storage.get(stateStorageKeys.replica(legacyOwnerKey))
+    ? await ownerReplicaRepository.read(legacyOwnerKey)
     : null;
   const recovery: LegacyRecovery = {
     version: 1,
@@ -581,14 +561,14 @@ async function migrateLegacy(
       : null;
   if (legacySession) {
     const replica = safeLegacyReplica(legacy, legacySession);
-    const replicaKey = stateStorageKeys.replica(replica.ownerKey);
     // With no verified migration marker, even a structurally valid v2 replica may be
     // the output of the unsafe partial migration. Quarantine it above, then rebuild
     // only from v1 records whose workspace ownership is explicit.
     const replicaRaw = JSON.stringify(replica);
-    await storage.set(replicaKey, replicaRaw);
-    if ((await storage.get(replicaKey)) !== replicaRaw) {
-      throw new StatePersistenceError('Migrated replica could not be verified');
+    try {
+      await ownerReplicaRepository.commit(replica.ownerKey, replicaRaw);
+    } catch (cause) {
+      throw new StatePersistenceError('Migrated replica could not be verified', { cause });
     }
 
     if (!existingSession && !existingTombstone) {
@@ -743,73 +723,121 @@ export function readReplicaForLease(lease: SessionLease): ReplicaState {
   };
 }
 
-/** Replace and durably persist one current owner replica as one JSON commit. */
+export interface ReplicaChange<Result> {
+  next: ReplicaState;
+  result: Result;
+}
+
+export interface AppliedReplicaChange<Result> {
+  result: Result;
+  /** Exact owner snapshot persistence; callers must handle this promise. */
+  durable: Promise<void>;
+}
+
+interface InternalReplicaApplication<Result> extends AppliedReplicaChange<Result> {
+  previous: PersistedReplica;
+  next: PersistedReplica;
+}
+
+function persistedReplicaForLease(lease: SessionLease, state: ReplicaState): PersistedReplica {
+  return {
+    version: 2,
+    ownerKey: lease.ownerKey,
+    userId: lease.userId,
+    workspaceId: lease.workspaceId,
+    notes: { ...state.notes },
+    syncCursor: state.syncCursor,
+    deviceId: lease.deviceId,
+    outbox: [...state.outbox],
+    pendingPush: state.pendingPush ? [...state.pendingPush] : null,
+    syncIssue: state.syncIssue
+      ? { ...state.syncIssue, affectedOpIds: [...state.syncIssue.affectedOpIds] }
+      : null,
+    conflicts: { ...state.conflicts },
+  };
+}
+
+function publishReplicaProjection(replica: PersistedReplica): void {
+  const current = store$.get();
+  store$.set({
+    ...current,
+    notes: { ...replica.notes },
+    syncCursor: replica.syncCursor,
+    deviceId: replica.deviceId,
+    outbox: [...replica.outbox],
+    pendingPush: replica.pendingPush ? [...replica.pendingPush] : null,
+    syncIssue: replica.syncIssue
+      ? { ...replica.syncIssue, affectedOpIds: [...replica.syncIssue.affectedOpIds] }
+      : null,
+    conflicts: { ...replica.conflicts },
+  });
+}
+
+function activeProjectionMatches(lease: SessionLease, replica: PersistedReplica): boolean {
+  return (
+    isCurrentSession(lease) &&
+    store$.syncCursor.get() === replica.syncCursor &&
+    store$.deviceId.get() === replica.deviceId &&
+    JSON.stringify(store$.notes.get()) === JSON.stringify(replica.notes) &&
+    JSON.stringify(store$.outbox.get()) === JSON.stringify(replica.outbox) &&
+    JSON.stringify(store$.pendingPush.get()) === JSON.stringify(replica.pendingPush) &&
+    JSON.stringify(store$.syncIssue.get()) === JSON.stringify(replica.syncIssue) &&
+    JSON.stringify(store$.conflicts.get()) === JSON.stringify(replica.conflicts)
+  );
+}
+
+function applyReplicaChange<Result>(
+  lease: SessionLease,
+  update: (current: ReplicaState) => ReplicaChange<Result>,
+): InternalReplicaApplication<Result> {
+  const current = readReplicaForLease(lease);
+  const change = update(current);
+  const previous = persistedReplicaForLease(lease, current);
+  const next = persistedReplicaForLease(lease, change.next);
+  assertReplicaIntegrity(next);
+  assertCurrentSession(lease);
+  // Register durable ordering before the root publication. Legend-State observers run
+  // synchronously and may re-enter this function with a newer local change; that newer
+  // snapshot must queue after this one rather than be overwritten by it after restart.
+  const durable = enqueueReplicaSave(next).then(() => assertCurrentSession(lease));
+  publishReplicaProjection(next);
+  return { result: change.result, durable, previous, next };
+}
+
+/**
+ * Publish one synchronous local transaction and expose its exact durability promise.
+ * Optimistic local edits stay visible on failure so a later commit can rescue them.
+ */
+export function applyReplicaForLease<Result>(
+  lease: SessionLease,
+  update: (current: ReplicaState) => ReplicaChange<Result>,
+): AppliedReplicaChange<Result> {
+  const { result, durable } = applyReplicaChange(lease, update);
+  return { result, durable };
+}
+
+/** Replace and durably persist one current owner replica as one logical commit. */
+export async function commitReplicaForLease<Result>(
+  lease: SessionLease,
+  update: (current: ReplicaState) => ReplicaChange<Result>,
+): Promise<Result> {
+  const applied = applyReplicaChange(lease, update);
+  try {
+    await applied.durable;
+  } catch (error) {
+    if (activeProjectionMatches(lease, applied.next)) publishReplicaProjection(applied.previous);
+    throw error;
+  }
+  assertCurrentSession(lease);
+  return applied.result;
+}
+
+/** Compatibility wrapper for reducers that do not return a value. */
 export async function updateReplicaForLease(
   lease: SessionLease,
   update: (current: ReplicaState) => ReplicaState,
 ): Promise<void> {
-  const current = readReplicaForLease(lease);
-  const next = update(current);
-  const replica: PersistedReplica = {
-    version: 2,
-    ownerKey: lease.ownerKey,
-    userId: lease.userId,
-    workspaceId: lease.workspaceId,
-    notes: { ...next.notes },
-    syncCursor: next.syncCursor,
-    deviceId: lease.deviceId,
-    outbox: [...next.outbox],
-    pendingPush: next.pendingPush ? [...next.pendingPush] : null,
-    syncIssue: next.syncIssue
-      ? { ...next.syncIssue, affectedOpIds: [...next.syncIssue.affectedOpIds] }
-      : null,
-    conflicts: { ...next.conflicts },
-  };
-  const previousReplica: PersistedReplica = {
-    version: 2,
-    ownerKey: lease.ownerKey,
-    userId: lease.userId,
-    workspaceId: lease.workspaceId,
-    notes: { ...current.notes },
-    syncCursor: current.syncCursor,
-    deviceId: lease.deviceId,
-    outbox: [...current.outbox],
-    pendingPush: current.pendingPush ? [...current.pendingPush] : null,
-    syncIssue: current.syncIssue
-      ? { ...current.syncIssue, affectedOpIds: [...current.syncIssue.affectedOpIds] }
-      : null,
-    conflicts: { ...current.conflicts },
-  };
-  assertReplicaIntegrity(replica);
-  assertCurrentSession(lease);
-  store$.notes.set(replica.notes);
-  store$.syncCursor.set(replica.syncCursor);
-  store$.outbox.set(replica.outbox);
-  store$.pendingPush.set(replica.pendingPush);
-  store$.syncIssue.set(replica.syncIssue);
-  store$.conflicts.set(replica.conflicts);
-  try {
-    await enqueueReplicaSave(replica);
-  } catch (error) {
-    const unchangedSinceApply =
-      isCurrentSession(lease) &&
-      store$.syncCursor.get() === replica.syncCursor &&
-      JSON.stringify(store$.notes.get()) === JSON.stringify(replica.notes) &&
-      JSON.stringify(store$.outbox.get()) === JSON.stringify(replica.outbox) &&
-      JSON.stringify(store$.pendingPush.get()) === JSON.stringify(replica.pendingPush) &&
-      JSON.stringify(store$.syncIssue.get()) === JSON.stringify(replica.syncIssue) &&
-      JSON.stringify(store$.conflicts.get()) === JSON.stringify(replica.conflicts);
-    if (unchangedSinceApply) {
-      store$.notes.set(previousReplica.notes);
-      store$.syncCursor.set(previousReplica.syncCursor);
-      store$.outbox.set(previousReplica.outbox);
-      store$.pendingPush.set(previousReplica.pendingPush);
-      store$.syncIssue.set(previousReplica.syncIssue);
-      store$.conflicts.set(previousReplica.conflicts);
-    }
-    throw error;
-  }
-  assertCurrentSession(lease);
+  await commitReplicaForLease(lease, (current) => ({ next: update(current), result: undefined }));
 }
 
 export function setStatusForLease(lease: SessionLease, status: SyncStatus): void {

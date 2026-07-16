@@ -342,6 +342,15 @@ current 401s, cursor isolation, cross-workspace response rejection, A-outbox/B-t
 separation, verified/quarantined recovery copies, storage failpoints, save ordering, and
 stale conflict decisions.
 
+All raw owner-replica access now crosses an `OwnerReplicaRepository` contract. Its current
+key/value adapter validates the embedded immutable owner, serializes replacement commits
+per owner, and verifies the exact bytes after every write. Active local note and outbox
+changes publish through one lease-fenced root reducer; optimistic edits expose their
+durability promise, while sync, conflict, restore, and undo commits retain
+rollback-if-unchanged behavior. This is the repository seam, not the release storage
+implementation: replica-v2 bytes and keys remain unchanged, and the adapter still stores
+one size-limited SecureStore/localStorage value.
+
 The durable transport half of Sync v2 is integrated in ADR-012. Before release, the
 note-specific wire shape must become a generic resource envelope so projects and tasks
 do not require a second sync engine. Native resources and the outbox must move from the

@@ -130,8 +130,9 @@ artifacts, on later runs. Focused tests cover transport bounds, lost
 responses, persistence races, exact applied/conflict replay, non-`BYPASSRLS`
 upgrade-with-data, delayed push/pull, pagination, sign-out, account switch, stale 401,
 cross-workspace cursor rejection, and A-outbox/B-token separation (ADR-011/012). Generic
-resource envelopes, transactional SQLite/IndexedDB replicas, web cross-tab coordination,
-recovery import, and native device/simulator acceptance remain explicit release blockers.
+resource envelopes, SQLite/IndexedDB implementations behind the integrated owner-replica
+repository contract, web cross-tab coordination, recovery import, and native
+device/simulator acceptance remain explicit release blockers.
 GitHub Actions run `29506816638` passed the PostgreSQL 16
 independent-connection commit-order and concurrent device-gate gate for commit
 `8a8785114623d3e601f26ddf7b6eed21b23415cf`.

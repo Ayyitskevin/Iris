@@ -51,6 +51,7 @@ vi.mock('./storage', () => ({
 
 import {
   adoptSession,
+  applyReplicaForLease,
   expireSessionIfCurrent,
   loadState,
   openSessionLease,
@@ -718,6 +719,45 @@ describe('owner-partitioned state', () => {
     expect(store$.notes.get()).toEqual({});
   });
 
+  it('finishes an in-flight A commit under A while fencing the switched B projection', async () => {
+    await adoptSession(sessionA);
+    const leaseA = openSessionLease()!;
+    const keyA = stateStorageKeys.replica(ownerKeyFor(sessionA));
+    const gate = deferred();
+    memory.block = { key: keyA, promise: gate.promise };
+    const draftA = note(noteAId, workspaceA, 'in-flight A draft');
+    const queuedA = mutation(noteAId, 'op-in-flight-a', draftA.bodyMd);
+    const appliedA = applyReplicaForLease(leaseA, (current) => ({
+      next: {
+        ...current,
+        notes: { ...current.notes, [noteAId]: draftA },
+        outbox: [queuedA],
+      },
+      result: undefined,
+    }));
+    await vi.waitFor(() => expect(memory.block).toBeNull());
+
+    const switching = adoptSession(sessionB);
+    await vi.waitFor(() => expect(leaseA.signal.aborted).toBe(true));
+    gate.resolve();
+    await expect(appliedA.durable).rejects.toThrow('Session changed');
+    await switching;
+
+    expect(store$.session.get()).toEqual(sessionB);
+    expect(store$.notes.get()).toEqual({});
+    expect(store$.outbox.get()).toEqual([]);
+    const persistedA = JSON.parse(memory.values.get(keyA)!) as {
+      notes: Record<string, Note>;
+      outbox: SyncMutation[];
+    };
+    expect(persistedA.notes[noteAId]?.bodyMd).toBe(draftA.bodyMd);
+    expect(persistedA.outbox).toEqual([queuedA]);
+
+    await adoptSession({ ...sessionA, token: 'token-A-return' });
+    expect(store$.notes.get()[noteAId]?.bodyMd).toBe(draftA.bodyMd);
+    expect(store$.outbox.get()).toEqual([queuedA]);
+  });
+
   it('rolls back a replica transition when its durable write fails', async () => {
     await adoptSession(sessionA);
     const lease = openSessionLease()!;
@@ -741,6 +781,41 @@ describe('owner-partitioned state', () => {
     await adoptSession(sessionB);
     await adoptSession(sessionA);
     expect(store$.notes.get()[noteAId]?.bodyMd).toBe('original');
+  });
+
+  it('retains an optimistic apply after failure and rescues its exact pair later', async () => {
+    await adoptSession(sessionA);
+    const lease = openSessionLease()!;
+    const original = note(noteAId, workspaceA, 'original');
+    store$.notes.set({ [noteAId]: original });
+    expect(await saveState()).toBe(true);
+
+    const key = stateStorageKeys.replica(ownerKeyFor(sessionA));
+    memory.failSetOnceKey = key;
+    const optimistic = note(noteAId, workspaceA, 'optimistic');
+    const queued = mutation(noteAId, 'op-optimistic', optimistic.bodyMd);
+    const applied = applyReplicaForLease(lease, (current) => ({
+      next: {
+        ...current,
+        notes: { ...current.notes, [noteAId]: optimistic },
+        outbox: [queued],
+      },
+      result: 'visible',
+    }));
+
+    expect(applied.result).toBe('visible');
+    await expect(applied.durable).rejects.toThrow('Could not persist');
+    expect(store$.notes.get()[noteAId]?.bodyMd).toBe(optimistic.bodyMd);
+    expect(store$.outbox.get()).toEqual([queued]);
+    expect(JSON.parse(memory.values.get(key)!).notes[noteAId].bodyMd).toBe(original.bodyMd);
+
+    await updateReplicaForLease(lease, (current) => current);
+    const rescued = JSON.parse(memory.values.get(key)!) as {
+      notes: Record<string, Note>;
+      outbox: SyncMutation[];
+    };
+    expect(rescued.notes[noteAId]?.bodyMd).toBe(optimistic.bodyMd);
+    expect(rescued.outbox).toEqual([queued]);
   });
 
   it('rolls back pending request staging when its durable write fails', async () => {
@@ -824,6 +899,48 @@ describe('owner-partitioned state', () => {
       memory.values.get(stateStorageKeys.replica(ownerKeyFor(sessionA)))!,
     ) as { notes: Record<string, Note> };
     expect(persisted.notes[noteAId]?.bodyMd).toBe('second');
+  });
+
+  it('queues a root-observer re-entry after the snapshot that triggered it', async () => {
+    await adoptSession(sessionA);
+    const lease = openSessionLease()!;
+    const firstNote = note(noteAId, workspaceA, 'first projection');
+    const firstMutation = mutation(noteAId, 'op-first-projection', firstNote.bodyMd);
+    const secondNote = note(noteAId, workspaceA, 'observer projection');
+    const secondMutation = mutation(noteAId, 'op-observer-projection', secondNote.bodyMd);
+    let observerDurable: Promise<void> | null = null;
+
+    const dispose = store$.onChange(({ value }) => {
+      if (observerDurable || value.notes[noteAId]?.bodyMd !== firstNote.bodyMd) return;
+      observerDurable = applyReplicaForLease(lease, (current) => ({
+        next: {
+          ...current,
+          notes: { ...current.notes, [noteAId]: secondNote },
+          outbox: [secondMutation],
+        },
+        result: undefined,
+      })).durable;
+    });
+
+    const first = applyReplicaForLease(lease, (current) => ({
+      next: {
+        ...current,
+        notes: { ...current.notes, [noteAId]: firstNote },
+        outbox: [firstMutation],
+      },
+      result: undefined,
+    }));
+    dispose();
+    expect(observerDurable).not.toBeNull();
+    await Promise.all([first.durable, observerDurable!]);
+
+    const persisted = JSON.parse(
+      memory.values.get(stateStorageKeys.replica(ownerKeyFor(sessionA)))!,
+    ) as { notes: Record<string, Note>; outbox: SyncMutation[] };
+    expect(persisted.notes[noteAId]?.bodyMd).toBe(secondNote.bodyMd);
+    expect(persisted.outbox).toEqual([secondMutation]);
+    expect(store$.notes.get()[noteAId]?.bodyMd).toBe(secondNote.bodyMd);
+    expect(store$.outbox.get()).toEqual([secondMutation]);
   });
 
   it('serializes hydration behind an in-flight account adoption', async () => {

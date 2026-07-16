@@ -4,6 +4,7 @@ import type { Note, SyncMutation, SyncPushRequest, SyncPushResponse } from '@iri
 const memory = vi.hoisted(() => ({
   values: new Map<string, string>(),
   failSetKey: null as string | null,
+  failSetOnceKey: null as string | null,
 }));
 const apiMock = vi.hoisted(() => ({
   calls: [] as {
@@ -19,6 +20,10 @@ vi.mock('../state/storage', () => ({
   storage: {
     get: async (key: string) => memory.values.get(key) ?? null,
     set: async (key: string, value: string) => {
+      if (memory.failSetOnceKey === key) {
+        memory.failSetOnceKey = null;
+        throw new Error('injected one-time write failure');
+      }
       if (memory.failSetKey === key) throw new Error('injected write failure');
       memory.values.set(key, value);
     },
@@ -71,6 +76,7 @@ import {
 } from '../state/store';
 import { mergeAuthoritativeNoteIfSafe } from '../history-safety';
 import {
+  createNoteLocal,
   deleteNoteLocal,
   keepLocalConflict,
   recoverSyncIssue,
@@ -168,6 +174,7 @@ async function installConflict(session: Session, opId = 'op-local'): Promise<voi
 beforeEach(async () => {
   memory.values.clear();
   memory.failSetKey = null;
+  memory.failSetOnceKey = null;
   apiMock.calls = [];
   apiMock.pushPromise = null;
   await loadState();
@@ -390,6 +397,114 @@ describe('local tombstone guards', () => {
     expect(deleteNoteLocal(noteId)).toBe(false);
     expect(store$.notes.get()[noteId]).toEqual(tombstone);
     expect(store$.outbox.get()).toEqual([]);
+  });
+});
+
+describe('local replica transactions', () => {
+  it('publishes matching note and outbox state for create, update, and delete', async () => {
+    store$.notes.set({});
+    store$.outbox.set([]);
+    store$.pendingPush.set(null);
+    store$.conflicts.set({});
+    store$.syncIssue.set({
+      code: 'test_hold',
+      message: 'Keep network reconciliation inert while observing local publications',
+      affectedOpIds: [],
+      recoveryKind: 'retry',
+    });
+    expect(await saveState()).toBe(true);
+
+    const observed: {
+      bodyMd: string;
+      deleted: boolean;
+      mutationType: SyncMutation['type'] | undefined;
+      mutationBody: string | undefined;
+    }[] = [];
+    const dispose = store$.notes.onChange(({ value }) => {
+      const changed = Object.values(value)[0];
+      if (!changed) return;
+      const queued = store$.outbox.get().find((item) => item.note.id === changed.id);
+      observed.push({
+        bodyMd: changed.bodyMd,
+        deleted: changed.deletedAt !== null,
+        mutationType: queued?.type,
+        mutationBody: queued?.note.bodyMd,
+      });
+    });
+
+    const created = createNoteLocal({ title: 'Created', bodyMd: 'created body' });
+    expect(updateNoteLocal(created.id, { bodyMd: 'updated body' })).toBe(true);
+    expect(deleteNoteLocal(created.id)).toBe(true);
+    dispose();
+
+    expect(observed).toEqual([
+      {
+        bodyMd: 'created body',
+        deleted: false,
+        mutationType: 'upsert',
+        mutationBody: 'created body',
+      },
+      {
+        bodyMd: 'updated body',
+        deleted: false,
+        mutationType: 'upsert',
+        mutationBody: 'updated body',
+      },
+      {
+        bodyMd: 'updated body',
+        deleted: true,
+        mutationType: 'delete',
+        mutationBody: 'updated body',
+      },
+    ]);
+
+    await updateReplicaForLease(openSessionLease()!, (current) => current);
+    const persisted = JSON.parse(
+      memory.values.get(stateStorageKeys.replica(ownerKeyFor(sessionA)))!,
+    ) as { notes: Record<string, Note>; outbox: SyncMutation[] };
+    expect(persisted.notes[created.id]?.deletedAt).not.toBeNull();
+    expect(persisted.outbox[0]).toMatchObject({
+      type: 'delete',
+      note: { id: created.id, bodyMd: 'updated body' },
+    });
+  });
+
+  it('publishes note and outbox together, then lets staging rescue a failed first save', async () => {
+    const original = note(workspaceA, 'original');
+    store$.notes.set({ [noteId]: original });
+    store$.outbox.set([]);
+    store$.pendingPush.set(null);
+    store$.conflicts.set({});
+    store$.syncIssue.set(null);
+    expect(await saveState()).toBe(true);
+
+    const replicaKey = stateStorageKeys.replica(ownerKeyFor(sessionA));
+    memory.failSetOnceKey = replicaKey;
+    const push = deferred<SyncPushResponse>();
+    apiMock.pushPromise = push.promise;
+
+    expect(updateNoteLocal(noteId, { bodyMd: 'optimistic and durable' })).toBe(true);
+    const queued = store$.outbox.get()[0]!;
+    expect(store$.notes.get()[noteId]?.bodyMd).toBe('optimistic and durable');
+    expect(queued.note.bodyMd).toBe('optimistic and durable');
+
+    const running = sync();
+    await vi.waitFor(() => expect(apiMock.calls.some((call) => call.method === 'push')).toBe(true));
+
+    const rescued = JSON.parse(memory.values.get(replicaKey)!) as {
+      notes: Record<string, Note>;
+      outbox: SyncMutation[];
+      pendingPush: SyncMutation[] | null;
+    };
+    expect(rescued.notes[noteId]?.bodyMd).toBe('optimistic and durable');
+    expect(rescued.outbox).toEqual([queued]);
+    expect(rescued.pendingPush).toEqual([queued]);
+
+    push.resolve(appliedResponse(workspaceA, [queued]));
+    await running;
+    expect(store$.notes.get()[noteId]?.bodyMd).toBe('optimistic and durable');
+    expect(store$.outbox.get()).toEqual([]);
+    expect(store$.pendingPush.get()).toBeNull();
   });
 });
 

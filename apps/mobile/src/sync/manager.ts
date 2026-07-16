@@ -6,16 +6,17 @@ import type { Note, SyncMutation } from '@iris/shared';
 import { Platform } from 'react-native';
 import { apiForLease } from '../api';
 import {
-  assertCurrentSession,
+  applyReplicaForLease,
   expireSessionIfCurrent,
   isCurrentSession,
   openSessionLease,
   readReplicaForLease,
-  saveState,
   setStatusForLease,
   setSyncGatedForLease,
   store$,
   updateReplicaForLease,
+  type ReplicaChange,
+  type ReplicaState,
   type SessionLease,
 } from '../state/store';
 import { createSyncCoordinator } from './coordinator';
@@ -135,12 +136,10 @@ export async function recoverSyncIssue(): Promise<boolean> {
   }
 }
 
-function enqueue(lease: SessionLease, mutation: SyncMutation): void {
-  assertCurrentSession(lease);
-  const currentOutbox = store$.outbox.get();
-  const replaced = currentOutbox.find((item) => item.note.id === mutation.note.id);
+function enqueueMutation(current: ReplicaState, mutation: SyncMutation): ReplicaState {
+  const replaced = current.outbox.find((item) => item.note.id === mutation.note.id);
   const alreadyStaged = Boolean(
-    replaced && store$.pendingPush.get()?.some((item) => item.opId === replaced.opId),
+    replaced && current.pendingPush?.some((item) => item.opId === replaced.opId),
   );
   // Preserve an explicit, not-yet-dispatched resurrection while collapsing subsequent
   // edits into its newest payload. Once that resurrection is staged, later edits are a
@@ -149,10 +148,20 @@ function enqueue(lease: SessionLease, mutation: SyncMutation): void {
     mutation.type === 'upsert' && replaced?.type === 'resurrect' && !alreadyStaged
       ? { ...mutation, type: 'resurrect', baseVersion: replaced.baseVersion }
       : mutation;
-  const rest = currentOutbox.filter((item) => item.note.id !== mutation.note.id);
-  store$.outbox.set([...rest, nextMutation]);
-  void saveState();
+  const rest = current.outbox.filter((item) => item.note.id !== mutation.note.id);
+  return { ...current, outbox: [...rest, nextMutation] };
+}
+
+function applyLocalChange<Result>(
+  lease: SessionLease,
+  update: (current: ReplicaState) => ReplicaChange<Result>,
+): Result {
+  const applied = applyReplicaForLease(lease, update);
+  void applied.durable.catch(() => {
+    if (isCurrentSession(lease)) setStatusForLease(lease, 'error');
+  });
   void sync();
+  return applied.result;
 }
 
 type NotePatch = {
@@ -183,9 +192,7 @@ export function createNoteLocal(input: {
     updatedAt: createdAt,
     deletedAt: null,
   };
-  assertCurrentSession(lease);
-  store$.notes[id].set(note);
-  enqueue(lease, {
+  const mutation: SyncMutation = {
     opId: uuid(),
     type: 'upsert',
     note: {
@@ -196,14 +203,18 @@ export function createNoteLocal(input: {
       tags: note.tags,
     },
     baseVersion: 0,
-  });
-  return note;
+  };
+  return applyLocalChange(lease, (current) => ({
+    next: enqueueMutation({ ...current, notes: { ...current.notes, [id]: note } }, mutation),
+    result: note,
+  }));
 }
 
 export function updateNoteLocal(id: string, patch: NotePatch): boolean {
   const lease = currentLease();
-  if (store$.conflicts.get()[id]) return false;
-  const current = store$.notes[id].get();
+  const currentReplica = readReplicaForLease(lease);
+  if (currentReplica.conflicts[id]) return false;
+  const current = currentReplica.notes[id];
   if (!current || current.workspaceId !== lease.workspaceId || current.deletedAt) return false;
   const next: Note = {
     ...current,
@@ -213,9 +224,7 @@ export function updateNoteLocal(id: string, patch: NotePatch): boolean {
     tags: patch.tags ?? current.tags,
     updatedAt: nowIso(),
   };
-  assertCurrentSession(lease);
-  store$.notes[id].set(next);
-  enqueue(lease, {
+  const mutation: SyncMutation = {
     opId: uuid(),
     type: 'upsert',
     note: {
@@ -226,18 +235,21 @@ export function updateNoteLocal(id: string, patch: NotePatch): boolean {
       tags: next.tags,
     },
     baseVersion: current.version,
-  });
-  return true;
+  };
+  return applyLocalChange(lease, (latest) => ({
+    next: enqueueMutation({ ...latest, notes: { ...latest.notes, [id]: next } }, mutation),
+    result: true,
+  }));
 }
 
 export function deleteNoteLocal(id: string): boolean {
   const lease = currentLease();
-  if (store$.conflicts.get()[id]) return false;
-  const current = store$.notes[id].get();
+  const currentReplica = readReplicaForLease(lease);
+  if (currentReplica.conflicts[id]) return false;
+  const current = currentReplica.notes[id];
   if (!current || current.workspaceId !== lease.workspaceId || current.deletedAt) return false;
-  assertCurrentSession(lease);
-  store$.notes[id].set({ ...current, deletedAt: nowIso() });
-  enqueue(lease, {
+  const deletedAt = nowIso();
+  const mutation: SyncMutation = {
     opId: uuid(),
     type: 'delete',
     note: {
@@ -248,8 +260,17 @@ export function deleteNoteLocal(id: string): boolean {
       tags: current.tags,
     },
     baseVersion: current.version,
-  });
-  return true;
+  };
+  return applyLocalChange(lease, (latest) => ({
+    next: enqueueMutation(
+      {
+        ...latest,
+        notes: { ...latest.notes, [id]: { ...current, deletedAt } },
+      },
+      mutation,
+    ),
+    result: true,
+  }));
 }
 
 /** Re-queue the exact retained local draft the operator reviewed. */
