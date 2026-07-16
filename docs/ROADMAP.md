@@ -88,37 +88,39 @@ These were named as out of scope and are staying out until the foundation is pro
   the authoritative note including tombstones for immediate replica fencing. Focused
   tests cover restore-to-delete, undo-delete, undo-create, restore/sync revival undo,
   legacy uncertainty, migration drift/RLS, and mixed-path no-mutation behavior.
+- **Phase 2.5 — explicit sync resurrection** (ADR-015): ordinary upsert never clears a
+  tombstone; only an exact-base `resurrect` chosen from the retained conflict draft can
+  make it live. The operation type is bound by the existing frozen receipt fingerprint,
+  successful revival records reversible `note.restore` activity, and old/new binaries
+  reject or retain the intent without silently reinterpreting it. Mobile queue collapse
+  preserves unstaged resurrection intent and rebases edits made after durable staging.
 
 ## Near-term follow-ups (next things)
 
-1. **Make resurrection an explicit sync intent**: ordinary upsert against a tombstone
-   still revives at a matching base version. Add a dedicated `resurrect` mutation,
-   make normal upsert conflict with tombstones, retain the local draft, and give the
-   operator explicit “Restore my draft” versus “Keep deleted” choices across devices.
-2. **Complete Sync v2's resource/repository boundary and release gates**: generic resource envelopes,
+1. **Complete Sync v2's resource/repository boundary and release gates**: generic resource envelopes,
    SQLite on native, IndexedDB plus cross-tab session coordination on web,
    transactional note+outbox writes, and a user-facing recovery/import path for
    quarantined legacy `iris:state:v1` data, followed by native iOS/Android device or
    simulator acceptance. The current note-only wire contract and size-limited per-owner
    SecureStore value, missing web cross-tab ownership, missing recovery import, and
    unrun native acceptance are explicit blockers before the work queue.
-3. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
+2. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
    accountable human-or-agent assignee, reversible writes, and the same sync resource
    envelope. Keep activity, check-in, delegation, and durable claim/run semantics
    distinct.
-4. **Managed auth provider** wired for real (Clerk or Supabase) + password reset + OAuth +
+3. **Managed auth provider** wired for real (Clerk or Supabase) + password reset + OAuth +
    email verification — these are the managed provider's job, not `LocalAuthProvider`'s.
-5. **Attachment storage** to object storage (S3/R2) with the same export guarantee;
+4. **Attachment storage** to object storage (S3/R2) with the same export guarantee;
    foundation stores attachment metadata and includes files in export, but a production
    blob store + upload flow is a follow-up.
-6. **Implement rate limiting** for agent tokens (per-scope budgets, a documented window,
+5. **Implement rate limiting** for agent tokens (per-scope budgets, a documented window,
    and 429 semantics). No coarse limiter is currently shipped.
-7. **Stripe hardening**: proration, plan changes, dunning, customer portal, tax.
-8. **EAS Build + store submission** pipeline and OTA update channels.
-9. **Editor upgrades**: live Markdown preview, slash-menu, image paste — still emitting
+6. **Stripe hardening**: proration, plan changes, dunning, customer portal, tax.
+7. **EAS Build + store submission** pipeline and OTA update channels.
+8. **Editor upgrades**: live Markdown preview, slash-menu, image paste — still emitting
    plain Markdown.
-10. **Search/tags upgrades**: tag rename/merge, search snippets & highlighting, filter by
-    tag _and_ query together, per-field ranking weights.
+9. **Search/tags upgrades**: tag rename/merge, search snippets & highlighting, filter by
+   tag _and_ query together, per-field ranking weights.
 
 ## Tempted-but-parked ideas (write here, don't build)
 

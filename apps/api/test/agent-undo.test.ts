@@ -331,7 +331,7 @@ describe('agent actors, activity feed, and undo', () => {
     expect(ordinaryRead.status).toBe(200);
   });
 
-  it('undoes a sync revival back to its prior tombstone', async () => {
+  it('attributes an agent sync resurrection and lets the operator undo it to a tombstone', async () => {
     const user = await signUp(t.app);
     const deviceId = `device-${randomUUID()}`;
     await call(t.app, 'POST', '/v1/devices', {
@@ -348,21 +348,46 @@ describe('agent actors, activity feed, and undo', () => {
       token: user.token,
       body: { baseVersion: 1 },
     });
-    const revival = await call(t.app, 'POST', '/v1/sync/push', {
+    const writer = await call(t.app, 'POST', '/v1/agents/tokens', {
       token: user.token,
+      body: { agentName: 'Resurrection agent', scopes: ['notes:read', 'notes:write'] },
+    });
+    const reader = await call(t.app, 'POST', '/v1/agents/tokens', {
+      token: user.token,
+      body: { agentName: 'Read-only agent', scopes: ['notes:read'] },
+    });
+    const notePayload = {
+      id: note.id,
+      title: 'Sync lifecycle',
+      bodyMd: 'revived draft',
+      folder: 'agent/restored',
+      tags: ['revived'],
+    };
+    const refused = await call(t.app, 'POST', '/v1/sync/push', {
+      token: reader.json.token,
+      body: {
+        deviceId,
+        mutations: [
+          {
+            opId: `refused-revive-${randomUUID()}`,
+            type: 'resurrect',
+            note: notePayload,
+            baseVersion: 2,
+          },
+        ],
+      },
+    });
+    expect(refused.status).toBe(403);
+
+    const revival = await call(t.app, 'POST', '/v1/sync/push', {
+      token: writer.json.token,
       body: {
         deviceId,
         mutations: [
           {
             opId: `revive-${randomUUID()}`,
-            type: 'upsert',
-            note: {
-              id: note.id,
-              title: 'Sync lifecycle',
-              bodyMd: 'revived draft',
-              folder: null,
-              tags: ['revived'],
-            },
+            type: 'resurrect',
+            note: notePayload,
             baseVersion: 2,
           },
         ],
@@ -372,11 +397,17 @@ describe('agent actors, activity feed, and undo', () => {
       version: 3,
       deletedAt: null,
       bodyMd: 'revived draft',
+      folder: 'agent/restored',
+      tags: ['revived'],
     });
     const feed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
     const revivalAction = feed.json.activity.find(
-      (entry: any) => entry.action === 'note.update' && entry.resultingVersion === 3,
+      (entry: any) =>
+        entry.actorType === 'agent' &&
+        entry.action === 'note.restore' &&
+        entry.resultingVersion === 3,
     );
+    expect(revivalAction.actorName).toBe('Resurrection agent');
 
     const undo = await call(t.app, 'POST', `/v2/activity/${revivalAction.id}/undo`, {
       token: user.token,

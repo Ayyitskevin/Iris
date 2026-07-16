@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { call, makeApp, signUp, type TestApp } from './helpers';
 
@@ -144,6 +144,435 @@ describe('local-first sync', () => {
           note.tags.join(',') === 'edited',
       ),
     ).toBe(true);
+  });
+
+  it('requires an exact explicit resurrection and binds that intent to its receipt', async () => {
+    const user = await signUp(t.app);
+    const deviceId = `device-${randomUUID()}`;
+    await call(t.app, 'POST', '/v1/devices', {
+      token: user.token,
+      body: { id: deviceId, name: 'Lifecycle review', platform: 'web' },
+    });
+    const created = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: user.token,
+        body: {
+          title: 'Before deletion',
+          bodyMd: 'server tombstone body',
+          folder: 'archive/original',
+          tags: ['before'],
+        },
+      })
+    ).json.note;
+    const deleted = await call(t.app, 'DELETE', `/v1/notes/${created.id}`, {
+      token: user.token,
+      body: { baseVersion: 1 },
+    });
+    expect(deleted.json.note).toMatchObject({ version: 2 });
+    expect(deleted.json.note.deletedAt).toEqual(expect.any(String));
+
+    const retainedDraft = {
+      id: created.id,
+      title: 'Restored local title',
+      bodyMd: 'retained local draft',
+      folder: 'restored/folder',
+      tags: ['Restored', 'restored'],
+    };
+    const legacyOpId = `legacy-upsert-${randomUUID()}`;
+    const ordinary = await call(t.app, 'POST', '/v1/sync/push', {
+      token: user.token,
+      body: {
+        deviceId,
+        mutations: [{ opId: legacyOpId, type: 'upsert', note: retainedDraft, baseVersion: 2 }],
+      },
+    });
+    expect(ordinary.status).toBe(200);
+    expect(ordinary.json.applied).toEqual([]);
+    expect(ordinary.json.conflicts).toEqual([
+      expect.objectContaining({
+        opId: legacyOpId,
+        reason: 'version_mismatch',
+        serverNote: expect.objectContaining({
+          id: created.id,
+          version: 2,
+          bodyMd: 'server tombstone body',
+          deletedAt: expect.any(String),
+        }),
+      }),
+    ]);
+
+    const unchangedHistory = await call(t.app, 'GET', `/v1/notes/${created.id}/versions`, {
+      token: user.token,
+    });
+    const unchangedFeed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    expect(unchangedHistory.json.versions).toHaveLength(2);
+    expect(
+      unchangedFeed.json.activity.filter((entry: any) => entry.noteId === created.id),
+    ).toHaveLength(2);
+
+    const staleTombstone = await call(t.app, 'POST', '/v1/sync/push', {
+      token: user.token,
+      body: {
+        deviceId,
+        mutations: [
+          {
+            opId: `stale-tombstone-${randomUUID()}`,
+            type: 'resurrect',
+            note: retainedDraft,
+            baseVersion: 1,
+          },
+        ],
+      },
+    });
+    expect(staleTombstone.status).toBe(200);
+    expect(staleTombstone.json.applied).toEqual([]);
+    expect(staleTombstone.json.conflicts[0].serverNote).toMatchObject({
+      version: 2,
+      bodyMd: 'server tombstone body',
+      deletedAt: expect.any(String),
+    });
+
+    // The operation id is already bound to ordinary edit intent, even though that edit
+    // only produced a conflict. It cannot be repurposed as the reviewed resurrection.
+    const intentReuse = await call(t.app, 'POST', '/v1/sync/push', {
+      token: user.token,
+      body: {
+        deviceId,
+        mutations: [{ opId: legacyOpId, type: 'resurrect', note: retainedDraft, baseVersion: 2 }],
+      },
+    });
+    expect(intentReuse.status).toBe(409);
+    expect(intentReuse.json.error).toMatchObject({
+      code: 'idempotency_key_reused',
+      operationId: legacyOpId,
+    });
+
+    const resurrectOpId = `resurrect-${randomUUID()}`;
+    const resurrection = {
+      deviceId,
+      mutations: [{ opId: resurrectOpId, type: 'resurrect', note: retainedDraft, baseVersion: 2 }],
+    };
+    const applied = await call(t.app, 'POST', '/v1/sync/push', {
+      token: user.token,
+      body: resurrection,
+    });
+    const replay = await call(t.app, 'POST', '/v1/sync/push', {
+      token: user.token,
+      body: resurrection,
+    });
+    expect(applied.status).toBe(200);
+    expect(replay.json).toEqual(applied.json);
+    expect(applied.json.conflicts).toEqual([]);
+    expect(applied.json.applied[0].note).toMatchObject({
+      id: created.id,
+      title: 'Restored local title',
+      bodyMd: 'retained local draft',
+      folder: 'restored/folder',
+      tags: ['restored'],
+      version: 3,
+      deletedAt: null,
+    });
+
+    const history = await call(t.app, 'GET', `/v1/notes/${created.id}/versions`, {
+      token: user.token,
+    });
+    expect(history.json.versions).toHaveLength(3);
+    expect(history.json.versions.slice(0, 2)).toEqual([
+      expect.objectContaining({
+        version: 3,
+        title: 'Restored local title',
+        bodyMd: 'retained local draft',
+        folder: 'restored/folder',
+        tags: ['restored'],
+        isDeleted: false,
+      }),
+      expect.objectContaining({ version: 2, isDeleted: true }),
+    ]);
+    const feed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    expect(
+      feed.json.activity.filter(
+        (entry: any) =>
+          entry.noteId === created.id &&
+          entry.action === 'note.restore' &&
+          entry.resultingVersion === 3,
+      ),
+    ).toHaveLength(1);
+
+    const receipts = (
+      await t.client.query(
+        `SELECT op_id, receipt_version
+         FROM sync_idempotency
+         WHERE workspace_id = $1 AND op_id IN ($2, $3)
+         ORDER BY op_id`,
+        [user.workspaceId, legacyOpId, resurrectOpId],
+      )
+    ).rows as Array<{ op_id: string; receipt_version: number }>;
+    expect(receipts).toHaveLength(2);
+    expect(receipts.every((receipt) => receipt.receipt_version === 1)).toBe(true);
+
+    const alreadyLive = await call(t.app, 'POST', '/v1/sync/push', {
+      token: user.token,
+      body: {
+        deviceId,
+        mutations: [
+          {
+            opId: `live-resurrect-${randomUUID()}`,
+            type: 'resurrect',
+            note: retainedDraft,
+            baseVersion: 3,
+          },
+        ],
+      },
+    });
+    expect(alreadyLive.status).toBe(200);
+    expect(alreadyLive.json.applied).toEqual([]);
+    expect(alreadyLive.json.conflicts[0].serverNote).toMatchObject({
+      version: 3,
+      bodyMd: 'retained local draft',
+      deletedAt: null,
+    });
+    const finalHistory = await call(t.app, 'GET', `/v1/notes/${created.id}/versions`, {
+      token: user.token,
+    });
+    expect(finalHistory.json.versions).toHaveLength(3);
+  });
+
+  it('rolls back a whole batch when a later resurrection has no tombstone target', async () => {
+    const user = await signUp(t.app);
+    const deviceId = `device-${randomUUID()}`;
+    await call(t.app, 'POST', '/v1/devices', {
+      token: user.token,
+      body: { id: deviceId, name: 'Atomic resurrection', platform: 'web' },
+    });
+    const note = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: user.token,
+        body: { title: 'Atomic tombstone', bodyMd: 'must stay deleted', tags: ['before'] },
+      })
+    ).json.note;
+    await call(t.app, 'DELETE', `/v1/notes/${note.id}`, {
+      token: user.token,
+      body: { baseVersion: 1 },
+    });
+    const other = await signUp(t.app);
+    const otherNote = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: other.token,
+        body: { title: 'Other tenant tombstone', bodyMd: 'must remain private' },
+      })
+    ).json.note;
+    await call(t.app, 'DELETE', `/v1/notes/${otherNote.id}`, {
+      token: other.token,
+      body: { baseVersion: 1 },
+    });
+    const validOpId = `valid-resurrect-${randomUUID()}`;
+    const missingOpId = `missing-resurrect-${randomUUID()}`;
+    const validMutation = {
+      opId: validOpId,
+      type: 'resurrect',
+      note: {
+        id: note.id,
+        title: 'Would revive',
+        bodyMd: 'must roll back',
+        folder: null,
+        tags: ['after'],
+      },
+      baseVersion: 2,
+    };
+    const failed = await call(t.app, 'POST', '/v1/sync/push', {
+      token: user.token,
+      body: {
+        deviceId,
+        mutations: [
+          validMutation,
+          {
+            opId: missingOpId,
+            type: 'resurrect',
+            note: {
+              id: otherNote.id,
+              title: 'Missing',
+              bodyMd: 'must not be created',
+              folder: null,
+              tags: [],
+            },
+            baseVersion: 0,
+          },
+        ],
+      },
+    });
+    expect(failed.status).toBe(400);
+    expect(failed.json.error.code).toBe('invalid_sync_resurrection');
+
+    const stillDeleted = await call(t.app, 'GET', `/v1/notes/${note.id}`, {
+      token: user.token,
+    });
+    expect(stillDeleted.status).toBe(404);
+    const history = await call(t.app, 'GET', `/v1/notes/${note.id}/versions`, {
+      token: user.token,
+    });
+    expect(history.json.versions).toHaveLength(2);
+    expect(history.json.versions[0]).toMatchObject({ version: 2, isDeleted: true });
+    const receipts = (
+      await t.client.query(
+        `SELECT op_id
+         FROM sync_idempotency
+         WHERE workspace_id = $1 AND op_id IN ($2, $3)`,
+        [user.workspaceId, validOpId, missingOpId],
+      )
+    ).rows;
+    expect(receipts).toEqual([]);
+    const otherHistory = await call(t.app, 'GET', `/v1/notes/${otherNote.id}/versions`, {
+      token: other.token,
+    });
+    expect(otherHistory.json.versions).toHaveLength(2);
+    expect(otherHistory.json.versions[0]).toMatchObject({
+      version: 2,
+      bodyMd: 'must remain private',
+      isDeleted: true,
+    });
+
+    const retry = await call(t.app, 'POST', '/v1/sync/push', {
+      token: user.token,
+      body: { deviceId, mutations: [validMutation] },
+    });
+    expect(retry.status).toBe(200);
+    expect(retry.json.applied[0].note).toMatchObject({ version: 3, deletedAt: null });
+  });
+
+  it('applies exactly one of two concurrent resurrection intents on the same base', async () => {
+    const user = await signUp(t.app);
+    const deviceId = `device-${randomUUID()}`;
+    await call(t.app, 'POST', '/v1/devices', {
+      token: user.token,
+      body: { id: deviceId, name: 'Resurrection race', platform: 'web' },
+    });
+    const note = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: user.token,
+        body: { title: 'Race tombstone', bodyMd: 'before' },
+      })
+    ).json.note;
+    await call(t.app, 'DELETE', `/v1/notes/${note.id}`, {
+      token: user.token,
+      body: { baseVersion: 1 },
+    });
+    const resurrect = (bodyMd: string) =>
+      call(t.app, 'POST', '/v1/sync/push', {
+        token: user.token,
+        body: {
+          deviceId,
+          mutations: [
+            {
+              opId: `race-resurrect-${randomUUID()}`,
+              type: 'resurrect',
+              note: { id: note.id, title: 'Race tombstone', bodyMd, folder: null, tags: [] },
+              baseVersion: 2,
+            },
+          ],
+        },
+      });
+    const results = await Promise.all([resurrect('winner A'), resurrect('winner B')]);
+    expect(results.map((result) => result.status)).toEqual([200, 200]);
+    expect(results.flatMap((result) => result.json.applied)).toHaveLength(1);
+    expect(results.flatMap((result) => result.json.conflicts)).toHaveLength(1);
+    expect(results.flatMap((result) => result.json.conflicts)[0].serverNote).toMatchObject({
+      version: 3,
+      deletedAt: null,
+    });
+
+    const current = await call(t.app, 'GET', `/v1/notes/${note.id}`, { token: user.token });
+    expect(current.json.note.version).toBe(3);
+    expect(['winner A', 'winner B']).toContain(current.json.note.bodyMd);
+    const history = await call(t.app, 'GET', `/v1/notes/${note.id}/versions`, {
+      token: user.token,
+    });
+    expect(history.json.versions).toHaveLength(3);
+    const feed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    expect(
+      feed.json.activity.filter(
+        (entry: any) => entry.noteId === note.id && entry.action === 'note.restore',
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('replays a frozen pre-change receipt-v1 upsert under the new mutation enum', async () => {
+    const user = await signUp(t.app);
+    const deviceId = `device-${randomUUID()}`;
+    await call(t.app, 'POST', '/v1/devices', {
+      token: user.token,
+      body: { id: deviceId, name: 'Legacy receipt', platform: 'web' },
+    });
+    const created = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: user.token,
+        body: { title: 'Receipt v1', bodyMd: 'version one', folder: null, tags: ['old'] },
+      })
+    ).json.note;
+    const updated = (
+      await call(t.app, 'PATCH', `/v1/notes/${created.id}`, {
+        token: user.token,
+        body: {
+          title: 'Receipt v1 updated',
+          bodyMd: 'version two',
+          folder: 'legacy/folder',
+          tags: ['legacy'],
+          baseVersion: 1,
+        },
+      })
+    ).json.note;
+    const mutation = {
+      opId: `pre-change-v1-${randomUUID()}`,
+      type: 'upsert',
+      note: {
+        id: updated.id,
+        title: updated.title,
+        bodyMd: updated.bodyMd,
+        folder: updated.folder,
+        tags: updated.tags,
+      },
+      baseVersion: 1,
+    };
+    // This is the exact V1 canonical object from before `resurrect` joined the enum.
+    const canonical = JSON.stringify({
+      actorType: 'user',
+      actorId: user.userId,
+      deviceId,
+      operation: {
+        type: mutation.type,
+        note: mutation.note,
+        baseVersion: mutation.baseVersion,
+      },
+    });
+    const fingerprint = createHash('sha256').update(canonical).digest('hex');
+    const outcome = { kind: 'applied', item: { opId: mutation.opId, note: updated } };
+    await t.client.query(
+      `INSERT INTO sync_idempotency (
+         workspace_id, op_id, actor_type, actor_id, device_id,
+         receipt_version, request_fingerprint, outcome
+       ) VALUES ($1, $2, 'user', $3, $4, 1, $5, $6::jsonb)`,
+      [
+        user.workspaceId,
+        mutation.opId,
+        user.userId,
+        deviceId,
+        fingerprint,
+        JSON.stringify(outcome),
+      ],
+    );
+
+    const replay = await call(t.app, 'POST', '/v1/sync/push', {
+      token: user.token,
+      body: { deviceId, mutations: [mutation] },
+    });
+    expect(replay.status).toBe(200);
+    expect(replay.json).toEqual({
+      applied: [{ opId: mutation.opId, note: updated }],
+      conflicts: [],
+    });
+    const history = await call(t.app, 'GET', `/v1/notes/${created.id}/versions`, {
+      token: user.token,
+    });
+    expect(history.json.versions).toHaveLength(2);
   });
 
   it('accepts UUIDs without RFC version bits across REST, push, and V1 cursors', async () => {

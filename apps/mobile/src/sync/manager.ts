@@ -137,8 +137,20 @@ export async function recoverSyncIssue(): Promise<boolean> {
 
 function enqueue(lease: SessionLease, mutation: SyncMutation): void {
   assertCurrentSession(lease);
-  const rest = store$.outbox.get().filter((item) => item.note.id !== mutation.note.id);
-  store$.outbox.set([...rest, mutation]);
+  const currentOutbox = store$.outbox.get();
+  const replaced = currentOutbox.find((item) => item.note.id === mutation.note.id);
+  const alreadyStaged = Boolean(
+    replaced && store$.pendingPush.get()?.some((item) => item.opId === replaced.opId),
+  );
+  // Preserve an explicit, not-yet-dispatched resurrection while collapsing subsequent
+  // edits into its newest payload. Once that resurrection is staged, later edits are a
+  // separate upsert that reconciliation rebases onto the revived authoritative head.
+  const nextMutation: SyncMutation =
+    mutation.type === 'upsert' && replaced?.type === 'resurrect' && !alreadyStaged
+      ? { ...mutation, type: 'resurrect', baseVersion: replaced.baseVersion }
+      : mutation;
+  const rest = currentOutbox.filter((item) => item.note.id !== mutation.note.id);
+  store$.outbox.set([...rest, nextMutation]);
   void saveState();
   void sync();
 }
@@ -251,9 +263,16 @@ export async function keepLocalConflict(
   const conflict = store$.conflicts.get()[noteId];
   if (!conflict || conflict.localMutation.opId !== expectedOpId) return false;
 
+  const reviewedType: SyncMutation['type'] =
+    conflict.localMutation.type === 'delete'
+      ? 'delete'
+      : conflict.serverNote.deletedAt
+        ? 'resurrect'
+        : 'upsert';
   const mutation: SyncMutation = {
     ...conflict.localMutation,
     opId: uuid(),
+    type: reviewedType,
     baseVersion: conflict.serverNote.version,
   };
   const local: Note = {

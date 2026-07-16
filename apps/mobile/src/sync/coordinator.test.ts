@@ -539,6 +539,55 @@ describe('session-bound sync coordinator', () => {
     expect(h.calls.some((call) => call.method === 'changes')).toBe(false);
   });
 
+  it('durably holds a resurrection rejected by an old server without dropping its draft', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const resurrection: SyncMutation = {
+      ...mutation('op-resurrect', 'retained draft', 2),
+      type: 'resurrect',
+    };
+    const localProjection = {
+      ...note(workspaceA, resurrection.note.bodyMd, 2),
+      title: resurrection.note.title,
+      deletedAt: null,
+    };
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes: { [noteId]: localProjection },
+      outbox: [resurrection],
+    });
+    const h = harness(port, {
+      push: () =>
+        Promise.reject(
+          new ApiRequestError(
+            400,
+            'validation_error',
+            'Old server does not recognize resurrect mutations',
+          ),
+        ),
+    });
+
+    await h.sync();
+
+    const replica = port.replicas.get(lease.ownerKey)!;
+    expect(h.calls.filter((call) => call.method === 'push')).toHaveLength(1);
+    expect(h.calls.some((call) => call.method === 'changes')).toBe(false);
+    expect(replica.pendingPush).toEqual([resurrection]);
+    expect(replica.outbox).toEqual([resurrection]);
+    expect(replica.notes[noteId]).toEqual(localProjection);
+    expect(replica.syncIssue).toMatchObject({
+      code: 'validation_error',
+      affectedOpIds: [resurrection.opId],
+      recoveryKind: 'retry',
+    });
+    expect(port.statuses.get(lease.ownerKey)).toBe('error');
+
+    await h.sync();
+    expect(h.calls.filter((call) => call.method === 'push')).toHaveLength(1);
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toEqual([resurrection]);
+  });
+
   it('does not stage or send a second chunk when the first response commit fails', async () => {
     const port = new MemoryPort();
     const lease = port.adopt('A');

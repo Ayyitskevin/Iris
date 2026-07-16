@@ -54,13 +54,13 @@ export function validatePushResponse(sent: SyncMutation[], response: SyncPushRes
   for (const applied of response.applied) {
     const mutation = bindResult(applied.opId);
     if (!applied.note && mutation.type !== 'delete') {
-      throw new SyncProtocolError('Applied upsert response omitted its authoritative note');
+      throw new SyncProtocolError('Applied live-note response omitted its authoritative note');
     }
     if (applied.note && applied.note.id !== mutation.note.id) {
       throw new SyncProtocolError('Applied response note did not match its operation');
     }
-    if (applied.note && mutation.type === 'upsert' && applied.note.deletedAt !== null) {
-      throw new SyncProtocolError('Applied upsert response returned a deleted note');
+    if (applied.note && mutation.type !== 'delete' && applied.note.deletedAt !== null) {
+      throw new SyncProtocolError('Applied live-note response returned a deleted note');
     }
     if (applied.note && mutation.type === 'delete' && applied.note.deletedAt === null) {
       throw new SyncProtocolError('Applied delete response returned a live note');

@@ -56,6 +56,52 @@ describe('push reconciliation', () => {
     expect(result.notes[server.id]).toMatchObject({ bodyMd: 'newest edit', version: 2 });
   });
 
+  it('rebases a newer upsert after a staged resurrection becomes live', () => {
+    const resurrection: SyncMutation = {
+      ...mutation('op-resurrect', 'reviewed draft', 2),
+      type: 'resurrect',
+    };
+    const newer = {
+      ...mutation('op-newer', 'newest body', 2),
+      note: {
+        ...mutation('op-newer', 'newest body', 2).note,
+        title: 'Newest title',
+      },
+    };
+    const revived = note({
+      title: resurrection.note.title,
+      bodyMd: resurrection.note.bodyMd,
+      version: 3,
+      deletedAt: null,
+    });
+
+    const result = reconcilePush(
+      {
+        notes: {
+          [revived.id]: note({
+            title: newer.note.title,
+            bodyMd: newer.note.bodyMd,
+            version: 2,
+            deletedAt: null,
+          }),
+        },
+        outbox: [newer],
+        conflicts: {},
+      },
+      [resurrection],
+      { applied: [{ opId: resurrection.opId, note: revived }], conflicts: [] },
+      detectedAt,
+    );
+
+    expect(result.outbox).toEqual([{ ...newer, baseVersion: 3 }]);
+    expect(result.notes[revived.id]).toMatchObject({
+      title: 'Newest title',
+      bodyMd: 'newest body',
+      version: 3,
+      deletedAt: null,
+    });
+  });
+
   it('removes the exact acknowledged op when no newer edit exists', () => {
     const sent = mutation('op-sent', 'landed');
     const other = {
@@ -104,6 +150,45 @@ describe('push reconciliation', () => {
       noteId: server.id,
       localMutation: newer,
       serverNote: server,
+      detectedAt,
+    });
+  });
+
+  it('retains an ordinary upsert draft when the authoritative server state is a tombstone', () => {
+    const localDraft = mutation('op-old-client-upsert', 'retained old-client draft', 2);
+    const tombstone = note({
+      title: 'Deleted on another device',
+      bodyMd: 'authoritative deleted body',
+      version: 2,
+      deletedAt: '2026-07-15T12:00:00.000Z',
+    });
+
+    const result = reconcilePush(
+      {
+        notes: {
+          [tombstone.id]: note({
+            title: localDraft.note.title,
+            bodyMd: localDraft.note.bodyMd,
+            version: 2,
+          }),
+        },
+        outbox: [localDraft],
+        conflicts: {},
+      },
+      [localDraft],
+      {
+        applied: [],
+        conflicts: [{ opId: localDraft.opId, reason: 'version_mismatch', serverNote: tombstone }],
+      },
+      detectedAt,
+    );
+
+    expect(result.outbox).toEqual([]);
+    expect(result.notes[tombstone.id]).toEqual(tombstone);
+    expect(result.conflicts[tombstone.id]).toEqual({
+      noteId: tombstone.id,
+      localMutation: localDraft,
+      serverNote: tombstone,
       detectedAt,
     });
   });
@@ -157,6 +242,49 @@ describe('push reconciliation', () => {
         detectedAt,
       ),
     ).toThrow('omitted its authoritative note');
+  });
+
+  it('requires an authoritative live note for an applied resurrection', () => {
+    const resurrection: SyncMutation = {
+      ...mutation('op-resurrect', 'reviewed draft', 2),
+      type: 'resurrect',
+    };
+
+    expect(() =>
+      reconcilePush(
+        { notes: {}, outbox: [resurrection], conflicts: {} },
+        [resurrection],
+        { applied: [{ opId: resurrection.opId }], conflicts: [] },
+        detectedAt,
+      ),
+    ).toThrow('omitted its authoritative note');
+
+    expect(() =>
+      reconcilePush(
+        { notes: {}, outbox: [resurrection], conflicts: {} },
+        [resurrection],
+        {
+          applied: [
+            {
+              opId: resurrection.opId,
+              note: note({ version: 3, deletedAt: '2026-07-15T12:01:00.000Z' }),
+            },
+          ],
+          conflicts: [],
+        },
+        detectedAt,
+      ),
+    ).toThrow('returned a deleted note');
+
+    const live = note({ bodyMd: 'reviewed draft', version: 3, deletedAt: null });
+    const result = reconcilePush(
+      { notes: {}, outbox: [resurrection], conflicts: {} },
+      [resurrection],
+      { applied: [{ opId: resurrection.opId, note: live }], conflicts: [] },
+      detectedAt,
+    );
+    expect(result.notes[live.id]).toEqual(live);
+    expect(result.outbox).toEqual([]);
   });
 
   it('rejects a same-workspace acknowledgement for another note', () => {

@@ -146,3 +146,11 @@ whole-snapshot undo now reconstruct known lifecycle state; legacy restore requir
 explicit preservation, while incomplete undo fails without a fake compensating write.
 Restore/undo protocol 2 uses distinct `/v2` mutation paths, and the retired v1 paths
 return 428 so mixed old/new routing cannot silently apply legacy always-revive semantics.
+GitHub Actions run `29516023454` passed that exact slice at commit
+`ce0bd965d75529db9823eb227ff183c4408b9a28`.
+
+ADR-015 separates an explicit, receipt-bound `resurrect` from ordinary upsert. A normal
+edit now retains an authoritative tombstone as a conflict; only “Restore my draft” can
+create a live head, recorded as reversible `note.restore` activity. Exact retries replay,
+old/new binaries fail closed, and edits on either side of durable request staging keep
+their intended lifecycle and newest Markdown payload.

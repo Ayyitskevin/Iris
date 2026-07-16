@@ -247,8 +247,8 @@ add later:
 - A direct restore includes the rendered head version as `baseVersion`; a stale history
   choice conflicts instead of overwriting a newer committed head.
 
-Deleted/tombstone state is not yet included in these snapshots. Exact reversal of a note
-revival is therefore a separate ROADMAP correctness gate rather than an implied claim.
+ADR-014 extends these snapshots with explicit live/deleted state, and ADR-015 makes a
+sync revival an explicit, attributable restore intent instead of an ordinary edit.
 
 ---
 
@@ -267,7 +267,7 @@ revival is therefore a separate ROADMAP correctness gate rather than an implied 
   tags as a new head version only when the target action remains current. A legacy
   snapshot with unknown folder state preserves the current folder and returns that
   partial result explicitly; missing required history and stale target actions fail
-  loud. Deleted/tombstone-state reversal remains open in ROADMAP.
+  loud. ADR-014/015 make deletion and explicit sync resurrection reversible too.
 
 Agent-token rate limiting is not implemented yet; it remains an explicit ROADMAP item.
 
@@ -518,9 +518,45 @@ not suffice because an old Zod handler could strip it and still mutate.
 The mobile client keeps non-current protocols read-only, labels live/deleted/unknown
 history, explicitly preserves unknown legacy state, applies authoritative tombstone
 responses immediately, blocks history mutation while the same note has local pending
-work, and treats direct tombstone routes as read-only. Ordinary sync upsert can still
-revive a matching tombstone; making that an explicit `resurrect` mutation and conflict
-choice remains the next lifecycle-safety slice in ROADMAP.
+work, and treats direct tombstone routes as read-only. ADR-015 closes the remaining
+ordinary-sync resurrection hazard.
+
+---
+
+## ADR-015 — Explicit, receipt-bound sync resurrection
+
+**Accepted.**
+
+Sync now distinguishes `upsert`, `delete`, and `resurrect`. An ordinary upsert against
+any tombstone returns the existing `version_mismatch` result with the authoritative
+tombstone, even when its base version matches; the upsert path never writes lifecycle
+state. `resurrect` applies only to an existing tombstone at the exact reviewed version.
+A missing target fails `invalid_sync_resurrection`, while a stale tombstone or already
+live head returns the ordinary authoritative conflict. Successful resurrection creates
+one live version and records `note.restore`, so the actor is attributable and whole-
+snapshot undo can recreate the prior tombstone.
+
+Receipt version 1 remains deliberately unchanged. Its frozen request fingerprint already
+includes the literal operation type, and its applied/conflict outcome schema does not
+change. Therefore an exact resurrection retry replays its stored result, while reusing
+the same operation id for upsert versus resurrect fails as an idempotency collision. No
+new conflict reason is introduced solely to rename a lifecycle mismatch.
+
+The existing `/v1/sync/push` path is rollout-safe for this additive discriminant. An old
+client routed to a new server sends upsert and receives the old parseable tombstone
+conflict shape. A new client routed to an old server sends the unknown `resurrect` enum
+value, which the old request schema rejects before any note or receipt write; unlike an
+extra object field, the operation cannot be stripped and reinterpreted as upsert.
+
+On mobile, the retained draft becomes `resurrect` only when the operator reviews an
+authoritative tombstone and chooses “Restore my draft”; “Keep deleted” accepts the
+tombstone without a write. The retry type is normalized from the reviewed server state,
+so a previously retained resurrection against a now-live head becomes an ordinary
+upsert instead of looping. Edits collapse into an unstaged resurrection while preserving
+its reviewed base. Once that exact resurrection is durably staged, newer edits remain a
+separate upsert and are rebased onto the authoritative revived version after response.
+This preserves both explicit lifecycle intent and post-dispatch drafts without adding a
+replica or database migration.
 
 ---
 

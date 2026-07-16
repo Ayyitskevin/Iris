@@ -204,6 +204,168 @@ describe('owner-fenced conflict decisions', () => {
     expect(store$.outbox.get()[0]?.opId).not.toBe('op-local');
   });
 
+  it('normalizes retained non-delete intent from the reviewed server lifecycle', async () => {
+    const tombstone = {
+      ...note(workspaceA, 'deleted server', 4),
+      deletedAt: '2026-07-15T12:00:00.000Z',
+    };
+    const retained = localMutation('retained draft', 'op-retained');
+    store$.notes.set({ [noteId]: tombstone });
+    store$.outbox.set([]);
+    store$.pendingPush.set(null);
+    store$.conflicts.set({
+      [noteId]: {
+        noteId,
+        localMutation: retained,
+        serverNote: tombstone,
+        detectedAt: '2026-07-15T12:01:00.000Z',
+      },
+    });
+    store$.syncIssue.set({
+      code: 'test_hold',
+      message: 'Keep the reviewed mutation unstaged during this assertion',
+      affectedOpIds: [],
+      recoveryKind: 'retry',
+    });
+
+    expect(await keepLocalConflict(ownerKeyFor(sessionA), noteId, retained.opId)).toBe(true);
+    expect(store$.outbox.get()[0]).toMatchObject({
+      type: 'resurrect',
+      baseVersion: 4,
+      note: { id: noteId, bodyMd: 'retained draft' },
+    });
+    expect(store$.notes.get()[noteId]).toMatchObject({ bodyMd: 'retained draft', deletedAt: null });
+
+    const liveServer = note(workspaceA, 'already revived elsewhere', 5);
+    const staleResurrection: SyncMutation = {
+      ...localMutation('newest retained draft', 'op-resurrect'),
+      type: 'resurrect',
+    };
+    store$.notes.set({ [noteId]: liveServer });
+    store$.outbox.set([]);
+    store$.pendingPush.set(null);
+    store$.conflicts.set({
+      [noteId]: {
+        noteId,
+        localMutation: staleResurrection,
+        serverNote: liveServer,
+        detectedAt: '2026-07-15T12:02:00.000Z',
+      },
+    });
+
+    expect(await keepLocalConflict(ownerKeyFor(sessionA), noteId, staleResurrection.opId)).toBe(
+      true,
+    );
+    expect(store$.outbox.get()[0]).toMatchObject({
+      type: 'upsert',
+      baseVersion: 5,
+      note: { id: noteId, bodyMd: 'newest retained draft' },
+    });
+  });
+
+  it('keeps resurrection intent while collapsing edits before request staging', async () => {
+    const tombstone = {
+      ...note(workspaceA, 'deleted server', 4),
+      deletedAt: '2026-07-15T12:00:00.000Z',
+    };
+    const retained = localMutation('retained body', 'op-retained');
+    store$.notes.set({ [noteId]: tombstone });
+    store$.outbox.set([]);
+    store$.pendingPush.set(null);
+    store$.conflicts.set({
+      [noteId]: {
+        noteId,
+        localMutation: retained,
+        serverNote: tombstone,
+        detectedAt: '2026-07-15T12:01:00.000Z',
+      },
+    });
+    store$.syncIssue.set({
+      code: 'test_hold',
+      message: 'Keep the resurrection unstaged while the next edit collapses it',
+      affectedOpIds: [],
+      recoveryKind: 'retry',
+    });
+
+    expect(await keepLocalConflict(ownerKeyFor(sessionA), noteId, retained.opId)).toBe(true);
+    const reviewedOpId = store$.outbox.get()[0]!.opId;
+    expect(updateNoteLocal(noteId, { title: 'Latest title' })).toBe(true);
+
+    expect(store$.pendingPush.get()).toBeNull();
+    expect(store$.outbox.get()).toHaveLength(1);
+    expect(store$.outbox.get()[0]).toMatchObject({
+      type: 'resurrect',
+      baseVersion: 4,
+      note: { id: noteId, title: 'Latest title', bodyMd: 'retained body' },
+    });
+    expect(store$.outbox.get()[0]!.opId).not.toBe(reviewedOpId);
+    expect(await saveState()).toBe(true);
+  });
+
+  it('makes an edit after a staged resurrection a newer upsert', async () => {
+    const resurrection: SyncMutation = {
+      ...localMutation('reviewed body', 'op-resurrect'),
+      type: 'resurrect',
+      baseVersion: 4,
+    };
+    store$.notes.set({
+      [noteId]: {
+        ...note(workspaceA, 'reviewed body', 4),
+        title: 'Reviewed title',
+        deletedAt: null,
+      },
+    });
+    store$.outbox.set([resurrection]);
+    store$.pendingPush.set([resurrection]);
+    store$.conflicts.set({});
+    store$.syncIssue.set({
+      code: 'test_hold',
+      message: 'Keep the staged request fixed while the next edit is queued',
+      affectedOpIds: [resurrection.opId],
+      recoveryKind: 'retry',
+    });
+
+    expect(updateNoteLocal(noteId, { bodyMd: 'newest body' })).toBe(true);
+
+    expect(store$.pendingPush.get()).toEqual([resurrection]);
+    expect(store$.outbox.get()).toHaveLength(1);
+    expect(store$.outbox.get()[0]).toMatchObject({
+      type: 'upsert',
+      baseVersion: 4,
+      note: { id: noteId, title: 'Reviewed title', bodyMd: 'newest body' },
+    });
+    expect(store$.outbox.get()[0]!.opId).not.toBe(resurrection.opId);
+    expect(await saveState()).toBe(true);
+  });
+
+  it('keeps the exact authoritative tombstone without queueing a mutation', async () => {
+    const tombstone = {
+      ...note(workspaceA, 'authoritative deleted body', 4),
+      title: 'Authoritative deleted title',
+      tags: ['server'],
+      deletedAt: '2026-07-15T12:00:00.000Z',
+    };
+    const retained = localMutation('retained local draft', 'op-retained');
+    store$.notes.set({ [noteId]: tombstone });
+    store$.outbox.set([]);
+    store$.pendingPush.set(null);
+    store$.conflicts.set({
+      [noteId]: {
+        noteId,
+        localMutation: retained,
+        serverNote: tombstone,
+        detectedAt: '2026-07-15T12:01:00.000Z',
+      },
+    });
+
+    expect(await useServerConflict(ownerKeyFor(sessionA), noteId, retained.opId)).toBe(true);
+
+    expect(store$.conflicts.get()).toEqual({});
+    expect(store$.notes.get()[noteId]).toEqual(tombstone);
+    expect(store$.outbox.get()).toEqual([]);
+    expect(store$.pendingPush.get()).toBeNull();
+  });
+
   it('retains the conflict when accepting the server cannot be persisted', async () => {
     memory.failSetKey = stateStorageKeys.replica(ownerKeyFor(sessionA));
 

@@ -228,10 +228,18 @@ async function applyIdempotently(
     return parseStoredOutcome(receipt.receiptVersion, receipt.outcome);
   }
 
-  const result =
-    mutation.type === 'delete'
-      ? await applyDelete(ctx, mutation)
-      : await applyUpsert(ctx, mutation);
+  let result: ApplyResult;
+  switch (mutation.type) {
+    case 'upsert':
+      result = await applyUpsert(ctx, mutation);
+      break;
+    case 'delete':
+      result = await applyDelete(ctx, mutation);
+      break;
+    case 'resurrect':
+      result = await applyResurrect(ctx, mutation);
+      break;
+  }
   const recorded = await ctx.db
     .update(syncIdempotency)
     .set({ outcome: result })
@@ -290,7 +298,54 @@ async function applyUpsert(ctx: Ctx, m: SyncMutation): Promise<ApplyResult> {
     return { kind: 'applied', item: { opId: m.opId, note: serializeNote(note) } };
   }
 
+  // Editing content and reviving a deleted note are distinct operator intents. Even an
+  // exact base version must retain both sides until the user explicitly chooses restore.
+  if (existing.deletedAt) return conflictResult(m, existing);
   if (existing.version !== m.baseVersion) return conflictResult(m, existing);
+
+  const updated = await ctx.db
+    .update(notes)
+    .set({
+      title: m.note.title,
+      bodyMd: m.note.bodyMd,
+      folder: m.note.folder,
+      tags: normalizeTags(m.note.tags),
+      version: existing.version + 1,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(notes.id, m.note.id),
+        eq(notes.workspaceId, ctx.workspaceId),
+        eq(notes.version, existing.version),
+      ),
+    )
+    .returning();
+  const note = updated[0];
+  if (!note) {
+    // The workspace sequence trigger serializes commits, but the initial read happens
+    // before that statement trigger. The compare-and-swap predicate closes that gap.
+    const raced = await loadNote(ctx, m.note.id);
+    if (raced) return conflictResult(m, raced);
+    throw new Error('Concurrent note update removed its authoritative row');
+  }
+  await recordVersionAndActivity(ctx, note, 'note.update');
+  return { kind: 'applied', item: { opId: m.opId, note: serializeNote(note) } };
+}
+
+async function applyResurrect(ctx: Ctx, m: SyncMutation): Promise<ApplyResult> {
+  const existing = await loadNote(ctx, m.note.id);
+  if (!existing) {
+    throw badRequest(
+      'A resurrect mutation requires an existing tombstone',
+      'invalid_sync_resurrection',
+    );
+  }
+  // A resurrect intent was reviewed against a tombstone. If another write has already
+  // made it live, surface that authoritative head instead of applying a redundant edit.
+  if (!existing.deletedAt || existing.version !== m.baseVersion) {
+    return conflictResult(m, existing);
+  }
 
   const updated = await ctx.db
     .update(notes)
@@ -313,13 +368,13 @@ async function applyUpsert(ctx: Ctx, m: SyncMutation): Promise<ApplyResult> {
     .returning();
   const note = updated[0];
   if (!note) {
-    // The workspace sequence trigger serializes commits, but the initial read happens
-    // before that statement trigger. The compare-and-swap predicate closes that gap.
     const raced = await loadNote(ctx, m.note.id);
     if (raced) return conflictResult(m, raced);
-    throw new Error('Concurrent note update removed its authoritative row');
+    throw new Error('Concurrent note resurrection removed its authoritative row');
   }
-  await recordVersionAndActivity(ctx, note, 'note.update');
+  // `note.restore` is already understood by old activity clients and makes the explicit
+  // lifecycle compensation attributable and undoable back to the prior tombstone.
+  await recordVersionAndActivity(ctx, note, 'note.restore');
   return { kind: 'applied', item: { opId: m.opId, note: serializeNote(note) } };
 }
 

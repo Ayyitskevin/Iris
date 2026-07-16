@@ -419,7 +419,8 @@ export type SyncChangesResponse = z.infer<typeof SyncChangesResponse>;
 export const SyncMutation = z.object({
   /** Durable idempotency key; one key is permanently bound to one actor/device/payload. */
   opId: PostgreSqlText.pipe(z.string().min(1).max(200)),
-  type: z.enum(['upsert', 'delete']),
+  /** `resurrect` is the only sync operation allowed to make a tombstone live again. */
+  type: z.enum(['upsert', 'delete', 'resurrect']),
   note: z.object({
     id: PostgresUuid,
     title: NoteTitleInput,
