@@ -10,7 +10,7 @@ import {
   selectVisibleNotes,
   store$,
 } from '../../../src/state/store';
-import { createNoteLocal } from '../../../src/sync/manager';
+import { createNoteLocal, recoverSyncIssue } from '../../../src/sync/manager';
 import { authenticatedRequest } from '../../../src/api';
 import { theme } from '../../../src/theme';
 
@@ -20,6 +20,7 @@ export default function NotesList() {
   const status = useObs(() => store$.status.get());
   const gated = useObs(() => store$.syncGated.get());
   const pending = useObs(() => store$.outbox.get().length);
+  const syncIssue = useObs(() => store$.syncIssue.get());
   const conflictMap = useObs(() => store$.conflicts.get());
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
   const conflicts = new Set(Object.keys(conflictMap));
@@ -28,12 +29,14 @@ export default function NotesList() {
   const [activeTag, setActiveTag] = useState<string | null>(null);
   const [results, setResults] = useState<Note[] | null>(null); // null = not searching
   const [searchOwnerKey, setSearchOwnerKey] = useState(ownerKey);
+  const [recoveringSync, setRecoveringSync] = useState(false);
 
   useEffect(() => {
     setQuery('');
     setActiveTag(null);
     setResults(null);
     setSearchOwnerKey(ownerKey);
+    setRecoveringSync(false);
   }, [ownerKey]);
 
   // Debounced full-text search against the server, with an offline local fallback.
@@ -71,6 +74,15 @@ export default function NotesList() {
   function onNew() {
     const note = createNoteLocal({ title: '', bodyMd: '', tags: activeTag ? [activeTag] : [] });
     router.push(`/notes/${note.id}`);
+  }
+
+  async function onRecoverSync() {
+    setRecoveringSync(true);
+    try {
+      await recoverSyncIssue();
+    } finally {
+      setRecoveringSync(false);
+    }
   }
 
   return (
@@ -126,6 +138,27 @@ export default function NotesList() {
             );
           })}
         </ScrollView>
+      ) : null}
+
+      {syncIssue ? (
+        <View style={styles.issueBanner}>
+          <Text style={styles.issueTitle}>Sync needs your attention</Text>
+          <Text style={styles.issueMessage}>{syncIssue.message}</Text>
+          <Button
+            label={
+              syncIssue.recoveryKind === 'rekey'
+                ? 'Use new operation ID'
+                : syncIssue.recoveryKind === 'reset-cursor'
+                  ? 'Reset sync cursor'
+                  : syncIssue.recoveryKind === 'restage'
+                    ? 'Restage changes'
+                    : 'Retry sync'
+            }
+            onPress={() => void onRecoverSync()}
+            variant="ghost"
+            loading={recoveringSync}
+          />
+        </View>
       ) : null}
 
       {gated ? (
@@ -216,6 +249,25 @@ const styles = StyleSheet.create({
     padding: theme.space(3),
     marginBottom: theme.space(3),
     fontSize: 13,
+  },
+  issueBanner: {
+    backgroundColor: theme.colors.surfaceAlt,
+    borderColor: theme.colors.danger,
+    borderWidth: 1,
+    borderRadius: theme.radius,
+    padding: theme.space(3),
+    marginBottom: theme.space(3),
+  },
+  issueTitle: {
+    color: theme.colors.danger,
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: theme.space(1),
+  },
+  issueMessage: {
+    color: theme.colors.text,
+    fontSize: 13,
+    marginBottom: theme.space(2),
   },
   row: {
     backgroundColor: theme.colors.surface,

@@ -80,14 +80,20 @@ from migration 0001.
 
 Two layers of defense:
 
-1. **Application layer.** Every tenant-owned table carries a non-null `workspace_id`.
+1. **Application layer.** Every workspace-owned child table carries a non-null
+   `workspace_id`; `workspaces` is the tenant root rather than its own child.
    All data access goes through repository functions that take a `workspaceId` and filter
    by it; there is no query path that omits it. The authenticated principal (user session
    _or_ agent token) resolves to exactly one `workspace_id`, set per request.
-2. **Database layer (defense in depth).** RLS policies on tenant tables gate every row by
+2. **Database layer (defense in depth).** RLS policies on workspace-owned child tables
+   gate every row by
    a `current_setting('app.current_workspace')` GUC that the request sets inside its
    transaction. Even a buggy query that forgets the `WHERE` clause returns nothing across
    the tenant boundary.
+
+The `workspaces` root and the pre-tenant auth-bootstrap tables (`users`,
+`agent_tokens`) are outside the `workspace_isolation` policy. Their reads remain
+explicitly id-/workspace-scoped at the application layer.
 
 A test (`tenant-isolation.test.ts`) proves workspace A's principal cannot read workspace
 B's notes through the API. That test is the definition of this ADR being true.
@@ -163,6 +169,10 @@ we own:
   is **rejected as a conflict (HTTP 409)** and the response includes the authoritative
   server row. The client surfaces the conflict — it never silently overwrites.
 
+**Transport supersession note.** ADR-012 supersedes the timestamp-cursor and
+endpoint-level conflict details above with the integrated Phase 2.2a transport. ADR-005's
+engine selection, ownership model, and conflict-surfacing rationale remain in force.
+
 **Why not adopt a heavier engine.** PowerSync and ElectricSQL are excellent, but both
 introduce a _second piece of infrastructure_ (a sync service, and in Electric's case
 Postgres logical replication). That directly violates ADR-006's "no extra infra."
@@ -200,9 +210,11 @@ Render. This constraint is _upstream_ of ADR-005 (it is why we rejected PowerSyn
 **Accepted.**
 
 Mirror Obsidian's model: **local use is free; sync is the paid line.** One plan (~$5/mo)
-and a free tier. The gate is enforced server-side in the sync endpoints: a free workspace
-may register **one** sync device; a second device's sync is refused (`402`) unless the
-workspace has an active subscription.
+and a free tier. The billing gate is enforced when a signed-in user explicitly
+registers a device: a free workspace may register **one** sync device; a second
+registration is refused (`402`) unless the workspace has an active subscription. Push
+and pull accept only an already-registered workspace-composite device id; an unknown id
+is `403` and sync never allocates a plan slot implicitly.
 
 Stripe plumbing (Checkout session creation, customer/subscription mapping, webhook →
 subscription state machine) is built and unit-tested with an injected fake Stripe client,
@@ -220,13 +232,15 @@ A note's canonical content is a **Markdown string** (`body_md`) plus light metad
 foundation — one is enough; the other is a documented follow-up.
 
 **Every save writes a `note_versions` row** (immutable snapshot: body, title, author
-principal, timestamp, monotonically increasing `version`). The live `notes` row is a
+principal, timestamp, monotonically increasing `version`; tags were added in ADR-010,
+while folder is not yet snapshotted). The live `notes` row is a
 denormalized pointer to the current state for fast reads. This makes versioning
 _load-bearing for pillar #2_ (reversibility) rather than a feature to add later:
 
-- Restore = write the old snapshot's content as a new version (history is never rewritten).
-- Undo of an agent action = restore the version that preceded it, logged as a compensating
-  entry in the activity log.
+- Restore = write the recorded snapshot fields as a new version (history is never rewritten).
+- Undo of an agent action = restore the currently supported pre-action content fields,
+  logged as a compensating entry in the activity log. Exact folder/tag parity is the
+  separate ROADMAP correctness slice described under ADR-010.
 
 ---
 
@@ -238,13 +252,13 @@ _load-bearing for pillar #2_ (reversibility) rather than a feature to add later:
 - **Token** = issued once, returned in plaintext exactly once, stored only as a scrypt
   hash. Carries **scopes** (`notes:read`, `notes:write`) and is **revocable** (soft
   delete + revoked_at). Presented as `Authorization: Bearer <token>`.
-- **Every write** (by a user _or_ an agent) appends to `activity_log` (actor type + id,
-  action, target note, resulting version, timestamp). The log is **append-only** — undo
-  does not delete history, it appends a compensating action.
-- The **activity feed** screen reads this log; **undo** restores the pre-action version.
+- **Every note write** (by a user _or_ an agent) appends to `activity_log` (actor type +
+  id, action, target note, resulting version, timestamp). The log is **append-only** —
+  undo does not delete history, it appends a compensating action.
+- The **activity feed** screen reads this log; **undo** restores the currently supported
+  pre-action content fields as a new head version.
 
-Rate limits are per-token (a coarse fixed-window limiter in the foundation; documented as
-a place to harden).
+Agent-token rate limiting is not implemented yet; it remains an explicit ROADMAP item.
 
 ---
 
@@ -252,10 +266,13 @@ a place to harden).
 
 **Accepted.**
 
-**Tags** are a `jsonb` string array on `notes` (and on every `note_versions` snapshot, so
-they are versioned and restore correctly). Chosen over a normalized `note_tags` join
-table because tags then travel with the note for free — through sync (part of the note
-payload), export (frontmatter), and history — with no joins. Membership filtering uses the
+**Tags** are a `jsonb` string array on `notes` and on every `note_versions` snapshot.
+They are versioned and direct version restore carries them forward, but activity undo
+does not yet restore tags and version snapshots do not yet include folders. Closing that
+organizational-field reversibility gap is a separate next correctness slice in ROADMAP.
+Chosen over a normalized `note_tags` join table because tags then travel with the note
+through sync (part of the note payload), export (frontmatter), and history — with no
+joins. Membership filtering uses the
 jsonb `?` operator, backed by a GIN index; the tag list is aggregated (small workspaces).
 Tags are normalized (trim / lowercase / de-dupe) at the service boundary so `Work` and
 `work` collapse. Folders remain the primary org primitive; tags are orthogonal and
@@ -295,7 +312,8 @@ Runtime integration is permitted only behind the accompanying ownership fence:
 
 - credentials are persisted separately from replicas;
 - every replica is keyed by immutable workspace + user identity;
-- v1 migration preserves attributable known-owner drafts plus a token-free recovery copy,
+- legacy `iris:state:v1` migration preserves attributable known-owner drafts plus a
+  token-free recovery copy,
   while quarantining mixed or ownerless data and replacing the global cursor/device
   identity with fresh owner-scoped values;
 - each sync cycle captures one immutable token, owner, device, and generation;
@@ -315,11 +333,98 @@ current 401s, cursor isolation, cross-workspace response rejection, A-outbox/B-t
 separation, verified/quarantined recovery copies, storage failpoints, save ordering, and
 stale conflict decisions.
 
-Before release, Sync v2 must also replace the wall-clock cursor with a
-database-monotonic cursor, bind server idempotency records to a request fingerprint, and
-use a generic resource envelope so projects and tasks do not require a second sync
-engine. Native resources and the outbox must move from the size-limited per-owner
-SecureStore value into transactional SQLite while credentials remain in the OS keystore.
+The durable transport half of Sync v2 is integrated in ADR-012. Before release, the
+note-specific wire shape must become a generic resource envelope so projects and tasks
+do not require a second sync engine. Native resources and the outbox must move from the
+size-limited per-owner SecureStore value into transactional SQLite while credentials
+remain in the OS keystore; web replicas need IndexedDB plus cross-tab session
+coordination, and quarantined legacy `iris:state:v1` recovery needs an explicit user
+import path.
+
+---
+
+## ADR-012 — Commit-serialized cursors and request-bound sync receipts
+
+**Accepted and integrated as Phase 2.2a's durable transport half.** This ADR does not
+mean the whole of Sync v2 is complete or that Iris is release-ready.
+
+A PostgreSQL sequence can be allocated by transaction A before transaction B, while B
+commits first. Advancing a client cursor through B would then skip A when it eventually
+commits. Wall-clock timestamps have the same late-commit failure and can also move
+backward.
+
+Phase 2.2a serializes note writers per workspace before they acquire note-row locks. A
+statement trigger locks one `workspace_sync_cursors` row; a row trigger increments that
+counter for each changed note. The resulting `sync_seq` values therefore follow commit
+serialization, and the API exposes only opaque
+`v2:<workspace-id>:<sequence>` cursors. A cursor bound to another workspace is rejected.
+Migration 0003 deterministically backfills existing notes; a recognized legacy timestamp
+cursor or short-lived unbound draft v2 cursor receives one safe full replay and a bound
+cursor. Malformed/ahead cursors are rejected, and the migration transactionally
+suspends then restores FORCE RLS for a non-`BYPASSRLS` backfill. Every existing-note
+update path uses CAS: the workspace lock orders commits, but cannot protect a read that
+happened before the write statement acquired it.
+
+The runner owns a checksummed migration ledger. It recognizes only frozen legacy 0001
+or 0001+0002 safety-critical structural signatures—including exact RLS policies, column
+shapes, critical indexes, and foundation constraints—records that baseline, and then
+applies each pending SQL file plus receipt atomically. It also verifies the current-head
+0003 safety-critical artifacts against that receipt on later runs; a receipt alone is
+not accepted as proof. Partial or drifted signatures, checksum drift, history gaps,
+unknown receipts, and unledgered or mismatched 0003 artifacts fail loud. Real Postgres
+runs are serialized by one same-session advisory lock.
+
+CI now provisions a dedicated PostgreSQL 16 service and is configured to run the
+independent-connection concurrency gate for commit-ordered note sequences and
+serialized free-plan device claims. This integration did not supply a local
+`IRIS_TEST_POSTGRES_URL`, so it does not claim a green real-Postgres execution before
+the first pushed CI run.
+
+Client-chosen note and device ids now identify rows only together with their workspace;
+the same local id can therefore exist safely in two workspaces. A signed-in user must
+explicitly register a device through `POST /v1/devices` before it can sync. Push and pull
+accept only that existing workspace-composite device identity and never allocate
+billable device state for an agent implicitly.
+
+`sync_idempotency` permanently keys each `opId` by workspace and binds it to the
+authenticated actor, device, and a SHA-256 fingerprint of the parsed payload. A
+`receipt_version` freezes both that fingerprint algorithm and the stored-outcome
+parser; unknown versions fail closed before note mutation. The applied-or-conflict
+outcome is written in the same tenant transaction as note history and activity. An
+exact retry replays that validated outcome without another write; any other reuse fails
+loud, and a collision rolls back the full request batch. Pushes take the workspace
+cursor lock before any operation receipt so reversed operation orders cannot deadlock
+receipt rows against the cursor row.
+
+Before dispatch, the mobile coordinator greedily stages and persists an exact
+`pendingPush` request within both a six-operation limit and a 1,900,000-byte serialized
+UTF-8 request budget. Fastify's distinct outer ingress ceiling is 2,097,152 bytes. Any
+batch found pending at the start of a later cycle is first
+reconfirmed through the serialized persistence queue, closing the memory-visible /
+failed-save interleaving. A lost response, process restart, or failed local
+acknowledgement therefore retries the same operation ids and payloads while preserving
+and rebasing any newer outbox edit. The same `/v1/sync/push` ingress enforces those
+finite limits for every client; there is no uncapped legacy lane. Six worst-case
+currently bounded notes, including JSON escaping and result metadata, also fit the
+1,900,000-byte push response budget. A migrated pre-limit oversized note remains
+lossless and may occupy one conflict response beyond that modern-data budget. One sync
+cycle drains at most 16 chunks (96 operations), durably
+reconciling and clearing each exact pending request before it stages the next; any
+larger remainder stays in the outbox for a later cycle.
+
+New Markdown bodies are limited to 256 KiB of JSON-encoded UTF-8 string content. Pull
+pages are bounded by both 50 notes and a 1 MiB serialized response budget; one
+recognized pre-limit oversized note may occupy a page alone so migration remains
+lossless. The client rejects cursor cycles and stops a pathological drain after 1,000
+unique pages. Successful push and pull responses are validated at runtime before
+reconciliation. Non-retryable protocol failures become a durable, owner-scoped sync
+issue that stops all network work until the operator uses the visible manual recovery
+action to rekey affected operation ids, reset a bad cursor, restage a locally invalid
+request, or retry without discarding the exact pending payload.
+
+This closes the durable transport half, but it does not make the current
+SecureStore/localStorage replica transactional; the remaining Sync v2 and release
+boundaries are tracked in ROADMAP.
 
 ---
 

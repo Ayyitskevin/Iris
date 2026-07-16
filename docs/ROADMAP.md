@@ -41,37 +41,64 @@ These were named as out of scope and are staying out until the foundation is pro
   focused tests encode exact operation acknowledgement, in-flight edit rebasing,
   multi-conflict retention, and complete pull pagination.
 - **Phase 2.1b — owner isolation + runtime reconciliation** (ADR-011): credentials are
-  separate from owner-keyed replicas; v1 migration creates a verified recovery copy and
-  activates only attributable data; fixed-token, generation-bound sync cycles reject
-  stale responses; conflicts persist in a Review inbox. Concurrency tests cover delayed
-  requests, sign-out, account switching, stale 401s, cursor isolation, and
+  separate from owner-keyed replicas; legacy `iris:state:v1` recovery creates a verified
+  copy and activates only attributable data; fixed-token, generation-bound sync cycles
+  reject stale responses; conflicts persist in a Review inbox. Concurrency tests cover
+  delayed requests, sign-out, account switching, stale 401s, cursor isolation, and
   A-outbox/B-token separation.
+- **Phase 2.2a — durable Sync v2 transport half** (ADR-012; not full Sync v2 or release
+  readiness): note writes receive commit-serialized workspace sequences; operation ids
+  are permanently bound to one actor/device/payload/receipt version and replay their
+  transactionally stored outcome; workspace-bound cursors reject cross-owner reuse;
+  every existing-note update path uses CAS; note and device identities are
+  workspace-composite; and only an explicit signed-in-user registration may allocate a
+  device before push or pull. Current clients greedily persist exact requests within six
+  operations and a 1,900,000-byte serialized request budget; the same
+  `/v1/sync/push` ingress enforces that finite cap for every client beneath Fastify's
+  separate 2,097,152-byte ingress ceiling, and its worst-case result for currently
+  bounded notes fits a 1,900,000-byte response budget. A migrated pre-limit oversized
+  note remains lossless and may occupy one conflict response beyond that budget. A
+  cycle durably drains at most 16 chunks (96 operations) and leaves any larger
+  remainder for the next cycle. Pull is row- and
+  byte-bounded. The checksummed runner verifies current-head migration artifacts, and
+  durable terminal issues stop network work until a visible manual recovery action.
+  Upgrade-with-data, RLS-role, collision, rollback, transport-bound, lost-response,
+  failed-save interleaving, restart, large-outbox, and newer-edit rebasing tests cover
+  the PGlite/mobile boundary. CI now provisions PostgreSQL 16 and is configured to run
+  the independent-connection commit-order and device-gate concurrency test; this local
+  integration did not execute that opt-in real-Postgres file, so a green pushed CI run
+  remains required evidence.
 
 ## Near-term follow-ups (next things)
 
-1. **Sync v2 + transactional local repository**: monotonic database cursor,
-   request-bound server idempotency, generic resource envelopes, SQLite on native,
-   IndexedDB plus cross-tab session coordination on web, transactional note+outbox writes,
-   and a user-facing recovery/import path for quarantined v1 data.
-   The current size-limited per-owner SecureStore value and timestamp cursor are explicit
-   release blockers.
-2. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
+1. **Complete Sync v2's resource/repository boundary and release gates**: generic resource envelopes,
+   SQLite on native, IndexedDB plus cross-tab session coordination on web,
+   transactional note+outbox writes, and a user-facing recovery/import path for
+   quarantined legacy `iris:state:v1` data, followed by native iOS/Android device or
+   simulator acceptance. The current note-only wire contract and size-limited per-owner
+   SecureStore value, missing web cross-tab ownership, missing recovery import, and
+   unrun native acceptance are explicit blockers before the work queue.
+2. **Restore/undo organizational-field correctness**: add folders to version snapshots,
+   restore folder and tags consistently in both direct restore and activity undo, and
+   prove the behavior with focused history/undo tests. This reversibility gap is tracked;
+   Phase 2.2a does not silently claim it as shipped.
+3. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
    accountable human-or-agent assignee, reversible writes, and the same sync resource
    envelope. Keep activity, check-in, delegation, and durable claim/run semantics
    distinct.
-3. **Managed auth provider** wired for real (Clerk or Supabase) + password reset + OAuth +
+4. **Managed auth provider** wired for real (Clerk or Supabase) + password reset + OAuth +
    email verification — these are the managed provider's job, not `LocalAuthProvider`'s.
-4. **Attachment storage** to object storage (S3/R2) with the same export guarantee;
+5. **Attachment storage** to object storage (S3/R2) with the same export guarantee;
    foundation stores attachment metadata and includes files in export, but a production
    blob store + upload flow is a follow-up.
-5. **Rate limiting** for agent tokens beyond the coarse fixed-window limiter (per-scope
-   budgets, sliding window, 429 semantics).
-6. **Stripe hardening**: proration, plan changes, dunning, customer portal, tax.
-7. **EAS Build + store submission** pipeline and OTA update channels.
-8. **Editor upgrades**: live Markdown preview, slash-menu, image paste — still emitting
+6. **Implement rate limiting** for agent tokens (per-scope budgets, a documented window,
+   and 429 semantics). No coarse limiter is currently shipped.
+7. **Stripe hardening**: proration, plan changes, dunning, customer portal, tax.
+8. **EAS Build + store submission** pipeline and OTA update channels.
+9. **Editor upgrades**: live Markdown preview, slash-menu, image paste — still emitting
    plain Markdown.
-9. **Search/tags upgrades**: tag rename/merge, search snippets & highlighting, filter by
-   tag _and_ query together, per-field ranking weights.
+10. **Search/tags upgrades**: tag rename/merge, search snippets & highlighting, filter by
+    tag _and_ query together, per-field ranking weights.
 
 ## Tempted-but-parked ideas (write here, don't build)
 

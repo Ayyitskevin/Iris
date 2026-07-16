@@ -13,27 +13,40 @@ description: Open when working on the Expo mobile client — routing/navigation,
 
 ## Mental model
 
-The client is **local-first** (ADR-005). A single Legend-State observable, `store$` (`src/state/store.ts`), is the source of truth the UI renders. User edits mutate `store$` **synchronously** through the sync manager (`src/sync/manager.ts`) — the UI never waits on the network. Each local mutation also drops an entry in `store$.outbox`. A background `sync()` loop (kicked every 8s from the root layout, and on every mutation) reconciles: register the device → push the outbox → pull deltas. The server is authoritative on conflict; the client surfaces conflicts, never silently drops them.
+The client is **local-first** (ADR-005/ADR-011/ADR-012). Legend-State's `store$` is
+only the active owner's projection. Credentials are persisted separately; each durable
+replica is keyed by immutable workspace + user identity and contains notes, cursor,
+device id, outbox, exact `pendingPush`, and conflicts. User edits mutate the projection
+synchronously. The coordinator captures a fixed-token generation lease, persists a
+request before dispatch, reconciles only while that lease is current, then drains every
+pull page. The UI never waits on the network.
 
 Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redirects to `/notes` or `/sign-in` based on `store$.session`. Route groups `(auth)` and `(app)` organize screens without appearing in the URL. React reads the store through one deliberately version-thin hook, `useObs` (`src/state/hooks.ts`), built on Legend-State's core `observe` + React's `useSyncExternalStore` so a library upgrade can't strand the UI.
 
 ## Key files
 
-- `app/_layout.tsx` — root layout. `useEffect` runs `loadState()` and gates render on `ready` (spinner until hydrated → app opens instantly, offline). Second effect runs `sync()` immediately then `setInterval(sync, 8000)` while `store$.session.get()` is truthy. Wraps routes in `SafeAreaProvider` + a headerless `<Stack>`.
+- `app/_layout.tsx` — hydrates before routing, retries rejected-session tombstones, and runs the 8-second sync loop.
 - `app/index.tsx` — the root gate: `useObs(() => store$.session.get() !== null)` → `<Redirect href={signedIn ? '/notes' : '/sign-in'} />`.
 - `app/(auth)/_layout.tsx` — `<Stack>` for `sign-in` / `sign-up`. `(auth)` group is not in the URL.
 - `app/(app)/_layout.tsx` — `<Tabs>` for the signed-in app. Second gate: `if (!signedIn) return <Redirect href="/sign-in" />`. Declares the three tabs via `<Tabs.Screen name="notes|activity|settings" .../>`.
 - `app/(app)/notes/_layout.tsx` — nested `<Stack>` registering `index` and `[id]`.
-- `app/(app)/notes/index.tsx` — list screen. Reactive reads via `useObs(selectVisibleNotes)`, `store$.status`, `store$.syncGated`, `store$.outbox.length`. New note: `createNoteLocal(...)` then `router.push('/notes/'+id)`.
+- `app/(app)/notes/index.tsx` — list screen. Reactive reads via `useObs(selectVisibleNotes)`, `store$.status`, `store$.syncGated`, `store$.syncIssue`, `store$.outbox.length`. It owns the visible terminal-sync banner and manual recovery action. New note: `createNoteLocal(...)` then `router.push('/notes/'+id)`.
 - `app/(app)/notes/[id].tsx` — editor. `useLocalSearchParams<{id}>()`, `useObs(() => store$.notes[id].get())`, edits call `updateNoteLocal`/`deleteNoteLocal`. History/restore hit `api` directly.
-- `src/state/store.ts` — `store$ = observable<AppState>(...)`, the `AppState`/`Session` types, `loadState`/`saveState` (persist key `iris:state:v1`), `generateDeviceId`, and the `selectVisibleNotes()` selector.
+- `src/state/store.ts` — owner-keyed replicas, separate session/tombstone storage,
+  legacy `iris:state:v1` recovery quarantine, generation leases, verified writes, and
+  selectors.
 - `src/state/hooks.ts` — `useObs<T>(selector)`. The only sanctioned way to read `store$` in a component.
 - `src/state/storage.ts` — `storage: KVStore`. Web `localStorage`; native `expo-secure-store` (~2KB/key cap).
-- `src/sync/manager.ts` — `createNoteLocal` / `updateNoteLocal` / `deleteNoteLocal` (optimistic + enqueue) and `sync()` (reconcile). Module-level `syncing` flag = single-flight lock.
-- `src/api.ts` — `api = createApiClient({ baseUrl: API_URL, getToken: () => store$.session.get()?.token ?? null })`. Token is pulled from the store on every request; nothing else wires auth.
-- `src/auth/session.ts` — `signIn`/`signUp` adopt an `AuthResponse` into `store$.session` + `saveState`; `signOut` clears session/notes/outbox/cursor/gate/conflict.
+- `src/sync/manager.ts` — optimistic mutations/conflict choices and deliberate
+  `recoverSyncIssue` actions; delegates network work.
+- `src/sync/coordinator.ts` + `reconcile.ts` — lease-bound staged push, pure
+  reconciliation, validation, and complete paged pull.
+- `src/api.ts` — unauthenticated `publicApi` plus fixed-token, abortable
+  `apiForLease`; authenticated component requests return the checked lease.
+- `src/auth/session.ts` — serialized owner adoption and durable sign-out tombstones.
 - `src/config.ts` — `API_URL` from `EXPO_PUBLIC_API_URL` env → expo `extra.apiUrl` → `http://localhost:4000`.
-- `packages/shared/src/api-client.ts` — `createApiClient`, the method surface, and `ApiRequestError` (`.isConflict`=409, `.isPaymentRequired`=402).
+- `packages/shared/src/api-client.ts` — typed methods plus distinct `ApiRequestError`
+  classifiers for version conflict, idempotency reuse, and payment-required.
 - `src/components/ui.tsx` — `Screen`, `Title`, `Muted`, `Field`, `Button`, `Card`. Use these + `src/theme.ts` (`theme.colors`, `theme.space(n)`, `theme.radius`) so screens match.
 
 ## Playbook
@@ -74,7 +87,7 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 
    ```tsx
    <Tabs.Screen
-     name="search"                       // must equal the filename (no extension)
+     name="search" // must equal the filename (no extension)
      options={{ title: 'Search', tabBarIcon: ({ color }) => <Text style={{ color }}>⌕</Text> }}
    />
    ```
@@ -87,38 +100,67 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 
    ```tsx
    import { createNoteLocal, updateNoteLocal, deleteNoteLocal } from '../../src/sync/manager';
-   const note = createNoteLocal({ title: '', bodyMd: '' });   // optimistic; version 0 = unsynced
-   updateNoteLocal(note.id, { bodyMd: 'hello' });             // patches store + enqueues outbox
-   deleteNoteLocal(note.id);                                   // tombstone (deletedAt), enqueues delete
+   const note = createNoteLocal({ title: '', bodyMd: '' }); // optimistic; version 0 = unsynced
+   updateNoteLocal(note.id, { bodyMd: 'hello' }); // patches store + enqueues outbox
+   deleteNoteLocal(note.id); // tombstone (deletedAt), enqueues delete
    ```
 
    Each call mutates `store$` synchronously, coalesces into `store$.outbox`, `saveState()`s, and triggers `sync()`. The list re-renders because it reads `store$.notes` via `useObs`.
 
-5. **Calling the API directly** (data not mirrored in the store — billing, agent tokens, version history) uses `api` from `src/api.ts`; the session token is attached automatically. Handle offline with a swallowed `try/catch` and gates by error type:
+5. **Authenticated component requests** use `authenticatedRequest`. It captures one
+   immutable lease and returns it with the value; assert that lease immediately before
+   applying the result to component or replica state:
 
    ```tsx
-   import { api } from '../../src/api';
-   import { ApiRequestError } from '@iris/shared';
-   try {
-     const versions = await api.listVersions(id);
-   } catch (e) {
-     if (e instanceof ApiRequestError && e.isPaymentRequired) { /* 402: sync gate */ }
-   }
+   import { authenticatedRequest } from '../../src/api';
+   import { assertCurrentSession } from '../../src/state/store';
+   const { lease, value } = await authenticatedRequest((client) => client.listVersions(id));
+   assertCurrentSession(lease);
+   setVersions(value.versions);
    ```
 
 6. Verify: `pnpm --filter @iris/mobile start` (or `dev`), open the app, confirm the tab renders, a new note persists across a reload (proves `saveState`/`loadState`), and the sync status pill flips `syncing…` → `synced`.
 
 ## Invariants & gotchas
 
-- **Never mutate notes on `store$` directly for user edits.** Always go through `createNoteLocal`/`updateNoteLocal`/`deleteNoteLocal`. A raw `store$.notes[id].set(...)` skips the outbox and the `baseVersion` bookkeeping, so the edit never syncs and can be silently overwritten by the next pull. (The reconcile paths inside `sync()` and version *restore* are the only places that write notes straight to the store — because they carry authoritative server rows.)
-- **`version: 0` means "created locally, not yet acknowledged."** `baseVersion` in each outbox mutation is the optimistic-concurrency token; the server returns **409** when it disagrees. On 409, `sync()` writes `serverNote` into the store and sets `store$.conflictNoteId` — the editor shows the conflict banner and the user re-applies. Do not "fix" a 409 by retrying blindly.
-- **The outbox coalesces per note id** (`enqueue` drops any prior mutation for the same note). Only the latest pending mutation per note survives; `opId` is the idempotency key so retries don't double-apply. Don't assume every intermediate edit is a separate outbox entry.
-- **`sync()` is single-flight** via the module-level `syncing` flag and no-ops without a session. It fires from three places: the 8s interval in `app/_layout.tsx`, every `enqueue`, and a `useEffect` on note open in `[id].tsx`. Don't add your own interval — reuse these.
-- **Only a slice is persisted.** `saveState` writes `session, notes, syncCursor, deviceId, outbox`. `status`, `syncGated`, and `conflictNoteId` are **ephemeral** — they reset to defaults on restart and are recomputed by the next `sync()`. Never persist logic that depends on them surviving a reload.
-- **The pull step preserves in-flight edits:** `sync()` builds a `pending` set from the outbox and skips those note ids when applying server changes, so a delta never clobbers an unpushed local edit. Keep that filter if you touch the pull loop.
+- **Never mutate notes on `store$` directly for user edits.** Always go through `createNoteLocal`/`updateNoteLocal`/`deleteNoteLocal`. A raw `store$.notes[id].set(...)` skips the outbox and the `baseVersion` bookkeeping, so the edit never syncs and can be silently overwritten by the next pull. (The reconcile paths inside `sync()` and version _restore_ are the only places that write notes straight to the store — because they carry authoritative server rows.)
+- **`version: 0` means local and unacknowledged.** A version mismatch is a per-operation
+  HTTP 200 conflict result retained in the Review inbox. HTTP 409 from sync means
+  `idempotency_key_reused` and must fail loud.
+- **Outbox coalesces; `pendingPush` does not.** The outbox keeps the latest edit per
+  note. Once a schema-validated slice of at most six operations and 1,900,000 serialized
+  UTF-8 request bytes is staged, that exact request survives until its response is
+  durably reconciled; newer edits and the remainder stay in outbox and are rebased or
+  sent in later bounded chunks. A cycle drains no more than 16 chunks / 96 operations,
+  persisting `pendingPush: null` after each response before staging the next; a larger
+  remainder waits for the next cycle. Before sending a batch that was already pending
+  when a cycle began, queue an identity replica commit: memory can reflect a failed save
+  when a concurrent edit made rollback unsafe.
+- **`sync()` is single-flight per session generation.** The coordinator's `activeRuns`
+  map owns repeat scheduling. It fires from the root interval, enqueue, and note-open
+  effect; do not add another interval.
+- **Credentials and replicas are separate.** The owner replica persists notes, cursor,
+  device id, outbox, pending request, conflicts, and any terminal `syncIssue`.
+  `status` and `syncGated` are ephemeral. Never put the bearer token in a replica or
+  reuse component state across owner keys.
+- **Pull preserves pending edits and conflicts.** It skips current outbox note ids and
+  refreshes a retained conflict's server side without discarding its local mutation.
+- **A durable `syncIssue` is a full network stop.** Hydration preserves it, and every
+  automatic `sync()` returns before registration, push, or pull until the user chooses
+  the visible recovery action. `rekey` changes only affected operation ids,
+  `reset-cursor` replays pull from the canonical start, `restage` discards only an
+  invalid pre-dispatch pending snapshot so the current outbox can be staged, and
+  `retry` preserves the exact pending request.
 - **402 = the multi-device billing gate** (ADR-007), raised at `registerDevice`. `sync()` sets `store$.syncGated = true` and returns early — **local editing still works**, only sync stops. Surface it (banner in `notes/index.tsx`); do not treat it as a hard error.
-- **Two auth gates, both reactive.** `app/index.tsx` and `app/(app)/_layout.tsx` each redirect on `session === null`. After `signOut()` also call `router.replace('/sign-in')` (see `settings.tsx`) — don't rely on the gate alone mid-stack.
-- **`useObs` selector identity matters.** Its `subscribe` is memoized on `[selector]`, so an inline arrow re-subscribes every render (works, but churns). For hot lists prefer a stable module-level selector like `selectVisibleNotes`. Every observable you read *inside* the selector becomes a dependency — read only what the component renders.
+- **Two auth gates, both owner-reset.** Root and app layouts redirect on `session ===
+null`; route keys include the owner so component state cannot survive an account
+  switch. Sign-out must first commit its token-free tombstone.
+- **`useObs` selector identity matters.** Its `subscribe` is memoized on `[selector]`, so an inline arrow re-subscribes every render (works, but churns). For hot lists prefer a stable module-level selector like `selectVisibleNotes`. Every observable you read _inside_ the selector becomes a dependency — read only what the component renders.
 - **`Tabs.Screen`/`Stack.Screen` `name` must equal the filename** (sans extension); route groups `(auth)`/`(app)` and the `notes/` folder are path segments, but parenthesized groups are stripped from the URL. A mismatched `name` silently drops the screen from the navigator.
-- **Native persistence is best-effort.** `storage.ts` uses SecureStore (~2KB/key) on native, so large note payloads may fail to persist — `saveState` swallows the error by design. A durable native DB (MMKV/expo-sqlite) is a roadmap follow-up; don't build features assuming unbounded local storage on device today.
-- **Everything is workspace-scoped by the bearer token.** The client never sends `workspaceId`; `getToken` in `src/api.ts` reads `store$.session.token` and the server derives the tenant. Don't add explicit workspace params to client calls.
+- **Native replica capacity is still a release blocker.** SecureStore has a small
+  per-value ceiling. Writes are verified and failures set `error`; request staging
+  failure prevents dispatch, including the concurrent-edit interleaving via pending-batch
+  reconfirmation. SQLite/IndexedDB is still required for real capacity and transactions.
+- **Everything is workspace-scoped by a fixed-token lease.** The client never sends a
+  `workspaceId`; the server derives it. Do not replace `apiForLease` with a mutable
+  token callback for authenticated work.

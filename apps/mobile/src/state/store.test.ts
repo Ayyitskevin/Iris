@@ -6,6 +6,7 @@ const memory = vi.hoisted(() => ({
   failSetKey: null as string | null,
   failSetOnceKey: null as string | null,
   mutateThenThrowSetKey: null as string | null,
+  failAfterBlockSetKey: null as string | null,
   failRemoveKey: null as string | null,
   mutateThenThrowRemoveKey: null as string | null,
   removeCalls: [] as string[],
@@ -25,6 +26,10 @@ vi.mock('./storage', () => ({
       if (block?.key === key) {
         memory.block = null;
         await block.promise;
+      }
+      if (memory.failAfterBlockSetKey === key) {
+        memory.failAfterBlockSetKey = null;
+        throw new Error('injected failure after blocked write resumes');
       }
       memory.values.set(key, value);
       if (memory.mutateThenThrowSetKey === key) {
@@ -119,6 +124,7 @@ beforeEach(async () => {
   memory.failSetKey = null;
   memory.failSetOnceKey = null;
   memory.mutateThenThrowSetKey = null;
+  memory.failAfterBlockSetKey = null;
   memory.failRemoveKey = null;
   memory.mutateThenThrowRemoveKey = null;
   memory.removeCalls = [];
@@ -376,6 +382,32 @@ describe('owner-partitioned state', () => {
     expect(memory.values.has(stateStorageKeys.legacy)).toBe(false);
   });
 
+  it('loads a v2 replica written before pending request staging existed', async () => {
+    const ownerKey = ownerKeyFor(sessionA);
+    memory.values.set(stateStorageKeys.session, JSON.stringify(sessionA));
+    memory.values.set(
+      stateStorageKeys.replica(ownerKey),
+      JSON.stringify({
+        version: 2,
+        ownerKey,
+        userId: sessionA.userId,
+        workspaceId: sessionA.workspaceId,
+        notes: {},
+        syncCursor: 'legacy-v2-cursor',
+        deviceId: 'legacy-v2-device',
+        outbox: [],
+        conflicts: {},
+      }),
+    );
+
+    await loadState();
+
+    expect(store$.session.get()).toEqual(sessionA);
+    expect(store$.pendingPush.get()).toBeNull();
+    expect(store$.syncIssue.get()).toBeNull();
+    expect(store$.syncCursor.get()).toBe('legacy-v2-cursor');
+  });
+
   it('switches owners atomically and restores each private replica', async () => {
     await adoptSession(sessionA);
     const deviceA = store$.deviceId.get();
@@ -403,6 +435,86 @@ describe('owner-partitioned state', () => {
     expect(store$.outbox.get()).toEqual([opA]);
     expect(store$.syncCursor.get()).toBe('cursor-A');
     expect(store$.deviceId.get()).toBe(deviceA);
+  });
+
+  it('keeps an exact pending request durable and scoped to its owner', async () => {
+    await adoptSession(sessionA);
+    const a = note(noteAId, workspaceA, 'A staged request');
+    const opA = mutation(noteAId, 'op-A-staged', a.bodyMd);
+    store$.notes.set({ [a.id]: a });
+    store$.outbox.set([opA]);
+    store$.pendingPush.set([opA]);
+    expect(await saveState()).toBe(true);
+
+    // Prove hydration restores the durable request instead of trusting current memory.
+    store$.pendingPush.set(null);
+    await loadState();
+    expect(store$.pendingPush.get()).toEqual([opA]);
+
+    await adoptSession(sessionB);
+    expect(store$.pendingPush.get()).toBeNull();
+    await adoptSession({ ...sessionA, token: 'token-A-return' });
+    expect(store$.pendingPush.get()).toEqual([opA]);
+    expect(store$.outbox.get()).toEqual([opA]);
+  });
+
+  it('hydrates a durable sync issue only for its owning replica', async () => {
+    await adoptSession(sessionA);
+    const a = note(noteAId, workspaceA, 'A held request');
+    const opA = mutation(noteAId, 'op-A-held', a.bodyMd);
+    const issue = {
+      code: 'idempotency_key_reused',
+      message: 'Operation id is already bound',
+      affectedOpIds: [opA.opId],
+      recoveryKind: 'rekey' as const,
+    };
+    store$.notes.set({ [a.id]: a });
+    store$.outbox.set([opA]);
+    store$.pendingPush.set([opA]);
+    store$.syncIssue.set(issue);
+    expect(await saveState()).toBe(true);
+
+    store$.syncIssue.set(null);
+    await loadState();
+    expect(store$.syncIssue.get()).toEqual(issue);
+
+    await adoptSession(sessionB);
+    expect(store$.syncIssue.get()).toBeNull();
+    await adoptSession({ ...sessionA, token: 'token-A-return' });
+    expect(store$.syncIssue.get()).toEqual(issue);
+    expect(store$.pendingPush.get()).toEqual([opA]);
+  });
+
+  it('rejects a persisted sync issue with an invalid recovery contract', async () => {
+    const ownerKey = ownerKeyFor(sessionA);
+    memory.values.set(stateStorageKeys.session, JSON.stringify(sessionA));
+    memory.values.set(
+      stateStorageKeys.replica(ownerKey),
+      JSON.stringify({
+        version: 2,
+        ownerKey,
+        userId: sessionA.userId,
+        workspaceId: sessionA.workspaceId,
+        notes: {},
+        syncCursor: '',
+        deviceId: 'device-A',
+        outbox: [],
+        pendingPush: null,
+        syncIssue: {
+          code: 'broken',
+          message: 'Broken issue',
+          affectedOpIds: ['op-1', 'op-1'],
+          recoveryKind: 'invented',
+        },
+        conflicts: {},
+      }),
+    );
+
+    await loadState();
+
+    expect(store$.session.get()).toBeNull();
+    expect(store$.syncIssue.get()).toBeNull();
+    expect(store$.status.get()).toBe('error');
   });
 
   it('signs out without deleting drafts and restores them on the next A session', async () => {
@@ -629,6 +741,66 @@ describe('owner-partitioned state', () => {
     await adoptSession(sessionB);
     await adoptSession(sessionA);
     expect(store$.notes.get()[noteAId]?.bodyMd).toBe('original');
+  });
+
+  it('rolls back pending request staging when its durable write fails', async () => {
+    await adoptSession(sessionA);
+    const lease = openSessionLease()!;
+    const a = note(noteAId, workspaceA, 'not dispatched');
+    const opA = mutation(noteAId, 'op-not-dispatched', a.bodyMd);
+    store$.notes.set({ [a.id]: a });
+    store$.outbox.set([opA]);
+    expect(await saveState()).toBe(true);
+    memory.failSetKey = stateStorageKeys.replica(ownerKeyFor(sessionA));
+
+    await expect(
+      updateReplicaForLease(lease, (current) => ({ ...current, pendingPush: [opA] })),
+    ).rejects.toThrow('Could not persist');
+
+    expect(store$.pendingPush.get()).toBeNull();
+    expect(store$.outbox.get()).toEqual([opA]);
+  });
+
+  it('makes a memory-only pending request durable through an identity replica commit', async () => {
+    await adoptSession(sessionA);
+    const lease = openSessionLease()!;
+    const original = note(noteAId, workspaceA, 'first edit');
+    const staged = mutation(noteAId, 'op-staged', original.bodyMd);
+    store$.notes.set({ [original.id]: original });
+    store$.outbox.set([staged]);
+    expect(await saveState()).toBe(true);
+
+    const key = stateStorageKeys.replica(ownerKeyFor(sessionA));
+    const gate = deferred();
+    memory.block = { key, promise: gate.promise };
+    memory.failAfterBlockSetKey = key;
+    const staging = updateReplicaForLease(lease, (current) => ({
+      ...current,
+      pendingPush: [staged],
+    }));
+    await vi.waitFor(() => expect(memory.block).toBeNull());
+
+    const newer = note(noteAId, workspaceA, 'newer concurrent edit');
+    const newerMutation = mutation(noteAId, 'op-newer', newer.bodyMd);
+    store$.notes.set({ [newer.id]: newer });
+    store$.outbox.set([newerMutation]);
+    gate.resolve();
+    await expect(staging).rejects.toThrow('Could not persist');
+
+    const beforeConfirmation = JSON.parse(memory.values.get(key)!) as {
+      pendingPush: SyncMutation[] | null;
+    };
+    expect(beforeConfirmation.pendingPush).toBeNull();
+    expect(store$.pendingPush.get()).toEqual([staged]);
+
+    await updateReplicaForLease(lease, (current) => current);
+
+    const confirmed = JSON.parse(memory.values.get(key)!) as {
+      pendingPush: SyncMutation[] | null;
+      outbox: SyncMutation[];
+    };
+    expect(confirmed.pendingPush).toEqual([staged]);
+    expect(confirmed.outbox).toEqual([newerMutation]);
   });
 
   it('serializes owner saves so an older slow write cannot win', async () => {

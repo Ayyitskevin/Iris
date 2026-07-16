@@ -41,14 +41,13 @@ describe('billing gate on multi-device sync', () => {
     expect(reg2.status).toBe(402);
     expect(reg2.json.error.code).toBe('payment_required');
 
-    // Syncing from the unregistered second device is likewise gated.
-    const syncBlocked = await call(
-      t.app,
-      'GET',
-      `/v1/sync/changes?since=&deviceId=${d2}`,
-      { token: u.token },
-    );
-    expect(syncBlocked.status).toBe(402);
+    // Sync never allocates a device implicitly. The explicit registration above is
+    // the 402 billing boundary; an unknown device is forbidden at sync ingress.
+    const syncBlocked = await call(t.app, 'GET', `/v1/sync/changes?since=&deviceId=${d2}`, {
+      token: u.token,
+    });
+    expect(syncBlocked.status).toBe(403);
+    expect(syncBlocked.json.error.code).toBe('forbidden');
 
     // Start checkout (fake gateway returns a stub URL).
     const checkout = await call(t.app, 'POST', '/v1/billing/checkout', { token: u.token });
@@ -79,12 +78,9 @@ describe('billing gate on multi-device sync', () => {
     expect(reg2b.json.activeDevices).toBe(2);
 
     // And the previously-blocked device can now sync.
-    const syncOk = await call(
-      t.app,
-      'GET',
-      `/v1/sync/changes?since=&deviceId=${d2}`,
-      { token: u.token },
-    );
+    const syncOk = await call(t.app, 'GET', `/v1/sync/changes?since=&deviceId=${d2}`, {
+      token: u.token,
+    });
     expect(syncOk.status).toBe(200);
   });
 });

@@ -1,12 +1,12 @@
 /**
  * Devices are the unit the sync gate counts (ADR-007). Registering a device is where
- * the plan limit is enforced; syncing from an unregistered device auto-registers it,
- * so the 402 lands exactly when a free workspace reaches for a second device.
+ * the plan limit is enforced. Sync endpoints accept only an explicitly registered
+ * device, so read-only agents cannot allocate billable workspace state.
  */
 import { and, eq } from 'drizzle-orm';
-import { devices } from '../db/schema';
+import { devices, workspaces } from '../db/schema';
 import type { Ctx } from '../context';
-import { paymentRequired } from '../lib/errors';
+import { forbidden, paymentRequired } from '../lib/errors';
 import { countDevices, deviceLimit, getSubscription } from './billing';
 
 async function findDevice(ctx: Ctx, id: string) {
@@ -15,6 +15,21 @@ async function findDevice(ctx: Ctx, id: string) {
     .from(devices)
     .where(and(eq(devices.id, id), eq(devices.workspaceId, ctx.workspaceId)));
   return rows[0];
+}
+
+async function touchDevice(
+  ctx: Ctx,
+  id: string,
+  meta?: { name?: string; platform?: string },
+): Promise<void> {
+  await ctx.db
+    .update(devices)
+    .set({
+      lastSeenAt: new Date(),
+      ...(meta?.name ? { name: meta.name } : {}),
+      ...(meta?.platform ? { platform: meta.platform } : {}),
+    })
+    .where(and(eq(devices.id, id), eq(devices.workspaceId, ctx.workspaceId)));
 }
 
 /**
@@ -30,14 +45,23 @@ export async function ensureDevice(
 ): Promise<void> {
   const existing = await findDevice(ctx, id);
   if (existing) {
-    await ctx.db
-      .update(devices)
-      .set({
-        lastSeenAt: new Date(),
-        ...(meta?.name ? { name: meta.name } : {}),
-        ...(meta?.platform ? { platform: meta.platform } : {}),
-      })
-      .where(and(eq(devices.id, id), eq(devices.workspaceId, ctx.workspaceId)));
+    await touchDevice(ctx, id, meta);
+    return;
+  }
+
+  // Every request already runs in one workspace transaction. Locking its durable
+  // workspace row serializes count + insert for all device ids in that workspace.
+  await ctx.db
+    .select({ id: workspaces.id })
+    .from(workspaces)
+    .where(eq(workspaces.id, ctx.workspaceId))
+    .for('update');
+
+  // A concurrent registration of this same workspace/device may have committed while
+  // this transaction waited for the workspace lock. It is an update, not another slot.
+  const afterLock = await findDevice(ctx, id);
+  if (afterLock) {
+    await touchDevice(ctx, id, meta);
     return;
   }
 
@@ -66,7 +90,11 @@ export async function registerDevice(
   return { activeDevices: await countDevices(ctx) };
 }
 
-/** Gate for the sync endpoints: the device must be (or become) a registered device. */
+/** Gate for sync endpoints: only a signed-in user may create the device beforehand. */
 export async function requireRegisteredDevice(ctx: Ctx, deviceId: string): Promise<void> {
-  await ensureDevice(ctx, deviceId);
+  const existing = await findDevice(ctx, deviceId);
+  if (!existing) {
+    throw forbidden('This device must be registered by a signed-in user before syncing');
+  }
+  await touchDevice(ctx, deviceId);
 }

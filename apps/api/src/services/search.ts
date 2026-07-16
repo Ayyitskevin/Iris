@@ -27,6 +27,7 @@ export async function searchNotes(ctx: Ctx, query: string): Promise<SearchHit[]>
       title: notes.title,
       bodyMd: notes.bodyMd,
       folder: notes.folder,
+      syncSeq: notes.syncSeq,
       tags: notes.tags,
       version: notes.version,
       createdAt: notes.createdAt,

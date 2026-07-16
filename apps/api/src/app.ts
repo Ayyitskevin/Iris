@@ -16,6 +16,9 @@ import {
   RestoreVersionRequest,
   SignInRequest,
   SignUpRequest,
+  SYNC_HTTP_BODY_LIMIT_BYTES,
+  SyncChangesRequest,
+  SyncPushRequest,
   UpdateNoteRequest,
   type AuthResponse,
 } from '@iris/shared';
@@ -53,6 +56,7 @@ declare module 'fastify' {
 export function buildApp(bundle: DbBundle): FastifyInstance {
   const app = Fastify({
     logger: { level: process.env.NODE_ENV === 'test' ? 'silent' : 'info' },
+    bodyLimit: SYNC_HTTP_BODY_LIMIT_BYTES,
   });
 
   app.decorate('db', bundle.db);
@@ -63,8 +67,14 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
     (req as FastifyRequest).rawBody = body as string;
     try {
       done(null, body ? JSON.parse(body as string) : {});
-    } catch (err) {
-      done(err as Error, undefined);
+    } catch {
+      const error = new Error('Request body is not valid JSON') as Error & {
+        statusCode: number;
+        code: string;
+      };
+      error.statusCode = 400;
+      error.code = 'invalid_json';
+      done(error, undefined);
     }
   });
 
@@ -72,13 +82,37 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
 
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof HttpError) {
-      return reply
-        .status(err.status)
-        .send({ error: { code: err.code, message: err.message, conflict: err.conflict } });
+      return reply.status(err.status).send({
+        error: {
+          code: err.code,
+          message: err.message,
+          conflict: err.conflict,
+          operationId: err.operationId,
+        },
+      });
     }
     if (err instanceof ZodError) {
-      const message = err.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`).join('; ');
+      const message = err.issues
+        .map((i) => `${i.path.join('.') || 'body'}: ${i.message}`)
+        .join('; ');
       return reply.status(400).send({ error: { code: 'validation_error', message } });
+    }
+    const requestError = err as Error & { statusCode?: number; code?: string };
+    if (
+      requestError.statusCode !== undefined &&
+      requestError.statusCode >= 400 &&
+      requestError.statusCode < 500
+    ) {
+      const status = requestError.statusCode;
+      const code =
+        status === 413
+          ? 'payload_too_large'
+          : requestError.code === 'invalid_json'
+            ? 'invalid_json'
+            : 'invalid_request';
+      const message =
+        status === 413 ? 'Request body exceeds the Iris transport limit' : requestError.message;
+      return reply.status(status).send({ error: { code, message } });
     }
     req.log.error(err);
     const message =
@@ -193,7 +227,11 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
     tenant(req, async (ctx) => {
       requireScope(ctx, 'notes:write');
       const { baseVersion } = req.body as { baseVersion: number };
-      const note = await notesService.deleteNote(ctx, (req.params as { id: string }).id, baseVersion);
+      const note = await notesService.deleteNote(
+        ctx,
+        (req.params as { id: string }).id,
+        baseVersion,
+      );
       return { note };
     }),
   );
@@ -210,7 +248,11 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
     tenant(req, async (ctx) => {
       requireScope(ctx, 'notes:write');
       const { versionId } = RestoreVersionRequest.parse(req.body);
-      const note = await notesService.restoreVersion(ctx, (req.params as { id: string }).id, versionId);
+      const note = await notesService.restoreVersion(
+        ctx,
+        (req.params as { id: string }).id,
+        versionId,
+      );
       return { note };
     }),
   );
@@ -219,7 +261,10 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
   app.post('/v1/agents/tokens', guarded, (req, reply) =>
     tenant(req, async (ctx) => {
       requireUser(ctx.principal);
-      const result = await agentService.issueAgentToken(ctx, IssueAgentTokenRequest.parse(req.body));
+      const result = await agentService.issueAgentToken(
+        ctx,
+        IssueAgentTokenRequest.parse(req.body),
+      );
       reply.status(201);
       return result;
     }),
@@ -260,15 +305,15 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
   app.get('/v1/sync/changes', guarded, (req) =>
     tenant(req, async (ctx) => {
       requireScope(ctx, 'notes:read');
-      const q = req.query as { since?: string; deviceId?: string };
-      return syncService.syncChanges(ctx, q.since ?? '', q.deviceId ?? 'default');
+      const query = SyncChangesRequest.parse(req.query);
+      return syncService.syncChanges(ctx, query.since, query.deviceId);
     }),
   );
 
   app.post('/v1/sync/push', guarded, (req) =>
     tenant(req, async (ctx) => {
       requireScope(ctx, 'notes:write');
-      const body = req.body as { deviceId: string; mutations: Parameters<typeof syncService.syncPush>[2] };
+      const body = SyncPushRequest.parse(req.body);
       return syncService.syncPush(ctx, body.deviceId, body.mutations);
     }),
   );

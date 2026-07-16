@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
+import { PostgresUuid } from '@iris/shared';
 
 /** Primary-key generator. UUID v4 from the Node runtime — no DB extension needed. */
 export function newId(): string {
@@ -12,5 +13,5 @@ export function newSecret(bytes = 32): string {
 
 /** Basic UUID shape check for client-supplied ids (local-first note creation). */
 export function isUuid(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+  return PostgresUuid.safeParse(value).success;
 }

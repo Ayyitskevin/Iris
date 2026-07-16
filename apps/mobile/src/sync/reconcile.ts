@@ -1,5 +1,5 @@
 /**
- * Pure Sync v1 reconciliation contract.
+ * Pure Sync v2 reconciliation contract.
  *
  * This module has no store or network side effects. The runtime coordinator applies it
  * only while holding a checked session/workspace lease (ADR-011).
@@ -26,6 +26,9 @@ export class SyncProtocolError extends Error {
     this.name = 'SyncProtocolError';
   }
 }
+
+/** Defensive ceiling for one drain cycle, even if every server cursor is unique. */
+export const SYNC_CHANGE_PAGE_LIMIT = 1_000;
 
 export function validatePushResponse(sent: SyncMutation[], response: SyncPushResponse): void {
   const sentByOp = new Map<string, SyncMutation>();
@@ -169,15 +172,22 @@ export async function drainChangePages(
   applyPage: (page: SyncChangesResponse) => void | Promise<void>,
 ): Promise<string> {
   let cursor = initialCursor;
+  const seenCursors = new Set([initialCursor]);
 
-  for (;;) {
+  for (let pageIndex = 0; pageIndex < SYNC_CHANGE_PAGE_LIMIT; pageIndex += 1) {
     const page = await fetchPage(cursor);
     if (page.cursor === cursor && (page.hasMore || page.changes.length > 0)) {
       throw new SyncProtocolError('Sync change-feed returned changes without advancing its cursor');
     }
+    if (page.cursor !== cursor && seenCursors.has(page.cursor)) {
+      throw new SyncProtocolError('Sync change-feed repeated an earlier cursor');
+    }
     await applyPage(page);
 
     if (!page.hasMore) return page.cursor;
+    seenCursors.add(page.cursor);
     cursor = page.cursor;
   }
+
+  throw new SyncProtocolError('Sync change-feed exceeded its page limit');
 }

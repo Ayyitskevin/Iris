@@ -5,7 +5,8 @@ description: Open when touching Stripe/checkout/webhooks, the multi-device 402 g
 
 ## When to use
 
-- A device registration or sync call returns **402 `payment_required`** and you need to know why, or change the threshold.
+- A device registration returns **402 `payment_required`**, or sync rejects an
+  unregistered device with **403 `forbidden`**, and you need to know which gate fired.
 - You're wiring or debugging **Stripe** — checkout, the webhook, subscription state not updating after payment.
 - You need to change the **device limit** per plan (`deviceLimit`) or the plan/status mapping.
 - You're writing a test that must exercise subscription state **without live Stripe keys** (the fake gateway).
@@ -17,7 +18,7 @@ Local use is always free. The paid feature is **reconciling more than one device
 
 Stripe is hidden behind a `BillingGateway` seam (`stripe.ts`) with two implementations selected **once** by whether `STRIPE_SECRET_KEY` is set: `LiveStripeGateway` (real Stripe) or `FakeStripeGateway` (stub URL + plain-JSON webhook). Both emit the same normalized `SubscriptionEvent`, so the state machine and the webhook route never know which is live — that's what makes the gate testable with no keys.
 
-The webhook route has **no auth and no tenant context** (Stripe calls it). It routes to a workspace only because `workspaceId` was stamped into Stripe metadata at checkout and comes back on the event; `applySubscriptionEvent` re-opens a scoped transaction from that id. Subscription rows are the source of truth for the gate; devices are counted live per request.
+The webhook route has **no auth and no tenant context** (Stripe calls it). It routes to a workspace only because `workspaceId` was stamped into Stripe metadata at checkout and comes back on the event; `applySubscriptionEvent` re-opens a scoped transaction from that id. Subscription rows are the source of truth for the gate. A signed-in user explicitly registers a device through `POST /v1/devices`; `ensureDevice` locks the workspace row so count + insert are serialized. Sync accepts only a device already registered in the same workspace.
 
 ## Key files
 
@@ -35,10 +36,15 @@ The webhook route has **no auth and no tenant context** (Stripe calls it). It ro
 - `apps/api/src/services/devices.ts` — where the gate is **enforced**.
   - `ensureDevice(ctx, id, meta?)` — the choke point: existing device passes free; new device runs the limit check and throws `paymentRequired(...)` at the limit.
   - `registerDevice` — POST `/v1/devices` handler; returns `{activeDevices}`.
-  - `requireRegisteredDevice` — thin `ensureDevice` used by the sync path (auto-registers, so the 402 lands on sync too).
+  - `requireRegisteredDevice` — sync-only existence check. It updates `lastSeenAt` for
+    a known workspace-composite id and returns 403 for an unknown one; it never
+    auto-registers or consumes a plan slot.
 - `apps/api/src/lib/errors.ts` — `paymentRequired(msg)` = `HttpError(402, 'payment_required', msg)`.
-- `apps/api/src/app.ts:258-283` — routes: `POST /v1/devices`, `GET /v1/billing/status`, `POST /v1/billing/checkout`, and the **unauthenticated** `POST /v1/billing/webhook` (reads `req.rawBody` + `stripe-signature` header).
-- `apps/api/src/services/sync.ts:53,153` — `syncChanges`/`syncPush` both call `requireRegisteredDevice` first.
+- `apps/api/src/app.ts` — routes: `POST /v1/devices`, `GET /v1/billing/status`,
+  `POST /v1/billing/checkout`, and the **unauthenticated**
+  `POST /v1/billing/webhook` (reads `req.rawBody` + `stripe-signature`).
+- `apps/api/src/services/sync.ts` — `syncChanges`/`syncPush` both call
+  `requireRegisteredDevice` first.
 - `apps/api/test/billing-gate.test.ts` — the end-to-end reference test.
 
 ## Playbook
@@ -53,15 +59,17 @@ const s0 = await call(t.app, 'GET', '/v1/billing/status', { token: u.token });
 
 // 2. First device registers fine.
 await call(t.app, 'POST', '/v1/devices', {
-  token: u.token, body: { id: d1, name: 'Phone', platform: 'ios' },
+  token: u.token,
+  body: { id: d1, name: 'Phone', platform: 'ios' },
 }); // 200, activeDevices:1
 
 // 3. Second device on free plan is gated → 402 payment_required.
 const reg2 = await call(t.app, 'POST', '/v1/devices', {
-  token: u.token, body: { id: d2, name: 'Laptop', platform: 'web' },
+  token: u.token,
+  body: { id: d2, name: 'Laptop', platform: 'web' },
 });
 // reg2.status === 402, reg2.json.error.code === 'payment_required'
-// Same 402 if that unregistered device hits GET /v1/sync/changes?deviceId=d2.
+// If d2 skips registration and calls sync, it gets 403 forbidden instead.
 
 // 4. Upgrade via the FAKE webhook — a plain JSON SubscriptionEvent, no signature.
 await call(t.app, 'POST', '/v1/billing/webhook', {
@@ -70,7 +78,8 @@ await call(t.app, 'POST', '/v1/billing/webhook', {
 
 // 5. Now plan==='sync', deviceLimit>1; the second device registers and syncs.
 await call(t.app, 'POST', '/v1/devices', {
-  token: u.token, body: { id: d2, name: 'Laptop', platform: 'web' },
+  token: u.token,
+  body: { id: d2, name: 'Laptop', platform: 'web' },
 }); // 200, activeDevices:2
 ```
 
@@ -81,10 +90,18 @@ Key point for step 4: the fake webhook body **is** a `SubscriptionEvent` (JSON),
 ## Invariants & gotchas
 
 - **`workspaceId` MUST be in Stripe metadata.** `LiveStripeGateway.createCheckout` stamps it on the customer, the session, AND `subscription_data.metadata`. The webhook reads `sub.metadata.workspaceId` and returns `null` (silently ignored) if absent — the subscription would activate in Stripe but never update Iris. Don't drop any of those three metadata writes.
-- **The gate lives only in `ensureDevice`.** Every entry point that must be gated goes through it: `registerDevice` (POST `/v1/devices`) and `requireRegisteredDevice` (sync). If you add a new sync-ish endpoint, call `requireRegisteredDevice` or the gate won't apply.
-- **Existing devices never re-check the limit.** `ensureDevice` short-circuits for a known device id (just bumps `lastSeenAt`). This is deliberate: a customer who downgrades keeps already-synced devices working; the 402 only blocks *net-new* devices. Don't "fix" this into a hard cap.
+- **The billing gate lives only in `ensureDevice`.** The user-only `registerDevice`
+  route is the only entry point that may allocate a device and therefore the only one
+  that runs the plan-limit check. Sync endpoints call `requireRegisteredDevice`, which
+  is an existence gate, not a registration path.
+- **Existing devices never re-check the limit.** `ensureDevice` short-circuits for a known device id (just bumps `lastSeenAt`). This is deliberate: a customer who downgrades keeps already-synced devices working; the 402 only blocks _net-new_ devices. Don't "fix" this into a hard cap.
+- **Device ids are workspace-composite.** The same client installation id may exist in
+  two workspaces; every lookup and update pairs `devices.id` with `workspace_id`.
 - **`billingGateway()` is a memoized singleton.** It reads `env.stripe.secretKey` on first call and caches the instance. Setting/unsetting `STRIPE_SECRET_KEY` after the process starts has no effect; tests rely on it being unset at boot to get the fake.
 - **The webhook route is unauthenticated and uses the raw body.** `app.ts` keeps `req.rawBody` around specifically for Stripe signature verification (`constructEvent`). Don't route the webhook through `authGuard`/`tenant` — it has no principal; `applySubscriptionEvent` supplies its own workspace scope via `withWorkspace`.
 - **`applySubscriptionEvent` opens its own scoped transaction.** It's called with the app-level `app.db` (not a `Ctx`) and must wrap writes in `withWorkspace(db, event.workspaceId, …)` to satisfy RLS in production. Don't call it with an ambient/unscoped db handle.
 - **Live webhook only handles `customer.subscription.*` events; everything else returns `null`.** Deletions map to `'canceled'` regardless of `sub.status`. `current_period_end` is seconds → multiply by 1000 for the `Date`.
-- **402 is `payment_required`, distinct from 409 `version_conflict`.** The billing gate and the sync base-version conflict are different failures with different envelopes; don't conflate them.
+- **402 is `payment_required`.** REST note writes report `version_conflict` as HTTP
+  409, while sync version mismatches are typed per-operation results in HTTP 200 and
+  incompatible `opId` reuse is HTTP 409 `idempotency_key_reused`. Do not conflate any
+  of these with the billing gate.

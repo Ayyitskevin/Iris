@@ -3,6 +3,10 @@
  * any agent in TypeScript). Dependency-free — just `fetch`. All methods are
  * workspace-scoped implicitly by the bearer token.
  */
+import {
+  SyncChangesResponse as SyncChangesResponseSchema,
+  SyncPushResponse as SyncPushResponseSchema,
+} from './schemas';
 import type {
   ActivityListResponse,
   AgentTokenListResponse,
@@ -35,20 +39,38 @@ export interface ApiClientOptions {
   fetch?: typeof fetch;
 }
 
-/** Thrown on any non-2xx response. `conflict` is populated on 409s. */
+/** Thrown when a successful sync response does not satisfy the shared wire schema. */
+export class ApiResponseValidationError extends Error {
+  constructor(
+    public readonly path: string,
+    options?: { cause?: unknown },
+  ) {
+    super(`API returned an invalid successful response for ${path}`, options);
+    this.name = 'ApiResponseValidationError';
+  }
+}
+
+/** Thrown on any non-2xx response. `conflict` exists only on `version_conflict`. */
 export class ApiRequestError extends Error {
   constructor(
     public readonly status: number,
     public readonly code: string,
     message: string,
     public readonly conflict?: Note,
+    public readonly operationId?: string,
   ) {
     super(message);
     this.name = 'ApiRequestError';
   }
 
+  /** Single-note optimistic-concurrency failure with an authoritative note. */
   get isConflict(): boolean {
-    return this.status === 409;
+    return this.status === 409 && this.code === 'version_conflict';
+  }
+
+  /** Sync operation id was already bound to another actor/device/payload. */
+  get isIdempotencyKeyReused(): boolean {
+    return this.status === 409 && this.code === 'idempotency_key_reused';
   }
 
   /** 402 Payment Required — the multi-device sync gate (ADR-007). */
@@ -66,6 +88,7 @@ export function createApiClient(options: ApiClientOptions) {
     path: string,
     body?: unknown,
     overrideToken?: string,
+    validateResponse?: (value: unknown) => T,
   ): Promise<T> {
     const headers: Record<string, string> = { accept: 'application/json' };
     if (body !== undefined) headers['content-type'] = 'application/json';
@@ -79,21 +102,36 @@ export function createApiClient(options: ApiClientOptions) {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
 
-    if (res.status === 204) return undefined as T;
+    if (res.status === 204 && !validateResponse) return undefined as T;
 
     const text = await res.text();
-    const json = text ? JSON.parse(text) : undefined;
+    let json: unknown;
+    try {
+      json = text ? JSON.parse(text) : undefined;
+    } catch (cause) {
+      if (res.ok) throw new ApiResponseValidationError(path, { cause });
+      throw new ApiRequestError(res.status, 'unknown', `Request failed with ${res.status}`);
+    }
 
     if (!res.ok) {
-      const err = json?.error ?? {};
+      const err =
+        json && typeof json === 'object' && 'error' in json
+          ? ((json as { error?: Record<string, unknown> }).error ?? {})
+          : {};
       throw new ApiRequestError(
         res.status,
-        err.code ?? 'unknown',
-        err.message ?? `Request failed with ${res.status}`,
-        err.conflict,
+        typeof err.code === 'string' ? err.code : 'unknown',
+        typeof err.message === 'string' ? err.message : `Request failed with ${res.status}`,
+        err.conflict as Note | undefined,
+        typeof err.operationId === 'string' ? err.operationId : undefined,
       );
     }
-    return json as T;
+    if (!validateResponse) return json as T;
+    try {
+      return validateResponse(json);
+    } catch (cause) {
+      throw new ApiResponseValidationError(path, { cause });
+    }
   }
 
   return {
@@ -141,8 +179,14 @@ export function createApiClient(options: ApiClientOptions) {
       request<SyncChangesResponse>(
         'GET',
         `/v1/sync/changes?since=${encodeURIComponent(since)}&deviceId=${encodeURIComponent(deviceId)}`,
+        undefined,
+        undefined,
+        (value) => SyncChangesResponseSchema.parse(value),
       ),
-    syncPush: (b: SyncPushRequest) => request<SyncPushResponse>('POST', '/v1/sync/push', b),
+    syncPush: (b: SyncPushRequest) =>
+      request<SyncPushResponse>('POST', '/v1/sync/push', b, undefined, (value) =>
+        SyncPushResponseSchema.parse(value),
+      ),
 
     // --- Devices & billing ---
     registerDevice: (b: RegisterDeviceRequest) =>

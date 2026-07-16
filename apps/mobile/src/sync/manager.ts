@@ -76,6 +76,65 @@ export function sync(): Promise<void> {
   return coordinator.sync();
 }
 
+/**
+ * Apply the durable recovery encoded by the active owner's sync issue, then start one
+ * fresh cycle. Pending payloads are preserved exactly except for deliberate op-id rekeys.
+ */
+export async function recoverSyncIssue(): Promise<boolean> {
+  const lease = currentLease();
+  if (!store$.syncIssue.get()) return true;
+
+  try {
+    await updateReplicaForLease(lease, (current) => {
+      const issue = current.syncIssue;
+      if (!issue) return current;
+
+      if (issue.recoveryKind === 'rekey') {
+        const pendingPush = current.pendingPush;
+        if (!pendingPush) return { ...current, syncIssue: null };
+
+        const targetIds = new Set(
+          issue.affectedOpIds.length > 0
+            ? issue.affectedOpIds
+            : pendingPush.map((mutation) => mutation.opId),
+        );
+        const replacements = new Map<string, string>();
+        const rekeyedPending = pendingPush.map((mutation) => {
+          if (!targetIds.has(mutation.opId)) return mutation;
+          const replacement = uuid();
+          replacements.set(mutation.opId, replacement);
+          return { ...mutation, opId: replacement };
+        });
+        const rekeyedOutbox = current.outbox.map((mutation) => {
+          const replacement = replacements.get(mutation.opId);
+          return replacement ? { ...mutation, opId: replacement } : mutation;
+        });
+        return {
+          ...current,
+          pendingPush: rekeyedPending,
+          outbox: rekeyedOutbox,
+          syncIssue: null,
+        };
+      }
+
+      if (issue.recoveryKind === 'restage') {
+        return { ...current, pendingPush: null, syncIssue: null };
+      }
+
+      return {
+        ...current,
+        syncCursor: issue.recoveryKind === 'reset-cursor' ? '' : current.syncCursor,
+        syncIssue: null,
+      };
+    });
+    void sync();
+    return true;
+  } catch {
+    if (isCurrentSession(lease)) setStatusForLease(lease, 'error');
+    return false;
+  }
+}
+
 function enqueue(lease: SessionLease, mutation: SyncMutation): void {
   assertCurrentSession(lease);
   const rest = store$.outbox.get().filter((item) => item.note.id !== mutation.note.id);

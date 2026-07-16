@@ -6,7 +6,11 @@ const memory = vi.hoisted(() => ({
   failSetKey: null as string | null,
 }));
 const apiMock = vi.hoisted(() => ({
-  calls: [] as { token: string; method: 'register' | 'push' | 'changes' }[],
+  calls: [] as {
+    token: string;
+    method: 'register' | 'push' | 'changes';
+    body?: SyncPushRequest;
+  }[],
   pushPromise: null as Promise<SyncPushResponse> | null,
 }));
 
@@ -30,7 +34,7 @@ vi.mock('../api', () => ({
       return { activeDevices: 1 };
     },
     syncPush: async (body: SyncPushRequest) => {
-      apiMock.calls.push({ token: lease.token, method: 'push' });
+      apiMock.calls.push({ token: lease.token, method: 'push', body });
       if (apiMock.pushPromise) return apiMock.pushPromise;
       return {
         applied: body.mutations.map((item) => ({
@@ -63,13 +67,14 @@ import {
   store$,
   type Session,
 } from '../state/store';
-import { keepLocalConflict, sync, useServerConflict } from './manager';
+import { keepLocalConflict, recoverSyncIssue, sync, useServerConflict } from './manager';
 
 const workspaceA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const workspaceB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const userA = '11111111-1111-4111-8111-111111111111';
 const userB = '22222222-2222-4222-8222-222222222222';
 const noteId = '33333333-3333-4333-8333-333333333333';
+const secondNoteId = '44444444-4444-4444-8444-444444444444';
 
 const sessionA: Session = {
   token: 'token-A',
@@ -107,6 +112,23 @@ function localMutation(bodyMd: string, opId = 'op-local'): SyncMutation {
     type: 'upsert',
     note: { id: noteId, title: bodyMd, bodyMd, folder: null, tags: [] },
     baseVersion: 1,
+  };
+}
+
+function appliedResponse(workspaceId: string, mutations: SyncMutation[]): SyncPushResponse {
+  return {
+    applied: mutations.map((item) => ({
+      opId: item.opId,
+      note: {
+        ...item.note,
+        workspaceId,
+        version: item.baseVersion + 1,
+        createdAt: '2026-07-15T10:00:00.000Z',
+        updatedAt: '2026-07-15T12:00:00.000Z',
+        deletedAt: item.type === 'delete' ? '2026-07-15T12:00:00.000Z' : null,
+      },
+    })),
+    conflicts: [],
   };
 }
 
@@ -178,6 +200,178 @@ describe('owner-fenced conflict decisions', () => {
     expect(await useServerConflict(ownerKeyFor(sessionA), noteId, 'op-local')).toBe(false);
     expect(store$.conflicts.get()[noteId]?.localMutation.opId).toBe('op-local');
     expect(store$.status.get()).toBe('error');
+  });
+});
+
+describe('manual durable sync recovery', () => {
+  it('hydrates a terminal issue and suppresses every automatic network retry', async () => {
+    store$.conflicts.set({});
+    store$.syncIssue.set({
+      code: 'invalid_sync_response',
+      message: 'Malformed response',
+      affectedOpIds: [],
+      recoveryKind: 'retry',
+    });
+    expect(await saveState()).toBe(true);
+
+    store$.syncIssue.set(null);
+    await loadState();
+    expect(store$.syncIssue.get()?.code).toBe('invalid_sync_response');
+    apiMock.calls = [];
+
+    await sync();
+    await sync();
+
+    expect(apiMock.calls).toEqual([]);
+    expect(store$.status.get()).toBe('error');
+  });
+
+  it('rekeys only the operation named by an idempotency collision', async () => {
+    const first = localMutation('first', 'op-first');
+    const second = {
+      ...localMutation('second', 'op-second'),
+      note: { ...localMutation('second', 'op-second').note, id: secondNoteId },
+    };
+    store$.conflicts.set({});
+    store$.notes.set({
+      [noteId]: note(workspaceA, 'first', 1),
+      [secondNoteId]: { ...note(workspaceA, 'second', 1), id: secondNoteId },
+    });
+    store$.outbox.set([first, second]);
+    store$.pendingPush.set([first, second]);
+    store$.syncIssue.set({
+      code: 'idempotency_key_reused',
+      message: 'First operation id is already bound',
+      affectedOpIds: [first.opId],
+      recoveryKind: 'rekey',
+    });
+    expect(await saveState()).toBe(true);
+    const push = deferred<SyncPushResponse>();
+    apiMock.pushPromise = push.promise;
+
+    expect(await recoverSyncIssue()).toBe(true);
+    await vi.waitFor(() => expect(apiMock.calls.some((call) => call.method === 'push')).toBe(true));
+    const body = apiMock.calls.find((call) => call.method === 'push')!.body!;
+    expect(body.mutations[0]).toEqual({ ...first, opId: expect.any(String) });
+    expect(body.mutations[0]?.opId).not.toBe(first.opId);
+    expect(body.mutations[1]).toEqual(second);
+    expect(store$.outbox.get()).toEqual(body.mutations);
+    expect(store$.pendingPush.get()).toEqual(body.mutations);
+    expect(store$.syncIssue.get()).toBeNull();
+
+    const running = sync();
+    push.resolve(appliedResponse(workspaceA, body.mutations));
+    await running;
+  });
+
+  it('rekeys the whole pending batch when the collision names no operation', async () => {
+    const first = localMutation('first', 'op-first');
+    const second = {
+      ...localMutation('second', 'op-second'),
+      note: { ...localMutation('second', 'op-second').note, id: secondNoteId },
+    };
+    store$.conflicts.set({});
+    store$.notes.set({
+      [noteId]: note(workspaceA, 'first', 1),
+      [secondNoteId]: { ...note(workspaceA, 'second', 1), id: secondNoteId },
+    });
+    store$.outbox.set([first, second]);
+    store$.pendingPush.set([first, second]);
+    store$.syncIssue.set({
+      code: 'idempotency_key_reused',
+      message: 'Pending operation ids are already bound',
+      affectedOpIds: [first.opId, second.opId],
+      recoveryKind: 'rekey',
+    });
+    expect(await saveState()).toBe(true);
+    const push = deferred<SyncPushResponse>();
+    apiMock.pushPromise = push.promise;
+
+    expect(await recoverSyncIssue()).toBe(true);
+    await vi.waitFor(() => expect(apiMock.calls.some((call) => call.method === 'push')).toBe(true));
+    const body = apiMock.calls.find((call) => call.method === 'push')!.body!;
+    expect(body.mutations.map((item) => item.opId)).not.toContain(first.opId);
+    expect(body.mutations.map((item) => item.opId)).not.toContain(second.opId);
+    expect(body.mutations.map((item) => item.note)).toEqual([first.note, second.note]);
+
+    const running = sync();
+    push.resolve(appliedResponse(workspaceA, body.mutations));
+    await running;
+  });
+
+  it('resets only the cursor for invalid-cursor recovery', async () => {
+    store$.conflicts.set({});
+    store$.syncCursor.set('invalid-cursor');
+    store$.syncIssue.set({
+      code: 'invalid_sync_cursor',
+      message: 'Cursor is invalid',
+      affectedOpIds: [],
+      recoveryKind: 'reset-cursor',
+    });
+    expect(await saveState()).toBe(true);
+
+    expect(await recoverSyncIssue()).toBe(true);
+    await sync();
+
+    expect(store$.syncCursor.get()).toBe('');
+    expect(store$.syncIssue.get()).toBeNull();
+  });
+
+  it('restages the current outbox instead of replaying an invalid older pending request', async () => {
+    const oldPending = localMutation('old invalid payload', 'op-old');
+    const newer = localMutation('newer valid payload', 'op-newer');
+    store$.conflicts.set({});
+    store$.notes.set({ [noteId]: note(workspaceA, newer.note.bodyMd, 1) });
+    store$.outbox.set([newer]);
+    store$.pendingPush.set([oldPending]);
+    store$.syncIssue.set({
+      code: 'invalid_local_sync_mutation',
+      message: 'Edit the note and restage',
+      affectedOpIds: [oldPending.opId],
+      recoveryKind: 'restage',
+    });
+    expect(await saveState()).toBe(true);
+    const push = deferred<SyncPushResponse>();
+    apiMock.pushPromise = push.promise;
+
+    expect(await recoverSyncIssue()).toBe(true);
+    await vi.waitFor(() => expect(apiMock.calls.some((call) => call.method === 'push')).toBe(true));
+    const body = apiMock.calls.find((call) => call.method === 'push')!.body!;
+    expect(body.mutations).toEqual([newer]);
+    expect(store$.pendingPush.get()).toEqual([newer]);
+    expect(store$.outbox.get()).toEqual([newer]);
+    expect(store$.syncIssue.get()).toBeNull();
+
+    const running = sync();
+    push.resolve(appliedResponse(workspaceA, body.mutations));
+    await running;
+  });
+
+  it('generic retry preserves the exact durable pending payload', async () => {
+    const pending = localMutation('exact payload', 'op-exact');
+    store$.conflicts.set({});
+    store$.notes.set({ [noteId]: note(workspaceA, pending.note.bodyMd, 1) });
+    store$.outbox.set([pending]);
+    store$.pendingPush.set([pending]);
+    store$.syncIssue.set({
+      code: 'invalid_sync_response',
+      message: 'Malformed response',
+      affectedOpIds: [pending.opId],
+      recoveryKind: 'retry',
+    });
+    expect(await saveState()).toBe(true);
+    const push = deferred<SyncPushResponse>();
+    apiMock.pushPromise = push.promise;
+
+    expect(await recoverSyncIssue()).toBe(true);
+    await vi.waitFor(() => expect(apiMock.calls.some((call) => call.method === 'push')).toBe(true));
+    const body = apiMock.calls.find((call) => call.method === 'push')!.body!;
+    expect(body.mutations).toEqual([pending]);
+    expect(store$.pendingPush.get()).toEqual([pending]);
+
+    const running = sync();
+    push.resolve(appliedResponse(workspaceA, body.mutations));
+    await running;
   });
 });
 

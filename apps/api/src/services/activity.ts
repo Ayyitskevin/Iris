@@ -9,7 +9,7 @@ import { activityLog, noteVersions, notes } from '../db/schema';
 import type { Ctx } from '../context';
 import { badRequest, notFound } from '../lib/errors';
 import { serializeActivity, serializeNote } from '../serialize';
-import { loadNote, recordVersionAndActivity } from './note-write';
+import { loadNote, recordVersionAndActivity, throwConcurrentNoteChange } from './note-write';
 
 const FEED_LIMIT = 200;
 
@@ -96,9 +96,15 @@ export async function undoActivity(ctx: Ctx, activityId: string): Promise<UndoRe
       version: note.version + 1,
       updatedAt: new Date(),
     })
-    .where(and(eq(notes.id, target.noteId), eq(notes.workspaceId, ctx.workspaceId)))
+    .where(
+      and(
+        eq(notes.id, target.noteId),
+        eq(notes.workspaceId, ctx.workspaceId),
+        eq(notes.version, note.version),
+      ),
+    )
     .returning();
-  const head = updated[0]!;
+  const head = updated[0] ?? (await throwConcurrentNoteChange(ctx, target.noteId));
 
   const { activityId: undoId } = await recordVersionAndActivity(ctx, head, 'note.undo', target.id);
   const undoRows = await ctx.db

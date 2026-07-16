@@ -13,7 +13,7 @@ import type { Ctx } from '../context';
 import { conflict, notFound } from '../lib/errors';
 import { isUuid, newId } from '../lib/ids';
 import { serializeNote } from '../serialize';
-import { loadNote, recordVersionAndActivity } from './note-write';
+import { loadNote, recordVersionAndActivity, throwConcurrentNoteChange } from './note-write';
 
 /** Trim, lowercase, drop empties, and de-dupe tags so "Work" and " work " collapse. */
 export function normalizeTags(tags: string[] | undefined): string[] {
@@ -87,9 +87,15 @@ export async function updateNote(ctx: Ctx, id: string, input: UpdateNoteRequest)
       version: current.version + 1,
       updatedAt: new Date(),
     })
-    .where(and(eq(notes.id, id), eq(notes.workspaceId, ctx.workspaceId)))
+    .where(
+      and(
+        eq(notes.id, id),
+        eq(notes.workspaceId, ctx.workspaceId),
+        eq(notes.version, current.version),
+      ),
+    )
     .returning();
-  const note = updated[0]!;
+  const note = updated[0] ?? (await throwConcurrentNoteChange(ctx, id));
   await recordVersionAndActivity(ctx, note, 'note.update');
   return serializeNote(note);
 }
@@ -104,9 +110,15 @@ export async function deleteNote(ctx: Ctx, id: string, baseVersion: number): Pro
   const updated = await ctx.db
     .update(notes)
     .set({ deletedAt: new Date(), version: current.version + 1, updatedAt: new Date() })
-    .where(and(eq(notes.id, id), eq(notes.workspaceId, ctx.workspaceId)))
+    .where(
+      and(
+        eq(notes.id, id),
+        eq(notes.workspaceId, ctx.workspaceId),
+        eq(notes.version, current.version),
+      ),
+    )
     .returning();
-  const note = updated[0]!;
+  const note = updated[0] ?? (await throwConcurrentNoteChange(ctx, id));
   await recordVersionAndActivity(ctx, note, 'note.delete');
   return serializeNote(note);
 }
@@ -142,9 +154,15 @@ export async function restoreVersion(ctx: Ctx, id: string, versionId: string): P
       deletedAt: null,
       updatedAt: new Date(),
     })
-    .where(and(eq(notes.id, id), eq(notes.workspaceId, ctx.workspaceId)))
+    .where(
+      and(
+        eq(notes.id, id),
+        eq(notes.workspaceId, ctx.workspaceId),
+        eq(notes.version, current.version),
+      ),
+    )
     .returning();
-  const note = updated[0]!;
+  const note = updated[0] ?? (await throwConcurrentNoteChange(ctx, id));
   await recordVersionAndActivity(ctx, note, 'note.restore');
   return serializeNote(note);
 }

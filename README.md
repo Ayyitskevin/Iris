@@ -18,15 +18,17 @@ how to run it.
 A thin, end-to-end vertical slice that proves the architecture:
 
 - **Multi-tenant auth + workspaces** — sign up → your own isolated workspace.
-- **Notes core** — create/edit/delete Markdown notes in folders, **versioned** (every save
-  keeps history; restore any prior version). **Tags + full-text search** (phase 2, ADR-010):
-  ranked search and tag filtering, both workspace-scoped.
+- **Notes core** — create/edit/delete Markdown notes in folders, with versioned content
+  history and forward-only restore. **Tags + full-text search** (phase 2, ADR-010):
+  ranked search and tag filtering, both workspace-scoped. Exact folder/tag restore and
+  undo semantics remain a tracked correctness slice.
 - **Owner-isolated local-first sync** — edits apply instantly/offline; each user/workspace
   has a private replica and fixed-token sync lease; a change-feed reconciles to Postgres;
   conflicts retain both versions in a dedicated Review inbox.
 - **Agent actors + API** — issue scoped, revocable agent tokens; a REST API that agents
-  and the app share; every agent write lands in an **append-only activity log** and creates
-  a version; an **activity feed** where the operator can **undo** an action.
+  and the app share; every agent note write lands in an **append-only activity log** and
+  creates a version; an **activity feed** where the operator can undo recorded content
+  changes.
 - **Billing gate** — Stripe subscription; local use free, multi-device **sync is the paid
   line** (~$5/mo).
 - **Full Markdown export** — one action → a zip of `.md` files + attachments.
@@ -104,12 +106,31 @@ curl -s localhost:4000/v1/activity/<ACTIVITY_ID>/undo -X POST -H "authorization:
 ## Status & honesty note
 
 See the bottom of [`docs/DECISIONS.md`](docs/DECISIONS.md) and
-[`docs/ROADMAP.md`](docs/ROADMAP.md). The backend and its Definition-of-Done tests run and
-pass in-repo. Auth ships a **local** provider behind a managed-provider seam (ADR-004);
-Stripe ships full plumbing tested with a fake client (ADR-007). The production mobile
-loop now uses the lossless reconciliation contract behind owner-keyed replicas and
-immutable session leases; focused tests cover delayed push/pull, pagination, sign-out,
-account switch, stale 401, cursor isolation, migration recovery, and A-outbox/B-token
-separation (ADR-011). Sync v2's database-monotonic cursor, request-bound idempotency, and
-transactional SQLite/IndexedDB repository remain explicit release blockers. Device and
-simulator runs require the standard Expo/EAS toolchain and are a documented follow-up.
+[`docs/ROADMAP.md`](docs/ROADMAP.md). The PGlite-backed API suite and mobile suites run
+and pass in-repo. Auth ships a **local** provider behind a managed-provider seam
+(ADR-004); Stripe ships full plumbing tested with a fake client (ADR-007). The production
+mobile loop now uses the lossless reconciliation contract behind owner-keyed replicas
+and immutable session leases. Phase 2.2a delivers Sync v2's durable transport half, not the
+whole protocol or release readiness: current clients durably stage exact push chunks
+within six operations and a 1,900,000-byte serialized request budget; the same
+`/v1/sync/push` ingress applies that finite cap to every client beneath Fastify's
+separate 2,097,152-byte ingress ceiling, with a 1,900,000-byte worst-case response
+budget for notes accepted under the current bound. A migrated pre-limit oversized note
+remains lossless and may occupy one conflict response beyond that modern-data budget.
+Each sync cycle durably drains at most 16 chunks (96 operations) and leaves any
+larger remainder for the next cycle. Pull pages are bounded by both rows and bytes.
+Retries are bound to actor + explicitly user-registered, workspace-composite device +
+payload + frozen receipt version; cursors bind a commit-serialized sequence to one
+workspace. Terminal protocol failures persist an owner-local hold and require a visible
+manual recovery action before networking resumes.
+A checksummed migration ledger adopts only recognized legacy postconditions and verifies
+current-head artifacts on later runs. Focused tests cover transport bounds, lost
+responses, persistence races, exact applied/conflict replay, non-`BYPASSRLS`
+upgrade-with-data, delayed push/pull, pagination, sign-out, account switch, stale 401,
+cross-workspace cursor rejection, and A-outbox/B-token separation (ADR-011/012). Generic
+resource envelopes, transactional SQLite/IndexedDB replicas, web cross-tab coordination,
+recovery import, and native device/simulator acceptance remain explicit release blockers.
+CI now provisions PostgreSQL 16 and is configured to run the independent-connection
+commit-order and concurrent device-gate test. This local integration did not provide
+`IRIS_TEST_POSTGRES_URL`, so a green pushed CI run is still required before claiming
+that real-Postgres gate passed.

@@ -7,6 +7,7 @@ import { buildApp } from '../src/app';
 
 export interface TestApp {
   app: FastifyInstance;
+  client: PGlite;
   close: () => Promise<void>;
 }
 
@@ -19,6 +20,7 @@ export async function makeApp(): Promise<TestApp> {
   await app.ready();
   return {
     app,
+    client,
     close: async () => {
       await app.close();
       await bundle.close();

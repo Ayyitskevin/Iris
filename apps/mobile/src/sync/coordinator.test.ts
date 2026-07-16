@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   ApiRequestError,
+  ApiResponseValidationError,
+  SYNC_PUSH_LIMIT,
+  SYNC_PUSH_MAX_BYTES,
+  syncPushRequestByteLength,
   type RegisterDeviceRequest,
   type SyncChangesResponse,
   type SyncMutation,
@@ -8,7 +12,7 @@ import {
   type SyncPushResponse,
 } from '@iris/shared';
 import type { ReplicaState, SessionLease, SyncStatus } from '../state/store';
-import { createSyncCoordinator, type SyncPort } from './coordinator';
+import { createSyncCoordinator, SYNC_PUSH_CHUNK_LIMIT, type SyncPort } from './coordinator';
 
 const workspaceA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const workspaceB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -40,12 +44,50 @@ function mutation(opId: string, bodyMd: string, baseVersion = 1): SyncMutation {
   };
 }
 
+function appliedPush(body: SyncPushRequest): SyncPushResponse {
+  return {
+    applied: body.mutations.map((item) => ({
+      opId: item.opId,
+      note: {
+        ...note(workspaceA, item.note.bodyMd, item.baseVersion + 1),
+        id: item.note.id,
+        title: item.note.title,
+        folder: item.note.folder,
+        tags: item.note.tags,
+      },
+    })),
+    conflicts: [],
+  };
+}
+
+function makeQueue(
+  count: number,
+  opPrefix = 'op',
+): {
+  notes: ReplicaState['notes'];
+  queued: SyncMutation[];
+} {
+  const notes: ReplicaState['notes'] = {};
+  const queued = Array.from({ length: count }, (_, index) => {
+    const id = `33333333-3333-4333-8333-${(index + 1).toString(16).padStart(12, '0')}`;
+    const item = {
+      ...mutation(`${opPrefix}-${index}`, `body-${index}`),
+      note: { ...mutation(`${opPrefix}-${index}`, `body-${index}`).note, id },
+    };
+    notes[id] = { ...note(workspaceA, item.note.bodyMd), id };
+    return item;
+  });
+  return { notes, queued };
+}
+
 function emptyReplica(cursor = ''): ReplicaState {
   return {
     notes: {},
     syncCursor: cursor,
     deviceId: '',
     outbox: [],
+    pendingPush: null,
+    syncIssue: null,
     conflicts: {},
   };
 }
@@ -67,6 +109,9 @@ class MemoryPort implements SyncPort {
   statuses = new Map<string, SyncStatus>();
   gated = new Map<string, boolean>();
   expired: string[] = [];
+  nextUpdateError: Error | null = null;
+  nextAppliedUpdateError: Error | null = null;
+  afterNextApply: (() => void) | null = null;
   private controller = new AbortController();
 
   adopt(which: 'A' | 'B', token = 'token-' + which): SessionLease {
@@ -121,7 +166,20 @@ class MemoryPort implements SyncPort {
     update: (current: ReplicaState) => ReplicaState,
   ): Promise<void> => {
     if (!this.isCurrent(lease)) throw new Error('stale');
+    if (this.nextUpdateError) {
+      const error = this.nextUpdateError;
+      this.nextUpdateError = null;
+      throw error;
+    }
     this.replicas.set(lease.ownerKey, structuredClone(update(this.readReplica(lease))));
+    const afterApply = this.afterNextApply;
+    this.afterNextApply = null;
+    afterApply?.();
+    if (this.nextAppliedUpdateError) {
+      const error = this.nextAppliedUpdateError;
+      this.nextAppliedUpdateError = null;
+      throw error;
+    }
     await Promise.resolve();
     if (!this.isCurrent(lease)) throw new Error('stale');
   };
@@ -201,7 +259,14 @@ describe('session-bound sync coordinator', () => {
       outbox: [sent],
     });
     const push = deferred<SyncPushResponse>();
-    const h = harness(port, { push: () => push.promise });
+    let pushCount = 0;
+    const h = harness(port, {
+      push: async (_lease, body) => {
+        pushCount += 1;
+        expect(port.replicas.get(lease.ownerKey)?.pendingPush).toEqual(body.mutations);
+        return pushCount === 1 ? push.promise : appliedPush(body);
+      },
+    });
 
     const running = h.sync();
     await vi.waitFor(() => expect(h.calls.some((call) => call.method === 'push')).toBe(true));
@@ -219,9 +284,502 @@ describe('session-bound sync coordinator', () => {
 
     const replica = port.replicas.get(lease.ownerKey)!;
     expect(replica.notes[noteId]?.bodyMd).toBe('newest edit');
-    expect(replica.outbox).toEqual([{ ...newer, baseVersion: 2 }]);
-    const pushCall = h.calls.find((call) => call.method === 'push')!;
-    expect((pushCall.body as SyncPushRequest).mutations).toEqual([sent]);
+    expect(replica.notes[noteId]?.version).toBe(3);
+    expect(replica.outbox).toEqual([]);
+    expect(replica.pendingPush).toBeNull();
+    expect(
+      h.calls
+        .filter((call) => call.method === 'push')
+        .map((call) => (call.body as SyncPushRequest).mutations),
+    ).toEqual([[sent], [{ ...newer, baseVersion: 2 }]]);
+  });
+
+  it('retries the exact staged request after a lost response and rebases a newer edit', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const sent = mutation('op-sent', 'first edit');
+    const newer = mutation('op-newer', 'newest edit');
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica('c0'),
+      deviceId: lease.deviceId,
+      notes: { [noteId]: note(workspaceA, 'first edit') },
+      outbox: [sent],
+    });
+
+    let attempts = 0;
+    const h = harness(port, {
+      push: async (_lease, body) => {
+        attempts += 1;
+        if (attempts === 1) {
+          port.replicas.set(lease.ownerKey, {
+            ...port.replicas.get(lease.ownerKey)!,
+            notes: { [noteId]: note(workspaceA, 'newest edit') },
+            outbox: [newer],
+          });
+          // Model a committed server transaction whose response never reached the client.
+          throw new TypeError('response lost');
+        }
+        const applied = body.mutations[0]!;
+        return {
+          applied: [
+            {
+              opId: applied.opId,
+              note: note(workspaceA, applied.note.bodyMd, applied.baseVersion + 1),
+            },
+          ],
+          conflicts: [],
+        };
+      },
+    });
+
+    await h.sync();
+    expect(port.statuses.get(lease.ownerKey)).toBe('offline');
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toEqual([sent]);
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([newer]);
+
+    await h.sync();
+    const pushes = h.calls
+      .filter((call) => call.method === 'push')
+      .map((call) => (call.body as SyncPushRequest).mutations);
+    expect(pushes).toEqual([[sent], [sent], [{ ...newer, baseVersion: 2 }]]);
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toBeNull();
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([]);
+    expect(port.replicas.get(lease.ownerKey)?.notes[noteId]?.bodyMd).toBe('newest edit');
+    expect(port.replicas.get(lease.ownerKey)?.notes[noteId]?.version).toBe(3);
+  });
+
+  it('does not dispatch when durable request staging fails', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const sent = mutation('op-sent', 'must stay local');
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes: { [noteId]: note(workspaceA, 'must stay local') },
+      outbox: [sent],
+    });
+    const error = new Error('injected persistence failure');
+    error.name = 'StatePersistenceError';
+    port.nextUpdateError = error;
+    const h = harness(port);
+
+    await h.sync();
+
+    expect(h.calls).toEqual([]);
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toBeNull();
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([sent]);
+    expect(port.statuses.get(lease.ownerKey)).toBe('error');
+  });
+
+  it('reconfirms a memory-only staged request before dispatch after a concurrent edit', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const sent = mutation('op-sent', 'first edit');
+    const newer = mutation('op-newer', 'newest edit');
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica('c0'),
+      deviceId: lease.deviceId,
+      notes: { [noteId]: note(workspaceA, 'first edit') },
+      outbox: [sent],
+    });
+    const persistenceError = new Error('staging save failed after applying memory');
+    persistenceError.name = 'StatePersistenceError';
+    const confirmationError = new Error('memory-only batch is not durable');
+    confirmationError.name = 'StatePersistenceError';
+    const h = harness(port, {
+      push: async (_lease, body) => ({
+        applied: body.mutations.map((item) => ({
+          opId: item.opId,
+          note: note(workspaceA, item.note.bodyMd, item.baseVersion + 1),
+        })),
+        conflicts: [],
+      }),
+    });
+    port.nextAppliedUpdateError = persistenceError;
+    port.afterNextApply = () => {
+      port.replicas.set(lease.ownerKey, {
+        ...port.replicas.get(lease.ownerKey)!,
+        notes: { [noteId]: note(workspaceA, 'newest edit') },
+        outbox: [newer],
+      });
+      port.nextUpdateError = confirmationError;
+      void h.sync();
+    };
+
+    await h.sync();
+
+    expect(h.calls).toEqual([]);
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toEqual([sent]);
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([newer]);
+    expect(port.statuses.get(lease.ownerKey)).toBe('error');
+
+    await h.sync();
+
+    expect(
+      h.calls
+        .filter((call) => call.method === 'push')
+        .map((call) => (call.body as SyncPushRequest).mutations),
+    ).toEqual([[sent], [{ ...newer, baseVersion: 2 }]]);
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toBeNull();
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([]);
+    expect(port.replicas.get(lease.ownerKey)?.notes[noteId]?.bodyMd).toBe('newest edit');
+  });
+
+  it('drains more than one durable bounded chunk in one cycle and registers once', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const notes: ReplicaState['notes'] = {};
+    const queued = Array.from({ length: SYNC_PUSH_LIMIT + 1 }, (_, index) => {
+      const id = `33333333-3333-4333-8333-${(index + 1).toString(16).padStart(12, '0')}`;
+      notes[id] = { ...note(workspaceA, `body-${index}`), id };
+      return {
+        ...mutation(`op-${index}`, `body-${index}`),
+        note: { ...mutation(`op-${index}`, `body-${index}`).note, id },
+      };
+    });
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes,
+      outbox: queued,
+    });
+    const pendingAtDispatch: SyncMutation[][] = [];
+    const h = harness(port, {
+      push: async (_lease, body) => {
+        pendingAtDispatch.push(port.replicas.get(lease.ownerKey)!.pendingPush!);
+        return {
+          applied: body.mutations.map((item) => ({
+            opId: item.opId,
+            note: { ...notes[item.note.id]!, version: item.baseVersion + 1 },
+          })),
+          conflicts: [],
+        };
+      },
+    });
+
+    await h.sync();
+
+    const pushes = h.calls.filter((call) => call.method === 'push');
+    expect(pushes.map((call) => (call.body as SyncPushRequest).mutations)).toEqual([
+      queued.slice(0, SYNC_PUSH_LIMIT),
+      [queued.at(-1)],
+    ]);
+    expect(pendingAtDispatch).toEqual(
+      pushes.map((call) => (call.body as SyncPushRequest).mutations),
+    );
+    expect(h.calls.filter((call) => call.method === 'register')).toHaveLength(1);
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toBeNull();
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([]);
+  });
+
+  it('yields at the finite chunk ceiling and preserves the remainder for the next cycle', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const firstCycleCapacity = SYNC_PUSH_CHUNK_LIMIT * SYNC_PUSH_LIMIT;
+    const { notes, queued } = makeQueue(firstCycleCapacity + 1, 'op-ceiling');
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes,
+      outbox: queued,
+    });
+    const h = harness(port, { push: async (_lease, body) => appliedPush(body) });
+
+    await h.sync();
+
+    const firstCyclePushes = h.calls
+      .filter((call) => call.method === 'push')
+      .map((call) => call.body as SyncPushRequest);
+    expect(firstCyclePushes).toHaveLength(SYNC_PUSH_CHUNK_LIMIT);
+    expect(firstCyclePushes.flatMap((body) => body.mutations)).toEqual(
+      queued.slice(0, firstCycleCapacity),
+    );
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toBeNull();
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual(queued.slice(firstCycleCapacity));
+    expect(h.calls.filter((call) => call.method === 'register')).toHaveLength(1);
+
+    await h.sync();
+
+    expect(h.calls.filter((call) => call.method === 'push')).toHaveLength(
+      SYNC_PUSH_CHUNK_LIMIT + 1,
+    );
+    expect(h.calls.filter((call) => call.method === 'register')).toHaveLength(2);
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([]);
+  });
+
+  it('does not stage or send a second chunk when the first response is invalid', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const { notes, queued } = makeQueue(SYNC_PUSH_LIMIT + 1, 'op-invalid-response');
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes,
+      outbox: queued,
+    });
+    const h = harness(port, {
+      push: () => Promise.reject(new ApiResponseValidationError('/v1/sync/push')),
+    });
+
+    await h.sync();
+
+    const pushes = h.calls.filter((call) => call.method === 'push');
+    expect(pushes).toHaveLength(1);
+    expect((pushes[0]!.body as SyncPushRequest).mutations).toEqual(
+      queued.slice(0, SYNC_PUSH_LIMIT),
+    );
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toEqual(
+      queued.slice(0, SYNC_PUSH_LIMIT),
+    );
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual(queued);
+    expect(port.replicas.get(lease.ownerKey)?.syncIssue).toMatchObject({
+      code: 'invalid_sync_response',
+      recoveryKind: 'retry',
+    });
+    expect(h.calls.some((call) => call.method === 'changes')).toBe(false);
+  });
+
+  it('does not stage or send a second chunk when the first response commit fails', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const { notes, queued } = makeQueue(SYNC_PUSH_LIMIT + 1, 'op-commit-failure');
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes,
+      outbox: queued,
+    });
+    const persistenceError = new Error('first push response was not saved');
+    persistenceError.name = 'StatePersistenceError';
+    const h = harness(port, {
+      push: async (_lease, body) => {
+        port.nextUpdateError = persistenceError;
+        return appliedPush(body);
+      },
+    });
+
+    await h.sync();
+
+    expect(h.calls.filter((call) => call.method === 'push')).toHaveLength(1);
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toEqual(
+      queued.slice(0, SYNC_PUSH_LIMIT),
+    );
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual(queued);
+    expect(port.replicas.get(lease.ownerKey)?.syncIssue).toBeNull();
+    expect(port.statuses.get(lease.ownerKey)).toBe('error');
+    expect(h.calls.some((call) => call.method === 'changes')).toBe(false);
+  });
+
+  it('preserves and drains a newer edit queued while the first chunk is in flight', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const { notes, queued } = makeQueue(SYNC_PUSH_LIMIT + 1, 'op-in-flight');
+    const firstNoteId = queued[0]!.note.id;
+    const newer = {
+      ...mutation('op-newer-between-chunks', 'newest edit'),
+      note: { ...mutation('op-newer-between-chunks', 'newest edit').note, id: firstNoteId },
+    };
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes,
+      outbox: queued,
+    });
+    let pushCount = 0;
+    const h = harness(port, {
+      push: async (_lease, body) => {
+        pushCount += 1;
+        expect(port.replicas.get(lease.ownerKey)?.pendingPush).toEqual(body.mutations);
+        if (pushCount === 1) {
+          const current = port.replicas.get(lease.ownerKey)!;
+          port.replicas.set(lease.ownerKey, {
+            ...current,
+            notes: {
+              ...current.notes,
+              [firstNoteId]: { ...note(workspaceA, 'newest edit'), id: firstNoteId },
+            },
+            outbox: [...current.outbox.filter((item) => item.note.id !== firstNoteId), newer],
+          });
+        }
+        return appliedPush(body);
+      },
+    });
+
+    await h.sync();
+
+    const pushes = h.calls
+      .filter((call) => call.method === 'push')
+      .map((call) => (call.body as SyncPushRequest).mutations);
+    expect(pushes).toEqual([
+      queued.slice(0, SYNC_PUSH_LIMIT),
+      [queued.at(-1), { ...newer, baseVersion: 2 }],
+    ]);
+    expect(port.replicas.get(lease.ownerKey)?.notes[firstNoteId]).toMatchObject({
+      bodyMd: 'newest edit',
+      version: 3,
+    });
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([]);
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toBeNull();
+    expect(h.calls.filter((call) => call.method === 'register')).toHaveLength(1);
+  });
+
+  it('stages the count cap while measuring multibyte request bytes exactly', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const notes: ReplicaState['notes'] = {};
+    const bodyMd = 'é'.repeat(100_000);
+    const queued = Array.from({ length: 10 }, (_, index) => {
+      const id = `33333333-3333-4333-8333-${(index + 1).toString(16).padStart(12, '0')}`;
+      const item = {
+        ...mutation(`op-byte-${index}`, bodyMd),
+        note: { ...mutation(`op-byte-${index}`, bodyMd).note, id },
+      };
+      notes[id] = { ...note(workspaceA, bodyMd), id };
+      return item;
+    });
+    const expected: SyncMutation[] = [];
+    for (const item of queued) {
+      if (expected.length >= SYNC_PUSH_LIMIT) break;
+      const candidate = { deviceId: lease.deviceId, mutations: [...expected, item] };
+      if (syncPushRequestByteLength(candidate) > SYNC_PUSH_MAX_BYTES) break;
+      expected.push(item);
+    }
+    expect(expected).toHaveLength(SYNC_PUSH_LIMIT);
+    expect(expected.length).toBeLessThan(queued.length);
+    expect(
+      syncPushRequestByteLength({ deviceId: lease.deviceId, mutations: [queued[0]!] }),
+    ).toBeGreaterThan(bodyMd.length);
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes,
+      outbox: queued,
+    });
+    const h = harness(port, {
+      push: async (_lease, body) => ({
+        applied: body.mutations.map((item) => ({
+          opId: item.opId,
+          note: { ...notes[item.note.id]!, version: item.baseVersion + 1 },
+        })),
+        conflicts: [],
+      }),
+    });
+
+    await h.sync();
+
+    const pushes = h.calls
+      .filter((call) => call.method === 'push')
+      .map((call) => call.body as SyncPushRequest);
+    const first = pushes[0]!;
+    expect(first.mutations).toEqual(expected);
+    for (const request of pushes) {
+      expect(request.mutations.length).toBeLessThanOrEqual(SYNC_PUSH_LIMIT);
+      expect(syncPushRequestByteLength(request)).toBeLessThanOrEqual(SYNC_PUSH_MAX_BYTES);
+    }
+    const nextCandidate = {
+      deviceId: lease.deviceId,
+      mutations: [...first.mutations, queued[first.mutations.length]!],
+    };
+    expect(nextCandidate.mutations.length).toBeGreaterThan(SYNC_PUSH_LIMIT);
+    expect(syncPushRequestByteLength(nextCandidate)).toBeLessThanOrEqual(SYNC_PUSH_MAX_BYTES);
+    expect(pushes.flatMap((request) => request.mutations)).toEqual(queued);
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([]);
+  });
+
+  it('creates a terminal restage issue for one oversized mutation without dispatching', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const bodyMd = '🪻'.repeat(Math.ceil(SYNC_PUSH_MAX_BYTES / 4));
+    const oversized = mutation('op-oversized', bodyMd);
+    expect(
+      syncPushRequestByteLength({ deviceId: lease.deviceId, mutations: [oversized] }),
+    ).toBeGreaterThan(SYNC_PUSH_MAX_BYTES);
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes: { [noteId]: note(workspaceA, bodyMd) },
+      outbox: [oversized],
+    });
+    const h = harness(port);
+
+    await h.sync();
+
+    expect(h.calls).toEqual([]);
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([oversized]);
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toBeNull();
+    expect(port.replicas.get(lease.ownerKey)?.syncIssue).toMatchObject({
+      code: 'sync_mutation_too_large',
+      affectedOpIds: ['op-oversized'],
+      recoveryKind: 'restage',
+    });
+  });
+
+  it('fails loud before dispatch when a local mutation violates the wire contract', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const invalidId = 'not-a-uuid';
+    const invalid = {
+      ...mutation('op-invalid', 'kept locally'),
+      note: { ...mutation('op-invalid', 'kept locally').note, id: invalidId },
+    };
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes: { [invalidId]: { ...note(workspaceA, 'kept locally'), id: invalidId } },
+      outbox: [invalid],
+    });
+    const h = harness(port);
+
+    await h.sync();
+
+    expect(h.calls).toEqual([]);
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toBeNull();
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([invalid]);
+    expect(port.replicas.get(lease.ownerKey)?.syncIssue).toMatchObject({
+      code: 'invalid_local_sync_mutation',
+      affectedOpIds: ['op-invalid'],
+      recoveryKind: 'restage',
+    });
+    expect(port.statuses.get(lease.ownerKey)).toBe('error');
+  });
+
+  it('retains the staged request and fails loud on idempotency-key reuse', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const sent = mutation('op-reused', 'bound payload');
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes: { [noteId]: note(workspaceA, 'bound payload') },
+      outbox: [sent],
+    });
+    const h = harness(port, {
+      push: () =>
+        Promise.reject(
+          new ApiRequestError(
+            409,
+            'idempotency_key_reused',
+            'Operation id was already bound',
+            undefined,
+            sent.opId,
+          ),
+        ),
+    });
+
+    await h.sync();
+
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toEqual([sent]);
+    expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([sent]);
+    expect(port.replicas.get(lease.ownerKey)?.syncIssue).toMatchObject({
+      code: 'idempotency_key_reused',
+      affectedOpIds: [sent.opId],
+      recoveryKind: 'rekey',
+    });
+    expect(port.statuses.get(lease.ownerKey)).toBe('error');
+
+    const callCount = h.calls.length;
+    await h.sync();
+    expect(h.calls).toHaveLength(callCount);
   });
 
   it('discards a delayed A push after sign-out and makes no later request', async () => {
@@ -248,6 +806,7 @@ describe('session-bound sync coordinator', () => {
 
     expect(port.current).toBeNull();
     expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([sent]);
+    expect(port.replicas.get(lease.ownerKey)?.pendingPush).toEqual([sent]);
     expect(h.calls.filter((call) => call.method === 'changes')).toHaveLength(0);
     expect(new Set(h.calls.map((call) => call.token))).toEqual(new Set(['token-A']));
   });
@@ -402,6 +961,7 @@ describe('session-bound sync coordinator', () => {
       deviceId: leaseA.deviceId,
       notes: { [noteId]: note(workspaceA, 'A private draft') },
       outbox: [opA],
+      pendingPush: [opA],
     });
     const leaseB = port.adopt('B');
     port.replicas.set(leaseB.ownerKey, { ...emptyReplica('b0'), deviceId: leaseB.deviceId });
@@ -469,6 +1029,10 @@ describe('session-bound sync coordinator', () => {
 
     expect(port.replicas.get(lease.ownerKey)?.notes).toEqual({});
     expect(port.replicas.get(lease.ownerKey)?.syncCursor).toBe('b0');
+    expect(port.replicas.get(lease.ownerKey)?.syncIssue).toMatchObject({
+      code: 'sync_workspace_mismatch',
+      recoveryKind: 'retry',
+    });
     expect(port.statuses.get(lease.ownerKey)).toBe('error');
   });
 
@@ -488,7 +1052,47 @@ describe('session-bound sync coordinator', () => {
     await h.sync();
 
     expect(port.replicas.get(lease.ownerKey)?.notes).toEqual({});
+    expect(port.replicas.get(lease.ownerKey)?.syncIssue).toMatchObject({
+      code: 'sync_protocol_error',
+      recoveryKind: 'retry',
+    });
     expect(port.statuses.get(lease.ownerKey)).toBe('error');
+  });
+
+  it('persists malformed successful responses and invalid cursors with actionable recovery', async () => {
+    const responsePort = new MemoryPort();
+    const responseLease = responsePort.adopt('A');
+    const malformed = harness(responsePort, {
+      changes: () => Promise.reject(new ApiResponseValidationError('/v1/sync/changes')),
+    });
+
+    await malformed.sync();
+    expect(responsePort.replicas.get(responseLease.ownerKey)?.syncIssue).toMatchObject({
+      code: 'invalid_sync_response',
+      recoveryKind: 'retry',
+    });
+    const heldCallCount = malformed.calls.length;
+    await malformed.sync();
+    expect(malformed.calls).toHaveLength(heldCallCount);
+
+    const cursorPort = new MemoryPort();
+    const cursorLease = cursorPort.adopt('A');
+    cursorPort.replicas.set(cursorLease.ownerKey, {
+      ...emptyReplica('bad-cursor'),
+      deviceId: cursorLease.deviceId,
+    });
+    const invalidCursor = harness(cursorPort, {
+      changes: () =>
+        Promise.reject(new ApiRequestError(400, 'invalid_sync_cursor', 'Cursor is invalid')),
+    });
+
+    await invalidCursor.sync();
+    expect(cursorPort.replicas.get(cursorLease.ownerKey)?.syncCursor).toBe('bad-cursor');
+    expect(cursorPort.replicas.get(cursorLease.ownerKey)?.syncIssue).toMatchObject({
+      code: 'invalid_sync_cursor',
+      affectedOpIds: [],
+      recoveryKind: 'reset-cursor',
+    });
   });
 
   it('keeps billing, network, and authentication failures distinct', async () => {
@@ -511,5 +1115,26 @@ describe('session-bound sync coordinator', () => {
     expect(offlinePort.current?.ownerKey).toBe(offlineLease.ownerKey);
     expect(offlinePort.statuses.get(offlineLease.ownerKey)).toBe('offline');
     expect(offlinePort.expired).toEqual([]);
+  });
+
+  it('leaves transient client errors retryable without creating a durable hold', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    let attempts = 0;
+    const h = harness(port, {
+      register: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new ApiRequestError(429, 'rate_limited', 'Try again');
+        return { activeDevices: 1 };
+      },
+    });
+
+    await h.sync();
+    expect(port.statuses.get(lease.ownerKey)).toBe('offline');
+    expect(port.replicas.get(lease.ownerKey)?.syncIssue).toBeNull();
+
+    await h.sync();
+    expect(attempts).toBe(2);
+    expect(port.statuses.get(lease.ownerKey)).toBe('idle');
   });
 });

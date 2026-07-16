@@ -33,14 +33,56 @@ export type ActivityAction = z.infer<typeof ActivityAction>;
 export const Plan = z.enum(['free', 'sync']);
 export type Plan = z.infer<typeof Plan>;
 
-export const SubscriptionStatus = z.enum([
-  'none',
-  'trialing',
-  'active',
-  'past_due',
-  'canceled',
-]);
+export const SubscriptionStatus = z.enum(['none', 'trialing', 'active', 'past_due', 'canceled']);
 export type SubscriptionStatus = z.infer<typeof SubscriptionStatus>;
+
+/** Canonical hyphenated UUID shape, without RFC version/variant-bit restrictions. */
+export const PostgresUuid = z.guid();
+export type PostgresUuid = z.infer<typeof PostgresUuid>;
+
+/**
+ * Product-level transport bounds. Markdown remains the canonical stored format, but a
+ * single note must fit comfortably inside the mobile sync request/response envelope.
+ * Attachments and genuinely large documents belong in the object-storage seam rather
+ * than an unbounded JSON transaction.
+ */
+export const MAX_NOTE_BODY_BYTES = 256 * 1024;
+export const SYNC_HTTP_BODY_LIMIT_BYTES = 2 * 1024 * 1024;
+export const SYNC_PUSH_MAX_BYTES = 1_900_000;
+export const SYNC_PUSH_RESPONSE_MAX_BYTES = 1_900_000;
+/**
+ * Six worst-case bounded notes—including JSON escaping, metadata, and operation ids—
+ * fit inside the push response envelope. Generic paged envelopes can raise this later.
+ */
+export const SYNC_PUSH_LIMIT = 6;
+export const SYNC_PULL_PAGE_LIMIT = 50;
+export const SYNC_PULL_PAGE_MAX_BYTES = 1 * 1024 * 1024;
+
+/** UTF-8 byte length without relying on a platform-specific TextEncoder polyfill. */
+export function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (const character of value) {
+    const point = character.codePointAt(0)!;
+    bytes += point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+  }
+  return bytes;
+}
+
+/** Serialized JSON-string content bytes, excluding the surrounding quote characters. */
+export function jsonEncodedStringByteLength(value: string): number {
+  return utf8ByteLength(JSON.stringify(value)) - 2;
+}
+
+const PostgreSqlText = z.string().refine((value) => !value.includes('\u0000'), {
+  message: 'Text cannot contain NUL characters',
+});
+const NoteTitleInput = PostgreSqlText.pipe(z.string().max(500));
+const NoteBodyInput = PostgreSqlText.refine(
+  (value) => jsonEncodedStringByteLength(value) <= MAX_NOTE_BODY_BYTES,
+  `Markdown body must be at most ${MAX_NOTE_BODY_BYTES} JSON-encoded UTF-8 bytes`,
+);
+const NoteFolderInput = PostgreSqlText.pipe(z.string().max(500));
+const NoteTagsInput = z.array(PostgreSqlText.pipe(z.string().min(1).max(80))).max(50);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Entities
@@ -174,20 +216,20 @@ export type AuthResponse = z.infer<typeof AuthResponse>;
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const CreateNoteRequest = z.object({
-  title: z.string().max(500).default(''),
-  bodyMd: z.string().default(''),
-  folder: z.string().max(500).nullish(),
-  tags: z.array(z.string().min(1).max(80)).max(50).default([]),
+  title: NoteTitleInput.default(''),
+  bodyMd: NoteBodyInput.default(''),
+  folder: NoteFolderInput.nullish(),
+  tags: NoteTagsInput.default([]),
   /** Optional client-supplied id so local-first creates keep a stable identity. */
-  id: z.string().optional(),
+  id: PostgresUuid.optional(),
 });
 export type CreateNoteRequest = z.infer<typeof CreateNoteRequest>;
 
 export const UpdateNoteRequest = z.object({
-  title: z.string().max(500).optional(),
-  bodyMd: z.string().optional(),
-  folder: z.string().max(500).nullish(),
-  tags: z.array(z.string().min(1).max(80)).max(50).optional(),
+  title: NoteTitleInput.optional(),
+  bodyMd: NoteBodyInput.optional(),
+  folder: NoteFolderInput.nullish(),
+  tags: NoteTagsInput.optional(),
   /**
    * The version the edit was based on. If it doesn't match the server's current
    * version, the update is a conflict (HTTP 409) and is surfaced, never dropped.
@@ -283,35 +325,87 @@ export type UndoResponse = z.infer<typeof UndoResponse>;
 // Sync (local-first change-feed; see ADR-005)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Opaque monotonic cursor; the client stores it and passes it back to pull deltas. */
+export const SyncChangesRequest = z.object({
+  since: z.string().max(200).default(''),
+  deviceId: PostgreSqlText.pipe(z.string().min(1).max(200)).default('default'),
+});
+export type SyncChangesRequest = z.infer<typeof SyncChangesRequest>;
+
+/** Opaque database-monotonic cursor; clients must store and return it without parsing. */
 export const SyncChangesResponse = z.object({
-  changes: z.array(Note),
-  cursor: z.string(),
+  changes: z.array(Note).max(SYNC_PULL_PAGE_LIMIT),
+  cursor: z.string().max(200),
   hasMore: z.boolean(),
 });
 export type SyncChangesResponse = z.infer<typeof SyncChangesResponse>;
 
 export const SyncMutation = z.object({
-  /** Client-generated idempotency key so retries don't double-apply. */
-  opId: z.string(),
+  /** Durable idempotency key; one key is permanently bound to one actor/device/payload. */
+  opId: PostgreSqlText.pipe(z.string().min(1).max(200)),
   type: z.enum(['upsert', 'delete']),
   note: z.object({
-    id: z.string(),
-    title: z.string(),
-    bodyMd: z.string(),
-    folder: z.string().nullable(),
-    tags: z.array(z.string()).default([]),
+    id: PostgresUuid,
+    title: NoteTitleInput,
+    bodyMd: NoteBodyInput,
+    folder: NoteFolderInput.nullable(),
+    tags: NoteTagsInput.default([]),
   }),
   /** The version this mutation was derived from (0 for a brand-new note). */
   baseVersion: z.number().int().nonnegative(),
 });
 export type SyncMutation = z.infer<typeof SyncMutation>;
 
-export const SyncPushRequest = z.object({
-  deviceId: z.string(),
-  mutations: z.array(SyncMutation),
-});
+function validateUniqueOperationIds(
+  request: { mutations: SyncMutation[] },
+  ctx: z.RefinementCtx,
+): void {
+  const seen = new Set<string>();
+  request.mutations.forEach((mutation, index) => {
+    if (seen.has(mutation.opId)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['mutations', index, 'opId'],
+        message: 'opId values must be unique within a push request',
+      });
+    }
+    seen.add(mutation.opId);
+  });
+}
+
+export function syncPushRequestByteLength(request: {
+  deviceId: string;
+  mutations: SyncMutation[];
+}): number {
+  return utf8ByteLength(JSON.stringify(request));
+}
+
+function validatePushByteEnvelope(
+  request: { deviceId: string; mutations: SyncMutation[] },
+  ctx: z.RefinementCtx,
+): void {
+  if (syncPushRequestByteLength(request) > SYNC_PUSH_MAX_BYTES) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['mutations'],
+      message: `Serialized sync request must be at most ${SYNC_PUSH_MAX_BYTES} UTF-8 bytes`,
+    });
+  }
+}
+
+export const SyncPushRequest = z
+  .object({
+    deviceId: PostgreSqlText.pipe(z.string().min(1).max(200)),
+    mutations: z.array(SyncMutation).max(SYNC_PUSH_LIMIT),
+  })
+  .superRefine((request, ctx) => {
+    validateUniqueOperationIds(request, ctx);
+    validatePushByteEnvelope(request, ctx);
+  });
 export type SyncPushRequest = z.infer<typeof SyncPushRequest>;
+
+/** Alias naming the exact request snapshot current clients persist before dispatch. */
+export const SyncPushChunkRequest = SyncPushRequest;
+export type SyncPushChunkRequest = z.infer<typeof SyncPushChunkRequest>;
 
 export const SyncConflict = z.object({
   opId: z.string(),
@@ -321,9 +415,12 @@ export const SyncConflict = z.object({
 });
 export type SyncConflict = z.infer<typeof SyncConflict>;
 
+export const SyncApplied = z.object({ opId: z.string(), note: Note.optional() });
+export type SyncApplied = z.infer<typeof SyncApplied>;
+
 export const SyncPushResponse = z.object({
   // `note` is absent only for an idempotent delete of a note that never existed here.
-  applied: z.array(z.object({ opId: z.string(), note: Note.optional() })),
+  applied: z.array(SyncApplied),
   conflicts: z.array(SyncConflict),
 });
 export type SyncPushResponse = z.infer<typeof SyncPushResponse>;
@@ -333,9 +430,9 @@ export type SyncPushResponse = z.infer<typeof SyncPushResponse>;
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const RegisterDeviceRequest = z.object({
-  id: z.string(),
-  name: z.string().max(200).default('Unnamed device'),
-  platform: z.string().max(50).default('unknown'),
+  id: PostgreSqlText.pipe(z.string().min(1).max(200)),
+  name: PostgreSqlText.pipe(z.string().max(200)).default('Unnamed device'),
+  platform: PostgreSqlText.pipe(z.string().max(50)).default('unknown'),
 });
 export type RegisterDeviceRequest = z.infer<typeof RegisterDeviceRequest>;
 
@@ -354,8 +451,10 @@ export const ApiError = z.object({
   error: z.object({
     code: z.string(),
     message: z.string(),
-    /** Present on 409 conflicts: the server state to reconcile against. */
+    /** Present only for a single-note `version_conflict`. */
     conflict: Note.optional(),
+    /** Present when a sync idempotency collision names the bound operation. */
+    operationId: z.string().optional(),
   }),
 });
 export type ApiError = z.infer<typeof ApiError>;

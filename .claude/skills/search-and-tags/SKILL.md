@@ -12,9 +12,9 @@ extending the FTS (snippets, weights, combined tag+query filters).
 ## Mental model
 
 Two additive features on the existing note spine (ADR-010). **Tags** are a `jsonb`
-string array that lives *on the note* (and on every version snapshot), so they sync,
+string array that lives _on the note_ (and on every version snapshot), so they sync,
 export, and version for free — no join table. **Search** is Postgres FTS over a
-*generated, stored* `tsvector` column with a GIN index, ranked by `ts_rank`. Both are
+_generated, stored_ `tsvector` column with a GIN index, ranked by `ts_rank`. Both are
 workspace-scoped and skip tombstones like every other read. PGlite runs the identical
 FTS, so both are fully tested in-repo.
 
@@ -29,7 +29,8 @@ FTS, so both are fully tested in-repo.
 - `apps/api/src/services/notes.ts` — `normalizeTags` (trim/lowercase/de-dupe) at the
   service boundary; `listNotes(ctx, tag?)` uses the jsonb `?` operator to filter.
 - `apps/api/src/services/note-write.ts` — the version snapshot copies `note.tags`, so
-  restore/undo carry tags with the rest of the note.
+  direct version restore can carry tags forward. Activity undo does not yet restore
+  tags, and snapshots do not yet carry folders; ROADMAP tracks that correctness slice.
 - `packages/shared/src/schemas.ts` — `tags` on `Note`/`NoteVersion`/`Create`/`Update`/
   `SyncMutation`; `TagSummary`/`TagListResponse`/`SearchHit`/`SearchResponse`.
 - `apps/api/src/app.ts` — routes `GET /v1/notes/search`, `GET /v1/tags`, and `?tag=` on
@@ -47,12 +48,11 @@ FTS, so both are fully tested in-repo.
 2. **Tags travel with the note.** If you add a place notes are written (a new mutation
    path), pass `normalizeTags(input.tags)` into the insert/update **and** rely on
    `recordVersionAndActivity` to snapshot them — don't hand-roll a second snapshot.
-3. **Filtering by tag** = `sql\`${notes.tags} ? ${tag}\`` in the `where` (jsonb membership,
-   GIN-indexed). Aggregate counts either in-process (`listTags`) or via
-   `jsonb_array_elements_text` if you need it in SQL.
+3. **Filtering by tag** = `sql\`${notes.tags} ? ${tag}\``in the`where` (jsonb membership,
+GIN-indexed). Aggregate counts either in-process (`listTags`) or via
+`jsonb_array_elements_text` if you need it in SQL.
 4. **Search** = reference the generated column by raw name in a Drizzle select:
-   `sql\`search_vector @@ plainto_tsquery('english', ${term})\`` and rank with
-   `ts_rank(search_vector, …)`. Short-circuit empty queries to `[]`.
+   `sql\`search_vector @@ plainto_tsquery('english', ${term})\``and rank with`ts_rank(search_vector, …)`. Short-circuit empty queries to `[]`.
 5. **Test it** against PGlite (`makeApp`/`call`) exactly like `search-tags.test.ts` —
    including a workspace-isolation case.
 
@@ -64,8 +64,10 @@ FTS, so both are fully tested in-repo.
   Drizzle can't map).
 - **Normalize tags once, at the service boundary.** `normalizeTags` lowercases/de-dupes, so
   the DB only ever holds canonical tags — filters and counts assume that.
-- **Tags are versioned.** Any change to how tags are stored must also update the
-  `note_versions.tags` snapshot path, or restore/undo will silently drop tags.
+- **Tags are versioned, but reversibility is not yet complete.** Direct restore reads
+  `note_versions.tags`; activity undo currently restores only title/body/deleted state,
+  and `note_versions` has no folder snapshot. Keep the ROADMAP correctness slice open
+  until both restore paths cover folders and tags with tests.
 - **Route order:** if you add more `/v1/notes/...` static routes, they must stay ahead of
   `/:id` (Fastify handles static-before-param, but keep them grouped to avoid confusion).
 - **Scale caveats (documented, not bugs):** `listTags` aggregates in memory and search is

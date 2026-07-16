@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiRequestError, ApiResponseValidationError } from '@iris/shared';
 
 const memory = vi.hoisted(() => ({ values: new Map<string, string>() }));
 vi.mock('expo-constants', () => ({ default: { expoConfig: null } }));
@@ -100,5 +101,103 @@ describe('fixed-token authenticated API boundary', () => {
     });
     expect(store$.session.get()).toBeNull();
     expect(store$.status.get()).toBe('auth-required');
+  });
+});
+
+describe('API error classification', () => {
+  it('does not confuse an idempotency collision with a note version conflict', () => {
+    const version = new ApiRequestError(409, 'version_conflict', 'stale note');
+    const idempotency = new ApiRequestError(
+      409,
+      'idempotency_key_reused',
+      'operation id already bound',
+    );
+
+    expect(version.isConflict).toBe(true);
+    expect(version.isIdempotencyKeyReused).toBe(false);
+    expect(idempotency.isConflict).toBe(false);
+    expect(idempotency.isIdempotencyKeyReused).toBe(true);
+  });
+
+  it('retains the operation id named by a sync error envelope', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: {
+            code: 'idempotency_key_reused',
+            message: 'operation id already bound',
+            operationId: 'op-collision',
+          },
+        }),
+        { status: 409 },
+      ),
+    );
+
+    await expect(
+      apiForLease(openSessionLease()!).syncPush({
+        deviceId: store$.deviceId.get(),
+        mutations: [],
+      }),
+    ).rejects.toMatchObject({
+      code: 'idempotency_key_reused',
+      operationId: 'op-collision',
+    });
+  });
+
+  it('preserves a non-2xx status even when its error body is malformed', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('<html>bad request</html>', { status: 400 }),
+    );
+
+    await expect(
+      apiForLease(openSessionLease()!).syncChanges('', store$.deviceId.get()),
+    ).rejects.toMatchObject({
+      status: 400,
+      code: 'unknown',
+    });
+  });
+});
+
+describe('successful sync response validation', () => {
+  it('rejects a malformed push payload with the dedicated response error', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ applied: 'not-an-array', conflicts: [] }), { status: 200 }),
+    );
+
+    await expect(
+      apiForLease(openSessionLease()!).syncPush({
+        deviceId: store$.deviceId.get(),
+        mutations: [],
+      }),
+    ).rejects.toBeInstanceOf(ApiResponseValidationError);
+  });
+
+  it('rejects a malformed changes payload with the dedicated response error', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ changes: [], cursor: 42, hasMore: false }), { status: 200 }),
+    );
+
+    await expect(
+      apiForLease(openSessionLease()!).syncChanges('', store$.deviceId.get()),
+    ).rejects.toBeInstanceOf(ApiResponseValidationError);
+  });
+
+  it('classifies invalid JSON on a successful sync response the same way', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{broken', { status: 200 }));
+
+    await expect(
+      apiForLease(openSessionLease()!).syncChanges('', store$.deviceId.get()),
+    ).rejects.toBeInstanceOf(ApiResponseValidationError);
+  });
+
+  it('does not let a bodyless 2xx response bypass the sync schema', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+
+    await expect(
+      apiForLease(openSessionLease()!).syncPush({
+        deviceId: store$.deviceId.get(),
+        mutations: [],
+      }),
+    ).rejects.toBeInstanceOf(ApiResponseValidationError);
   });
 });

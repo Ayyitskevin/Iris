@@ -1,49 +1,95 @@
 /**
- * Sync change-feed (ADR-005). Pull deltas since a cursor; push local mutations with the
- * `base_version` each was derived from. A mismatch is a CONFLICT — surfaced with the
- * authoritative server note, never silently overwritten. All work runs in the request's
- * tenant transaction (runTenant), so a batch is atomic and workspace-scoped.
+ * Sync v2 change-feed (ADR-005/ADR-011). Pull deltas by database-monotonic cursor;
+ * push local mutations with the `base_version` each was derived from. Every operation
+ * id is durably bound to its actor, device, and exact payload in the same tenant
+ * transaction as its result, so a lost response can be replayed without double-apply.
  */
-import { and, asc, eq, sql } from 'drizzle-orm';
-import type {
-  Note,
-  SyncChangesResponse,
-  SyncConflict,
-  SyncMutation,
-  SyncPushResponse,
+import { createHash } from 'node:crypto';
+import { and, asc, eq, gt, sql } from 'drizzle-orm';
+import { z } from 'zod';
+import {
+  PostgresUuid,
+  SYNC_PULL_PAGE_LIMIT,
+  SYNC_PULL_PAGE_MAX_BYTES,
+  utf8ByteLength,
+  type SyncChangesResponse,
+  type SyncMutation,
+  type SyncPushResponse,
 } from '@iris/shared';
-import { notes } from '../db/schema';
-import type { NoteRow } from '../db/schema';
+import { notes, syncIdempotency, workspaceSyncCursors, type NoteRow } from '../db/schema';
 import type { Ctx } from '../context';
+import { badRequest, idempotencyKeyReused } from '../lib/errors';
 import { serializeNote } from '../serialize';
 import { loadNote, recordVersionAndActivity } from './note-write';
 import { requireRegisteredDevice } from './devices';
 import { normalizeTags } from './notes';
 
-const PAGE = 500;
+const CURRENT_RECEIPT_VERSION = 1;
+const PULL_ENVELOPE_OVERHEAD_BYTES = 512;
 
-/** Result of applying one mutation: either it landed, or it conflicted. */
+// Receipt V1 is intentionally frozen instead of importing mutable current wire schemas.
+const StoredNoteV1 = z.object({
+  id: z.string(),
+  workspaceId: z.string(),
+  title: z.string(),
+  bodyMd: z.string(),
+  folder: z.string().nullable(),
+  tags: z.array(z.string()),
+  version: z.number().int().nonnegative(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  deletedAt: z.string().nullable(),
+});
+const StoredApplyResultV1 = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('applied'),
+    item: z.object({ opId: z.string(), note: StoredNoteV1.optional() }),
+  }),
+  z.object({
+    kind: z.literal('conflict'),
+    item: z.object({
+      opId: z.string(),
+      reason: z.literal('version_mismatch'),
+      serverNote: StoredNoteV1,
+    }),
+  }),
+]);
 type ApplyResult =
-  | { kind: 'applied'; item: { opId: string; note?: Note } }
-  | { kind: 'conflict'; item: SyncConflict };
+  | { kind: 'applied'; item: SyncPushResponse['applied'][number] }
+  | { kind: 'conflict'; item: SyncPushResponse['conflicts'][number] };
 
-function encodeCursor(row: NoteRow): string {
-  return `${row.updatedAt.toISOString()}|${row.id}`;
+function encodeCursor(workspaceId: string, sequence: bigint): string {
+  return `v2:${workspaceId}:${sequence}`;
 }
 
-// Nil UUID sorts before every real id — the genesis lower bound for the (time, id) cursor.
-const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+const V2_BOUND_CURSOR = /^v2:([^:]+):(0|[1-9][0-9]*)$/;
+const V2_UNBOUND_CURSOR = /^v2:(0|[1-9][0-9]*)$/;
+const LEGACY_CURSOR =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function decodeCursor(cursor: string): { time: Date; id: string } {
-  if (!cursor || cursor === 'genesis') return { time: new Date(0), id: NIL_UUID };
-  const idx = cursor.lastIndexOf('|');
-  if (idx < 0) return { time: new Date(0), id: NIL_UUID };
-  return { time: new Date(cursor.slice(0, idx)), id: cursor.slice(idx + 1) };
+function decodeCursor(
+  cursor: string,
+  workspaceId: string,
+): { sequence: bigint; needsUpgrade: boolean } {
+  if (!cursor || cursor === 'genesis') return { sequence: 0n, needsUpgrade: true };
+  const bound = V2_BOUND_CURSOR.exec(cursor);
+  if (bound && PostgresUuid.safeParse(bound[1]).success) {
+    if (bound[1]!.toLowerCase() !== workspaceId.toLowerCase()) {
+      throw badRequest('Sync cursor belongs to another workspace', 'invalid_sync_cursor');
+    }
+    return { sequence: BigInt(bound[2]!), needsUpgrade: false };
+  }
+  // Legacy timestamp cursors and the short-lived draft unbound V2 cursor have no trusted
+  // workspace provenance. A safe full replay upgrades either form to a bound cursor.
+  if (V2_UNBOUND_CURSOR.test(cursor) || LEGACY_CURSOR.test(cursor)) {
+    return { sequence: 0n, needsUpgrade: true };
+  }
+  throw badRequest('Sync cursor is malformed', 'invalid_sync_cursor');
 }
 
 /**
- * Return notes (including tombstones) changed after `cursor`, ordered by (updated_at,
- * id) so the cursor is a stable, monotonic high-water mark.
+ * Return notes (including tombstones) changed after `cursor`, ordered by the sequence
+ * assigned while holding the workspace commit-serialization lock.
  */
 export async function syncChanges(
   ctx: Ctx,
@@ -52,28 +98,154 @@ export async function syncChanges(
 ): Promise<SyncChangesResponse> {
   // Pulling changes is syncing too — gate it on a registered device (ADR-007).
   await requireRegisteredDevice(ctx, deviceId);
-  const { time, id } = decodeCursor(cursor);
+  const decoded = decodeCursor(cursor, ctx.workspaceId);
+  const counterRows = await ctx.db
+    .select({ lastSeq: workspaceSyncCursors.lastSeq })
+    .from(workspaceSyncCursors)
+    .where(eq(workspaceSyncCursors.workspaceId, ctx.workspaceId));
+  const highWater = counterRows[0]?.lastSeq ?? 0n;
+  if (decoded.sequence > highWater) {
+    throw badRequest('Sync cursor is ahead of this workspace', 'invalid_sync_cursor');
+  }
 
   const rows = await ctx.db
     .select()
     .from(notes)
+    .where(and(eq(notes.workspaceId, ctx.workspaceId), gt(notes.syncSeq, decoded.sequence)))
+    .orderBy(asc(notes.syncSeq))
+    // One extra row is the hasMore sentinel. Byte-budgeting may stop earlier.
+    .limit(SYNC_PULL_PAGE_LIMIT + 1);
+
+  const changes: SyncChangesResponse['changes'] = [];
+  let responseBytes = PULL_ENVELOPE_OVERHEAD_BYTES;
+  for (const row of rows.slice(0, SYNC_PULL_PAGE_LIMIT)) {
+    const note = serializeNote(row);
+    const nextBytes =
+      responseBytes + utf8ByteLength(JSON.stringify(note)) + (changes.length === 0 ? 0 : 1);
+    // A single recognized legacy note is still returned losslessly even if it predates
+    // today's size bound. Every subsequent page remains byte-bounded.
+    if (changes.length > 0 && nextBytes > SYNC_PULL_PAGE_MAX_BYTES) break;
+    changes.push(note);
+    responseBytes = nextBytes;
+  }
+
+  const nextSequence =
+    rows[changes.length - 1]?.syncSeq ?? (decoded.needsUpgrade ? highWater : decoded.sequence);
+  return {
+    changes,
+    cursor: encodeCursor(ctx.workspaceId, nextSequence),
+    hasMore: rows[changes.length] !== undefined,
+  };
+}
+
+function requestFingerprintV1(ctx: Ctx, deviceId: string, mutation: SyncMutation): string {
+  // Construct the object explicitly so property ordering is deterministic across
+  // runtimes. opId is the receipt key; the fingerprint binds everything it names.
+  const canonical = JSON.stringify({
+    actorType: ctx.principal.type,
+    actorId: ctx.principal.id,
+    deviceId,
+    operation: {
+      type: mutation.type,
+      note: {
+        id: mutation.note.id,
+        title: mutation.note.title,
+        bodyMd: mutation.note.bodyMd,
+        folder: mutation.note.folder,
+        tags: mutation.note.tags,
+      },
+      baseVersion: mutation.baseVersion,
+    },
+  });
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+function requestFingerprint(
+  receiptVersion: number,
+  ctx: Ctx,
+  deviceId: string,
+  mutation: SyncMutation,
+): string {
+  if (receiptVersion === 1) return requestFingerprintV1(ctx, deviceId, mutation);
+  throw new Error(`Unsupported sync receipt version ${receiptVersion}`);
+}
+
+function parseStoredOutcome(receiptVersion: number, outcome: unknown): ApplyResult {
+  if (receiptVersion !== 1) {
+    throw new Error(`Unsupported sync receipt version ${receiptVersion}`);
+  }
+  const replay = StoredApplyResultV1.safeParse(outcome);
+  if (!replay.success) {
+    throw new Error('Stored sync idempotency outcome is incomplete or invalid');
+  }
+  return replay.data;
+}
+
+async function applyIdempotently(
+  ctx: Ctx,
+  deviceId: string,
+  mutation: SyncMutation,
+): Promise<ApplyResult> {
+  const fingerprint = requestFingerprint(CURRENT_RECEIPT_VERSION, ctx, deviceId, mutation);
+  const inserted = await ctx.db
+    .insert(syncIdempotency)
+    .values({
+      workspaceId: ctx.workspaceId,
+      opId: mutation.opId,
+      actorType: ctx.principal.type,
+      actorId: ctx.principal.id,
+      deviceId,
+      receiptVersion: CURRENT_RECEIPT_VERSION,
+      requestFingerprint: fingerprint,
+      outcome: null,
+    })
+    .onConflictDoNothing()
+    .returning({ opId: syncIdempotency.opId });
+
+  if (inserted.length === 0) {
+    const existing = await ctx.db
+      .select()
+      .from(syncIdempotency)
+      .where(
+        and(
+          eq(syncIdempotency.workspaceId, ctx.workspaceId),
+          eq(syncIdempotency.opId, mutation.opId),
+        ),
+      );
+    const receipt = existing[0];
+    if (
+      !receipt ||
+      receipt.actorType !== ctx.principal.type ||
+      receipt.actorId !== ctx.principal.id ||
+      receipt.deviceId !== deviceId
+    ) {
+      throw idempotencyKeyReused(mutation.opId);
+    }
+    const expectedFingerprint = requestFingerprint(receipt.receiptVersion, ctx, deviceId, mutation);
+    if (receipt.requestFingerprint !== expectedFingerprint) {
+      throw idempotencyKeyReused(mutation.opId);
+    }
+    return parseStoredOutcome(receipt.receiptVersion, receipt.outcome);
+  }
+
+  const result =
+    mutation.type === 'delete'
+      ? await applyDelete(ctx, mutation)
+      : await applyUpsert(ctx, mutation);
+  const recorded = await ctx.db
+    .update(syncIdempotency)
+    .set({ outcome: result })
     .where(
       and(
-        eq(notes.workspaceId, ctx.workspaceId),
-        // Row-value comparison: (updated_at, id) strictly after the cursor. Casts keep
-        // PGlite/Postgres from tripping over param types (timestamptz, uuid).
-        sql`(${notes.updatedAt}, ${notes.id}) > (${time.toISOString()}::timestamptz, ${id}::uuid)`,
+        eq(syncIdempotency.workspaceId, ctx.workspaceId),
+        eq(syncIdempotency.opId, mutation.opId),
+        eq(syncIdempotency.receiptVersion, CURRENT_RECEIPT_VERSION),
+        eq(syncIdempotency.requestFingerprint, fingerprint),
       ),
     )
-    .orderBy(asc(notes.updatedAt), asc(notes.id))
-    .limit(PAGE);
-
-  const nextCursor = rows.length > 0 ? encodeCursor(rows[rows.length - 1]!) : cursor;
-  return {
-    changes: rows.map(serializeNote),
-    cursor: nextCursor,
-    hasMore: rows.length === PAGE,
-  };
+    .returning({ opId: syncIdempotency.opId });
+  if (recorded.length !== 1) throw new Error('Could not finalize sync idempotency receipt');
+  return result;
 }
 
 function conflictResult(m: SyncMutation, existing: NoteRow): ApplyResult {
@@ -86,6 +258,12 @@ function conflictResult(m: SyncMutation, existing: NoteRow): ApplyResult {
 async function applyUpsert(ctx: Ctx, m: SyncMutation): Promise<ApplyResult> {
   const existing = await loadNote(ctx, m.note.id);
   if (!existing) {
+    if (m.baseVersion !== 0) {
+      throw badRequest(
+        'A missing note can only be created from baseVersion 0',
+        'invalid_sync_base_version',
+      );
+    }
     // A note created offline. Adopt the client's id.
     const inserted = await ctx.db
       .insert(notes)
@@ -98,8 +276,16 @@ async function applyUpsert(ctx: Ctx, m: SyncMutation): Promise<ApplyResult> {
         tags: normalizeTags(m.note.tags),
         version: 1,
       })
+      .onConflictDoNothing()
       .returning();
-    const note = inserted[0]!;
+    const note = inserted[0];
+    if (!note) {
+      // Another operation created this id after our read. Surface its committed head
+      // instead of leaking a duplicate-key 500 from a normal optimistic race.
+      const raced = await loadNote(ctx, m.note.id);
+      if (raced) return conflictResult(m, raced);
+      throw new Error('Concurrent note create did not expose an authoritative row');
+    }
     await recordVersionAndActivity(ctx, note, 'note.create');
     return { kind: 'applied', item: { opId: m.opId, note: serializeNote(note) } };
   }
@@ -117,9 +303,22 @@ async function applyUpsert(ctx: Ctx, m: SyncMutation): Promise<ApplyResult> {
       deletedAt: null,
       updatedAt: new Date(),
     })
-    .where(and(eq(notes.id, m.note.id), eq(notes.workspaceId, ctx.workspaceId)))
+    .where(
+      and(
+        eq(notes.id, m.note.id),
+        eq(notes.workspaceId, ctx.workspaceId),
+        eq(notes.version, existing.version),
+      ),
+    )
     .returning();
-  const note = updated[0]!;
+  const note = updated[0];
+  if (!note) {
+    // The workspace sequence trigger serializes commits, but the initial read happens
+    // before that statement trigger. The compare-and-swap predicate closes that gap.
+    const raced = await loadNote(ctx, m.note.id);
+    if (raced) return conflictResult(m, raced);
+    throw new Error('Concurrent note update removed its authoritative row');
+  }
   await recordVersionAndActivity(ctx, note, 'note.update');
   return { kind: 'applied', item: { opId: m.opId, note: serializeNote(note) } };
 }
@@ -139,9 +338,23 @@ async function applyDelete(ctx: Ctx, m: SyncMutation): Promise<ApplyResult> {
   const updated = await ctx.db
     .update(notes)
     .set({ deletedAt: new Date(), version: existing.version + 1, updatedAt: new Date() })
-    .where(and(eq(notes.id, m.note.id), eq(notes.workspaceId, ctx.workspaceId)))
+    .where(
+      and(
+        eq(notes.id, m.note.id),
+        eq(notes.workspaceId, ctx.workspaceId),
+        eq(notes.version, existing.version),
+      ),
+    )
     .returning();
-  const note = updated[0]!;
+  const note = updated[0];
+  if (!note) {
+    const raced = await loadNote(ctx, m.note.id);
+    if (!raced) return { kind: 'applied', item: { opId: m.opId } };
+    if (raced.deletedAt) {
+      return { kind: 'applied', item: { opId: m.opId, note: serializeNote(raced) } };
+    }
+    return conflictResult(m, raced);
+  }
   await recordVersionAndActivity(ctx, note, 'note.delete');
   return { kind: 'applied', item: { opId: m.opId, note: serializeNote(note) } };
 }
@@ -155,11 +368,24 @@ export async function syncPush(
   // billing limit is enforced (ADR-007). An unregistered device cannot push.
   await requireRegisteredDevice(ctx, deviceId);
 
+  if (mutations.length > 0) {
+    // All sync batches for a workspace take this row lock before touching operation
+    // receipts. The note trigger uses the same lock, so reversed op-id orders cannot
+    // form a receipt-row/workspace-row deadlock cycle.
+    await ctx.db
+      .insert(workspaceSyncCursors)
+      .values({ workspaceId: ctx.workspaceId, lastSeq: 0n })
+      .onConflictDoUpdate({
+        target: workspaceSyncCursors.workspaceId,
+        set: { lastSeq: sql`${workspaceSyncCursors.lastSeq}` },
+      });
+  }
+
   const applied: SyncPushResponse['applied'] = [];
   const conflicts: SyncPushResponse['conflicts'] = [];
 
   for (const m of mutations) {
-    const result = m.type === 'delete' ? await applyDelete(ctx, m) : await applyUpsert(ctx, m);
+    const result = await applyIdempotently(ctx, deviceId, m);
     if (result.kind === 'applied') applied.push(result.item);
     else conflicts.push(result.item);
   }

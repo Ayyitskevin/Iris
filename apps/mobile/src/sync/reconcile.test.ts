@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Note, SyncMutation, SyncPushResponse } from '@iris/shared';
-import { drainChangePages, reconcilePush } from './reconcile';
+import { drainChangePages, reconcilePush, SYNC_CHANGE_PAGE_LIMIT } from './reconcile';
 
 const detectedAt = '2026-07-15T12:00:00.000Z';
 
@@ -284,5 +284,45 @@ describe('pull pagination', () => {
       ),
     ).rejects.toThrow('without advancing');
     expect(applied).toEqual([]);
+  });
+
+  it('detects a cursor cycle before applying the repeated page', async () => {
+    const pages = new Map([
+      ['genesis', { changes: [], cursor: 'page-a', hasMore: true }],
+      ['page-a', { changes: [], cursor: 'page-b', hasMore: true }],
+      ['page-b', { changes: [], cursor: 'page-a', hasMore: true }],
+    ]);
+    const applied: string[] = [];
+
+    await expect(
+      drainChangePages(
+        'genesis',
+        async (cursor) => pages.get(cursor)!,
+        (page) => {
+          applied.push(page.cursor);
+        },
+      ),
+    ).rejects.toThrow('repeated an earlier cursor');
+    expect(applied).toEqual(['page-a', 'page-b']);
+  });
+
+  it('fails after a high but finite number of unique pages', async () => {
+    let fetched = 0;
+    let applied = 0;
+
+    await expect(
+      drainChangePages(
+        'genesis',
+        async () => {
+          fetched += 1;
+          return { changes: [], cursor: `page-${fetched}`, hasMore: true };
+        },
+        () => {
+          applied += 1;
+        },
+      ),
+    ).rejects.toThrow('exceeded its page limit');
+    expect(fetched).toBe(SYNC_CHANGE_PAGE_LIMIT);
+    expect(applied).toBe(SYNC_CHANGE_PAGE_LIMIT);
   });
 });

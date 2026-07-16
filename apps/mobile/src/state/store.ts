@@ -20,11 +20,27 @@ export interface Session {
 
 export type SyncStatus = 'idle' | 'syncing' | 'offline' | 'error' | 'auth-required';
 
+export type SyncIssueRecoveryKind = 'rekey' | 'reset-cursor' | 'restage' | 'retry';
+
+/**
+ * A durable, owner-local sync hold. The coordinator does no network work while one
+ * exists; only an explicit recovery action may clear or transform it.
+ */
+export interface SyncIssue {
+  code: string;
+  message: string;
+  affectedOpIds: string[];
+  recoveryKind: SyncIssueRecoveryKind;
+}
+
 export interface ReplicaState {
   notes: Record<string, Note>;
   syncCursor: string;
   deviceId: string;
   outbox: SyncMutation[];
+  /** Exact request snapshot that must be replayed until its response is durably applied. */
+  pendingPush: SyncMutation[] | null;
+  syncIssue: SyncIssue | null;
   conflicts: Record<string, SyncConflictDraft>;
 }
 
@@ -99,6 +115,8 @@ function blankState(status: SyncStatus = 'idle'): AppState {
     syncCursor: '',
     deviceId: '',
     outbox: [],
+    pendingPush: null,
+    syncIssue: null,
     conflicts: {},
     status,
     syncGated: false,
@@ -158,6 +176,8 @@ function emptyReplica(session: Session, deviceId = generateDeviceId()): Persiste
     syncCursor: '',
     deviceId,
     outbox: [],
+    pendingPush: null,
+    syncIssue: null,
     conflicts: {},
   };
 }
@@ -212,6 +232,10 @@ function cloneReplica(replica: PersistedReplica): PersistedReplica {
     ...replica,
     notes: { ...replica.notes },
     outbox: [...replica.outbox],
+    pendingPush: replica.pendingPush ? [...replica.pendingPush] : null,
+    syncIssue: replica.syncIssue
+      ? { ...replica.syncIssue, affectedOpIds: [...replica.syncIssue.affectedOpIds] }
+      : null,
     conflicts: { ...replica.conflicts },
   };
 }
@@ -230,10 +254,33 @@ function assertReplicaIntegrity(replica: PersistedReplica): void {
       throw new ReplicaIntegrityError('Replica contains a note owned by another workspace');
     }
   }
-  for (const mutation of replica.outbox) {
+  if (replica.pendingPush !== null && !Array.isArray(replica.pendingPush)) {
+    throw new ReplicaIntegrityError('Replica pending push is invalid');
+  }
+  if (replica.pendingPush?.length === 0) {
+    throw new ReplicaIntegrityError('Replica pending push cannot be empty');
+  }
+  if (replica.syncIssue !== null) {
+    const issue = replica.syncIssue;
+    if (
+      !issue ||
+      typeof issue !== 'object' ||
+      typeof issue.code !== 'string' ||
+      issue.code.length === 0 ||
+      typeof issue.message !== 'string' ||
+      issue.message.length === 0 ||
+      !Array.isArray(issue.affectedOpIds) ||
+      issue.affectedOpIds.some((opId) => typeof opId !== 'string' || opId.length === 0) ||
+      new Set(issue.affectedOpIds).size !== issue.affectedOpIds.length ||
+      !['rekey', 'reset-cursor', 'restage', 'retry'].includes(issue.recoveryKind)
+    ) {
+      throw new ReplicaIntegrityError('Replica sync issue is invalid');
+    }
+  }
+  for (const mutation of [...replica.outbox, ...(replica.pendingPush ?? [])]) {
     const note = replica.notes[mutation.note.id];
     if (!note || note.workspaceId !== replica.workspaceId) {
-      throw new ReplicaIntegrityError('Replica outbox is not backed by an owned note');
+      throw new ReplicaIntegrityError('Replica sync queue is not backed by an owned note');
     }
   }
   for (const [id, conflict] of Object.entries(replica.conflicts)) {
@@ -249,7 +296,17 @@ function assertReplicaIntegrity(replica: PersistedReplica): void {
 }
 
 function parseReplica(raw: string, session: Session): PersistedReplica {
-  const parsed = JSON.parse(raw) as PersistedReplica;
+  const stored = JSON.parse(raw) as PersistedReplica & {
+    pendingPush?: unknown;
+    syncIssue?: unknown;
+  };
+  const parsed = {
+    ...stored,
+    // Replicas written before request staging shipped have no pendingPush field.
+    pendingPush: stored.pendingPush === undefined ? null : stored.pendingPush,
+    // Replicas written before terminal sync holds shipped have no syncIssue field.
+    syncIssue: stored.syncIssue === undefined ? null : stored.syncIssue,
+  } as PersistedReplica;
   assertReplicaIntegrity(parsed);
   if (
     parsed.ownerKey !== ownerKeyFor(session) ||
@@ -275,6 +332,13 @@ function snapshotActiveReplica(): PersistedReplica | null {
     syncCursor: store$.syncCursor.get(),
     deviceId: store$.deviceId.get(),
     outbox: [...store$.outbox.get()],
+    pendingPush: store$.pendingPush.get() ? [...store$.pendingPush.get()!] : null,
+    syncIssue: store$.syncIssue.get()
+      ? {
+          ...store$.syncIssue.get()!,
+          affectedOpIds: [...store$.syncIssue.get()!.affectedOpIds],
+        }
+      : null,
     conflicts: { ...store$.conflicts.get() },
   };
   assertReplicaIntegrity(replica);
@@ -408,6 +472,10 @@ function activate(session: Session, replica: PersistedReplica): void {
     syncCursor: replica.syncCursor,
     deviceId: replica.deviceId,
     outbox: [...replica.outbox],
+    pendingPush: replica.pendingPush ? [...replica.pendingPush] : null,
+    syncIssue: replica.syncIssue
+      ? { ...replica.syncIssue, affectedOpIds: [...replica.syncIssue.affectedOpIds] }
+      : null,
     conflicts: { ...replica.conflicts },
     status: 'idle',
     syncGated: false,
@@ -664,6 +732,13 @@ export function readReplicaForLease(lease: SessionLease): ReplicaState {
     syncCursor: store$.syncCursor.get(),
     deviceId: store$.deviceId.get(),
     outbox: [...store$.outbox.get()],
+    pendingPush: store$.pendingPush.get() ? [...store$.pendingPush.get()!] : null,
+    syncIssue: store$.syncIssue.get()
+      ? {
+          ...store$.syncIssue.get()!,
+          affectedOpIds: [...store$.syncIssue.get()!.affectedOpIds],
+        }
+      : null,
     conflicts: { ...store$.conflicts.get() },
   };
 }
@@ -684,6 +759,10 @@ export async function updateReplicaForLease(
     syncCursor: next.syncCursor,
     deviceId: lease.deviceId,
     outbox: [...next.outbox],
+    pendingPush: next.pendingPush ? [...next.pendingPush] : null,
+    syncIssue: next.syncIssue
+      ? { ...next.syncIssue, affectedOpIds: [...next.syncIssue.affectedOpIds] }
+      : null,
     conflicts: { ...next.conflicts },
   };
   const previousReplica: PersistedReplica = {
@@ -695,6 +774,10 @@ export async function updateReplicaForLease(
     syncCursor: current.syncCursor,
     deviceId: lease.deviceId,
     outbox: [...current.outbox],
+    pendingPush: current.pendingPush ? [...current.pendingPush] : null,
+    syncIssue: current.syncIssue
+      ? { ...current.syncIssue, affectedOpIds: [...current.syncIssue.affectedOpIds] }
+      : null,
     conflicts: { ...current.conflicts },
   };
   assertReplicaIntegrity(replica);
@@ -702,6 +785,8 @@ export async function updateReplicaForLease(
   store$.notes.set(replica.notes);
   store$.syncCursor.set(replica.syncCursor);
   store$.outbox.set(replica.outbox);
+  store$.pendingPush.set(replica.pendingPush);
+  store$.syncIssue.set(replica.syncIssue);
   store$.conflicts.set(replica.conflicts);
   try {
     await enqueueReplicaSave(replica);
@@ -711,11 +796,15 @@ export async function updateReplicaForLease(
       store$.syncCursor.get() === replica.syncCursor &&
       JSON.stringify(store$.notes.get()) === JSON.stringify(replica.notes) &&
       JSON.stringify(store$.outbox.get()) === JSON.stringify(replica.outbox) &&
+      JSON.stringify(store$.pendingPush.get()) === JSON.stringify(replica.pendingPush) &&
+      JSON.stringify(store$.syncIssue.get()) === JSON.stringify(replica.syncIssue) &&
       JSON.stringify(store$.conflicts.get()) === JSON.stringify(replica.conflicts);
     if (unchangedSinceApply) {
       store$.notes.set(previousReplica.notes);
       store$.syncCursor.set(previousReplica.syncCursor);
       store$.outbox.set(previousReplica.outbox);
+      store$.pendingPush.set(previousReplica.pendingPush);
+      store$.syncIssue.set(previousReplica.syncIssue);
       store$.conflicts.set(previousReplica.conflicts);
     }
     throw error;

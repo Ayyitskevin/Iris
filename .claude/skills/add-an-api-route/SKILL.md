@@ -11,7 +11,7 @@ description: Open when adding, extending, or debugging a REST endpoint on apps/a
 
 ## Mental model
 
-One Fastify service, every tenant route workspace-scoped. The request lifecycle is fixed: `route (app.ts)` → `authGuard` sets `req.principal` (user JWT or agent token) → `tenant(req, fn)` calls `runTenant` which opens ONE transaction, sets the RLS GUC `app.current_workspace`, and hands the service a `Ctx{db, principal, workspaceId}` → the service filters **every** query by `ctx.workspaceId` and returns already-serialized wire types → the handler returns a plain object that Fastify sends as JSON. Contracts live once, in `packages/shared` zod schemas; the api validates against them and the client infers types from them, so a shape change is a compile error on both ends. Errors are thrown as `HttpError` and a single `setErrorHandler` turns them into `{ error: { code, message, conflict? } }`; a thrown `ZodError` becomes a 400 automatically. Two orthogonal guards protect routes: `requireScope(ctx, 'notes:read'|'notes:write')` (what an agent token may do; users implicitly hold all scopes) and `requireUser(ctx.principal)` (user-only actions like token mgmt, billing, undo, device registration).
+One Fastify service, every tenant route workspace-scoped. The request lifecycle is fixed: `route (app.ts)` → `authGuard` sets `req.principal` (user JWT or agent token) → `tenant(req, fn)` calls `runTenant` which opens ONE transaction, sets the RLS GUC `app.current_workspace`, and hands the service a `Ctx{db, principal, workspaceId}` → the service filters **every** query by `ctx.workspaceId` and returns already-serialized wire types → the handler returns a plain object that Fastify sends as JSON. Contracts live once, in `packages/shared` zod schemas; the api validates against them and the client infers types from them, so a shape change is a compile error on both ends. Errors are thrown as `HttpError` and a single `setErrorHandler` turns them into `{ error: { code, message, conflict?, operationId? } }`; only REST `version_conflict` errors carry the optional authoritative note, while `idempotency_key_reused` carries its operation id instead. A thrown `ZodError` becomes a 400 automatically. Two orthogonal guards protect routes: `requireScope(ctx, 'notes:read'|'notes:write')` (what an agent token may do; users implicitly hold all scopes) and `requireUser(ctx.principal)` (user-only actions like token mgmt, billing, undo, device registration).
 
 ## Key files
 
@@ -95,18 +95,26 @@ import { call, makeApp, signUp, type TestApp } from './helpers';
 
 describe('notes search', () => {
   let t: TestApp;
-  beforeAll(async () => { t = await makeApp(); });
+  beforeAll(async () => {
+    t = await makeApp();
+  });
   afterAll(() => t.close());
 
   it('matches title or body and stays inside the workspace', async () => {
     const alice = await signUp(t.app);
     const bob = await signUp(t.app);
-    await call(t.app, 'POST', '/v1/notes', { token: alice.token, body: { title: 'Groceries', bodyMd: 'milk and eggs' } });
-    await call(t.app, 'POST', '/v1/notes', { token: bob.token, body: { title: 'Groceries', bodyMd: 'bob milk' } });
+    await call(t.app, 'POST', '/v1/notes', {
+      token: alice.token,
+      body: { title: 'Groceries', bodyMd: 'milk and eggs' },
+    });
+    await call(t.app, 'POST', '/v1/notes', {
+      token: bob.token,
+      body: { title: 'Groceries', bodyMd: 'bob milk' },
+    });
 
     const res = await call(t.app, 'GET', '/v1/notes/search?q=milk', { token: alice.token });
     expect(res.status).toBe(200);
-    expect(res.json.notes).toHaveLength(1);              // never sees Bob's note
+    expect(res.json.notes).toHaveLength(1); // never sees Bob's note
     expect(res.json.notes[0].bodyMd).toContain('milk and eggs');
   });
 });
@@ -114,7 +122,7 @@ describe('notes search', () => {
 
 Run: `pnpm --filter @iris/api test`. Typecheck both ends: `pnpm -r typecheck` (shape drift between shared and api surfaces here).
 
-**Variant — a note-mutating endpoint (e.g. `pin`)**: it must go through the version/activity choke point. Follow `updateNote` in `services/notes.ts`: `loadNote(ctx, id)` → 404 if missing/deleted → if it accepts `baseVersion`, `throw conflict(msg, serializeNote(current))` on mismatch → `update(...).set({ ...changes, version: current.version + 1, updatedAt: new Date() })` → `await recordVersionAndActivity(ctx, note, 'note.update')`. A new *column* (e.g. `pinned`) additionally requires: add it to `db/schema.ts` AND the SQL in `migrations/`, plus `serializeNote` + the `Note` zod schema. Route uses `requireScope(ctx, 'notes:write')`.
+**Variant — a note-mutating endpoint (e.g. `pin`)**: it must go through the version/activity choke point. Follow `updateNote` in `services/notes.ts`: `loadNote(ctx, id)` → 404 if missing/deleted → if it accepts `baseVersion`, `throw conflict(msg, serializeNote(current))` on mismatch → `update(...).set({ ...changes, version: current.version + 1, updatedAt: new Date() })` → `await recordVersionAndActivity(ctx, note, 'note.update')`. A new _column_ (e.g. `pinned`) additionally requires: add it to `db/schema.ts` AND the SQL in `migrations/`, plus `serializeNote` + the `Note` zod schema. Route uses `requireScope(ctx, 'notes:write')`.
 
 ## Invariants & gotchas
 
@@ -125,7 +133,7 @@ Run: `pnpm --filter @iris/api test`. Typecheck both ends: `pnpm -r typecheck` (s
 - **Optimistic concurrency, never silent overwrite.** Update/delete take `baseVersion`; on mismatch `throw conflict(msg, serializeNote(current))` (409 carries the server note in `error.conflict`). Client surfaces it via `ApiRequestError.isConflict`.
 - **Serialize at the boundary.** Services return wire types via `serialize*` (Date→ISO, secrets stripped). Never return a raw Drizzle row from a handler — you'll leak `Date` objects or hashed columns and break the client's zod types.
 - **Don't open a transaction or set the GUC in a service.** You're already inside `runTenant`'s tx — use `ctx.db` for every read and write so the request stays atomic.
-- **Throw `HttpError` helpers, don't build error bodies.** `setErrorHandler` in `app.ts` owns the envelope. `ZodError` → 400 `validation_error`; anything else → 500. So `SomeRequest.parse(req.body)` is your validation — don't hand-roll it.
+- **Throw `HttpError` helpers, don't build error bodies.** `setErrorHandler` in `app.ts` owns the envelope. `ZodError` → 400 `validation_error`; parser/framework 4xx responses keep their status and become `invalid_json`, `payload_too_large` (413), or `invalid_request`; only an unhandled non-4xx error becomes 500. So `SomeRequest.parse(req.body)` is your validation — don't hand-roll it.
 - **Response wrapping is by convention.** Single entity → `{ note }`; collection → `{ notes }` / `{ versions }`. Match the zod response schema exactly or the client's `request<T>` cast lies.
 - **Static vs param routes.** Fastify (find-my-way) resolves static segments before parametric, so `/v1/notes/search` wins over `/v1/notes/:id` regardless of registration order — but don't introduce a literal segment that could ever be a real note id.
 - **Shared package uses extensionless relative imports** (`from './schemas'`), TS pinned at 5.9.3. Import wire types in api from `@iris/shared`; add new schemas to `schemas.ts` (auto re-exported) — don't touch `index.ts`.

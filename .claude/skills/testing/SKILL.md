@@ -15,7 +15,7 @@ This skill is only about the `apps/api` harness. `apps/mobile` (Legend-State) is
 
 ## Mental model
 
-API tests are **black-box HTTP tests against a real, in-process stack** — no mocks of the DB or services. `makeApp()` boots a fresh `PGlite` (Postgres compiled to WASM, running in the same node process), applies the real SQL migrations, wires it into the real `buildApp()` Fastify factory, and hands you back the app. You drive it with `call()`, which uses `app.inject()` to dispatch requests **without opening a TCP socket**. So a test exercises the exact route → `authGuard` → `runTenant` → service → `serialize` path production uses, just against WASM Postgres instead of a cluster.
+Most API tests are **black-box HTTP tests against a real, in-process stack** — no mocks of the DB or services. `makeApp()` boots a fresh `PGlite` (Postgres compiled to WASM, running in the same node process), applies the real SQL migrations, wires it into the real `buildApp()` Fastify factory, and hands you back the app. You drive it with `call()`, which uses `app.inject()` to dispatch requests **without opening a TCP socket**. So a test exercises the exact route → `authGuard` → `runTenant` → service → `serialize` path production uses, just against WASM Postgres instead of a cluster. The separate `postgres-concurrency.test.ts` suite uses `IRIS_TEST_POSTGRES_URL` to exercise locking behavior that PGlite cannot prove; CI provisions a dedicated Postgres 16 service so that gate is not skipped there.
 
 Isolation is **per file**: one `makeApp()` in `beforeAll`, one `close()` in `afterAll`, and every `it()` in that file shares that single database. That is why tests within a file must be treated as sequential and why you get a clean tenant by calling `signUp()` (each sign-up mints a brand-new user + workspace) rather than by resetting the DB. `vitest.config.ts` forces `DATABASE_URL=''` and `STRIPE_SECRET_KEY=''`, which is what selects the PGlite driver, the local auth provider, and the fake Stripe gateway — you never touch a network service.
 
@@ -26,10 +26,14 @@ Isolation is **per file**: one `makeApp()` in `beforeAll`, one `close()` in `aft
   - `call<T>(app, method, path, { token?, body? }): Promise<{status, json}>` (`helpers.ts:35`) — sets `Authorization: Bearer <token>` and JSON body, dispatches via `app.inject` (no socket). `json` is `res.json()`, or `undefined` if the body didn't parse (e.g. 204, or the zip export).
   - `signUp(app, email?): Promise<{token, workspaceId, userId, email}>` (`helpers.ts:64`) — POSTs `/v1/auth/sign-up` with password `'correct-horse-battery'`, **throws** unless status is 201. Default email is randomized, so each call is a fresh tenant.
 - `apps/api/vitest.config.ts` — `include: test/**/*.test.ts`, `environment: node`, `pool: forks`, `fileParallelism: false` (files run one at a time), 30s timeouts, and `env: { NODE_ENV: 'test', DATABASE_URL: '', STRIPE_SECRET_KEY: '', JWT_SECRET: 'test-secret' }`. That env block is what forces the PGlite + local-auth + fake-Stripe path regardless of your shell.
-- `apps/api/src/db/migrate.ts` — `applyMigrationsPglite(client)` (`migrate.ts:23`) runs every `migrations/*.sql` file whole via `client.exec` (files contain `DO $$…$$` blocks, so they are **not** split on `;`).
+- `apps/api/src/db/migrate.ts` — `applyMigrationsPglite(client)` runs every
+  `migrations/*.sql` file whole via `client.exec` (files contain `DO $$…$$` blocks,
+  so they are **not** split on `;`).
 - `apps/api/src/db/client.ts` — `createDb(pglite?)` picks the driver from `env.databaseUrl`; passing the PGlite instance gives the fresh per-file DB. `withWorkspace` sets the `app.current_workspace` GUC. **Note the comment at `client.ts:56`: PGlite connects as superuser and bypasses RLS**, so the in-test isolation proof is application-layer, not RLS.
-- `apps/api/src/app.ts` — `buildApp(bundle)` is the factory both tests and the server use. Every guarded route is `guarded` (runs `authGuard`) + `tenant(req, ctx => …)`; errors become `{ error: { code, message, conflict? } }` (`app.ts:72`).
+- `apps/api/src/app.ts` — `buildApp(bundle)` is the factory both tests and the server use. Every guarded route is `guarded` (runs `authGuard`) + `tenant(req, ctx => …)`; errors become `{ error: { code, message, conflict?, operationId? } }` (`app.ts`).
 - `apps/api/test/agent-undo.test.ts`, `tenant-isolation.test.ts` — canonical DoD-style examples; copy their shape.
+- `apps/api/test/postgres-concurrency.test.ts` — opt-in locally, mandatory in CI:
+  commit-order sequence serialization and concurrent first-device billing-gate claims.
 
 ## Playbook
 
@@ -45,7 +49,9 @@ import { call, makeApp, signUp, type TestApp } from './helpers';
 
 describe('note version conflict is a 409', () => {
   let t: TestApp;
-  beforeAll(async () => { t = await makeApp(); });
+  beforeAll(async () => {
+    t = await makeApp();
+  });
   afterAll(() => t.close());
 
   it('a stale baseVersion on update is rejected with the server note', async () => {
@@ -75,22 +81,22 @@ describe('note version conflict is a 409', () => {
       body: { bodyMd: 'v2-prime', baseVersion: 1 },
     });
     expect(stale.status).toBe(409);
-    // Error envelope is { error: { code, message, conflict? } } (app.ts:72).
-    expect(stale.json.error.conflict.note.version).toBe(2);
+    // Only version_conflict carries the authoritative note in error.conflict.
+    expect(stale.json.error.conflict.version).toBe(2);
   });
 });
 ```
 
-3. Assert on the **wire shape**, not internal rows: `res.status` for the HTTP code and `res.json.<field>` for the response envelope. Success bodies are the serialized types (`{ note }`, `{ notes }`, `{ activity }`, `{ token, agentToken }`); failures are `{ error: { code, message, conflict? } }`.
+3. Assert on the **wire shape**, not internal rows: `res.status` for the HTTP code and `res.json.<field>` for the response envelope. Success bodies are the serialized types (`{ note }`, `{ notes }`, `{ activity }`, `{ token, agentToken }`); failures are `{ error: { code, message, conflict?, operationId? } }`. Only REST `version_conflict` carries `conflict`; sync `idempotency_key_reused` carries `operationId`.
 
 4. Need an agent actor? Mint a scoped token through the API, exactly as the product does:
 
 ```ts
 const issued = await call(t.app, 'POST', '/v1/agents/tokens', {
-  token: user.token,               // token issuance is a *user* action
+  token: user.token, // token issuance is a *user* action
   body: { agentName: 'Researcher', scopes: ['notes:read', 'notes:write'] },
 });
-const agentToken = issued.json.token;             // begins 'iris_at_'
+const agentToken = issued.json.token; // begins 'iris_at_'
 // issued.json.agentToken.id is the row id, e.g. for DELETE /v1/agents/tokens/:id
 ```
 
@@ -106,12 +112,18 @@ pnpm test:watch                           # → vitest (watch)
 pnpm vitest run test/<feature>.test.ts    # single file
 ```
 
-No DB to start, no `DATABASE_URL` to set — the vitest env forces the in-memory path.
+No DB is needed for the ordinary PGlite files. To run the locking gate locally, provide
+`IRIS_TEST_POSTGRES_URL` pointing at a dedicated database named `iris_test`;
+`postgres-concurrency.test.ts` skips without it, while CI always supplies it.
 
 ## Invariants & gotchas
 
 - **One DB per file, shared by every `it()`.** State written in one case is visible to the next. Don't rely on ordering; get a clean slate by calling `signUp()` for a fresh workspace instead of expecting an empty DB. Reusing one `user` across cases in the same describe is fine as long as you account for the accumulated rows.
 - **RLS does not enforce isolation in tests.** PGlite connects as a Postgres superuser and **bypasses RLS** (`client.ts:56`). The GUC is still set so the identical code path enforces RLS on a real non-superuser cluster, but the in-repo proof of tenant isolation is the **application-layer** `where workspace_id = …` filter — which is exactly what `tenant-isolation.test.ts` asserts (Bob gets 404, not a DB error).
+- **Do not weaken the real-Postgres gate into a PGlite-only assertion.**
+  `postgres-concurrency.test.ts` proves lock blocking and committed sequence order with
+  independent connections, and proves concurrent free-plan registrations consume one
+  slot. The CI Postgres service is part of that contract.
 - **Never assume `res.json` is defined.** `call()` swallows JSON parse errors and returns `undefined` (`helpers.ts:57`). For 204s (e.g. `DELETE /v1/agents/tokens/:id`) and the zip `/v1/export` there is no JSON — assert on `res.status` and don't touch `res.json`.
 - **`signUp()` throws on non-201** — a failing sign-up surfaces as a thrown error inside `beforeAll`/the test, not an assertion. If a whole file dies at setup, suspect a migration or schema change.
 - **Migrations run as whole files.** New migrations go in `apps/api/migrations/*.sql` and are applied in filename order, uncut. Don't write a migration that depends on `;`-splitting; keep `DO $$…$$` blocks intact or `client.exec` will still run them but a broken statement fails the entire file → every test in every file fails at `makeApp()`.

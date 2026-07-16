@@ -7,10 +7,15 @@
  */
 import { sql } from 'drizzle-orm';
 import {
+  bigint,
+  check,
+  foreignKey,
   index,
   integer,
   jsonb,
   pgTable,
+  primaryKey,
+  smallint,
   text,
   timestamp,
   uniqueIndex,
@@ -55,7 +60,7 @@ export const workspaceMembers = pgTable(
 export const notes = pgTable(
   'notes',
   {
-    id: uuid('id').primaryKey(),
+    id: uuid('id').notNull(),
     workspaceId: uuid('workspace_id')
       .notNull()
       .references(() => workspaces.id, { onDelete: 'cascade' }),
@@ -65,6 +70,12 @@ export const notes = pgTable(
     // Organizational primitive alongside folders (phase 2). jsonb string array.
     tags: jsonb('tags').$type<string[]>().notNull().default([]),
     version: integer('version').notNull().default(1),
+    // Database-assigned workspace sequence used by Sync v2. A pair of database
+    // triggers owns this value so transaction commit order cannot leave holes behind
+    // an already-issued client cursor.
+    // The zero default only makes DB-managed columns optional in Drizzle inserts.
+    // iris_assign_note_sync_seq always replaces it before constraints are checked.
+    syncSeq: bigint('sync_seq', { mode: 'bigint' }).notNull().default(0n),
     createdAt: createdAt(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     deletedAt: timestamp('deleted_at', { withTimezone: true }),
@@ -72,17 +83,62 @@ export const notes = pgTable(
     // (migration 0002) for full-text search. It is DB-managed — never inserted or
     // selected through Drizzle — so it is deliberately not modeled here.
   },
-  // Drives the sync change-feed cursor (updated_at, id). See ADR-005.
-  (t) => [index('notes_sync_idx').on(t.workspaceId, t.updatedAt, t.id)],
+  // Drives the Sync v2 change feed. sync_seq is unique within a workspace.
+  (t) => [
+    primaryKey({ name: 'notes_pkey', columns: [t.workspaceId, t.id] }),
+    uniqueIndex('notes_sync_idx').on(t.workspaceId, t.syncSeq),
+  ],
+);
+
+/**
+ * One transactionally locked counter per workspace. The notes statement trigger locks
+ * this row before PostgreSQL can lock note rows; the row trigger then increments it for
+ * each changed note. That ordering makes sync_seq follow commit serialization instead
+ * of sequence-allocation time.
+ */
+export const workspaceSyncCursors = pgTable(
+  'workspace_sync_cursors',
+  {
+    workspaceId: uuid('workspace_id')
+      .primaryKey()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    lastSeq: bigint('last_seq', { mode: 'bigint' }).notNull().default(0n),
+  },
+  (t) => [check('workspace_sync_cursors_last_seq_check', sql`${t.lastSeq} >= 0`)],
+);
+
+/**
+ * Durable, exact sync-operation receipts. The request fingerprint binds an op id to
+ * its actor, device, and payload; outcome is written in the same tenant transaction as
+ * the note/version/activity mutation and replayed under its frozen receipt semantics.
+ */
+export const syncIdempotency = pgTable(
+  'sync_idempotency',
+  {
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    opId: text('op_id').notNull(),
+    actorType: text('actor_type').notNull(),
+    actorId: uuid('actor_id').notNull(),
+    deviceId: text('device_id').notNull(),
+    // Freezes fingerprint/outcome interpretation for durable retries across releases.
+    receiptVersion: smallint('receipt_version').notNull().default(1),
+    requestFingerprint: text('request_fingerprint').notNull(),
+    outcome: jsonb('outcome').$type<unknown>(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.workspaceId, t.opId] }),
+    check('sync_idempotency_receipt_version_check', sql`${t.receiptVersion} >= 1`),
+  ],
 );
 
 export const noteVersions = pgTable(
   'note_versions',
   {
     id: uuid('id').primaryKey(),
-    noteId: uuid('note_id')
-      .notNull()
-      .references(() => notes.id, { onDelete: 'cascade' }),
+    noteId: uuid('note_id').notNull(),
     workspaceId: uuid('workspace_id')
       .notNull()
       .references(() => workspaces.id, { onDelete: 'cascade' }),
@@ -95,7 +151,14 @@ export const noteVersions = pgTable(
     authorName: text('author_name').notNull(),
     createdAt: createdAt(),
   },
-  (t) => [uniqueIndex('note_versions_unique').on(t.noteId, t.version)],
+  (t) => [
+    foreignKey({
+      name: 'note_versions_note_id_fkey',
+      columns: [t.workspaceId, t.noteId],
+      foreignColumns: [notes.workspaceId, notes.id],
+    }).onDelete('cascade'),
+    uniqueIndex('note_versions_unique').on(t.workspaceId, t.noteId, t.version),
+  ],
 );
 
 export const agentTokens = pgTable('agent_tokens', {
@@ -134,17 +197,21 @@ export const activityLog = pgTable(
   (t) => [index('activity_feed_idx').on(t.workspaceId, t.createdAt)],
 );
 
-export const devices = pgTable('devices', {
-  // Client-generated (Expo installation id, etc.) — text, not necessarily a UUID.
-  id: text('id').primaryKey(),
-  workspaceId: uuid('workspace_id')
-    .notNull()
-    .references(() => workspaces.id, { onDelete: 'cascade' }),
-  name: text('name').notNull(),
-  platform: text('platform').notNull(),
-  createdAt: createdAt(),
-  lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const devices = pgTable(
+  'devices',
+  {
+    // Client-generated (Expo installation id, etc.) — text, not necessarily a UUID.
+    id: text('id').notNull(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    platform: text('platform').notNull(),
+    createdAt: createdAt(),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ name: 'devices_pkey', columns: [t.workspaceId, t.id] })],
+);
 
 export const subscriptions = pgTable('subscriptions', {
   workspaceId: uuid('workspace_id')
@@ -161,6 +228,7 @@ export const subscriptions = pgTable('subscriptions', {
 });
 
 export type NoteRow = typeof notes.$inferSelect;
+export type SyncIdempotencyRow = typeof syncIdempotency.$inferSelect;
 export type NoteVersionRow = typeof noteVersions.$inferSelect;
 export type AgentTokenRow = typeof agentTokens.$inferSelect;
 export type ActivityRow = typeof activityLog.$inferSelect;
@@ -174,6 +242,8 @@ export const schema = {
   users,
   workspaceMembers,
   notes,
+  workspaceSyncCursors,
+  syncIdempotency,
   noteVersions,
   agentTokens,
   activityLog,

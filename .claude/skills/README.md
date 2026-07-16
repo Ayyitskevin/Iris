@@ -28,22 +28,22 @@ domain pillars → client/test/reference), or jump straight to whatever your cha
 
 ## Index
 
-| Skill | What it's for |
-| --- | --- |
-| [architecture-overview](architecture-overview/SKILL.md) | Start here when you're new to Iris or unsure where a feature lives — the whole-repo map and how one API request flows from route to database. |
-| [tenant-isolation](tenant-isolation/SKILL.md) | Read before writing or reviewing any query, table, migration, or service — how workspace scoping is enforced end to end and how to avoid punching a hole in it. |
-| [database-and-migrations](database-and-migrations/SKILL.md) | Open when changing the DB — adding a table/column, writing a migration, adding RLS for a new tenant table, or debugging PGlite-vs-Postgres behavior. |
-| [add-an-api-route](add-an-api-route/SKILL.md) | Open when adding, extending, or debugging a REST endpoint on apps/api — the end-to-end recipe from zod schema to client method to route to service to test. |
-| [notes-and-versioning](notes-and-versioning/SKILL.md) | Open when touching note CRUD, version history, the baseVersion 409-conflict path, restore/undo, or soft delete — anything that mutates a note or reads its history. |
-| [search-and-tags](search-and-tags/SKILL.md) | Open when touching note tags (jsonb array, filtering, tag list) or full-text search (generated tsvector, ranking) — added in phase 2 (ADR-010). |
-| [activity-and-undo](activity-and-undo/SKILL.md) | Open when touching the activity feed, the undo endpoint, note_versions/activity_log rows, or debugging why an action shows (or won't show) as undone. |
-| [agent-actors-and-tokens](agent-actors-and-tokens/SKILL.md) | Open when issuing, hashing, scoping, verifying, or revoking agent tokens, debugging agent 401/403s, or adding/changing agent scopes. |
-| [sync-protocol](sync-protocol/SKILL.md) | Open when touching the local-first change-feed — cursor pulls, base_version pushes, conflict surfacing, the outbox, or the client sync() loop (ADR-005). |
-| [billing-and-the-sync-gate](billing-and-the-sync-gate/SKILL.md) | Open when touching Stripe/checkout/webhooks, the multi-device 402 gate, subscription state, or writing/fixing tests that drive billing without live keys. |
-| [auth-provider-seam](auth-provider-seam/SKILL.md) | Open when swapping Iris's local email+password auth for a managed provider (Clerk/Supabase), adding OAuth/password-reset/email-verification, or changing how sign-up provisions a tenant. |
-| [client-architecture](client-architecture/SKILL.md) | Open when working on the Expo mobile client — routing/navigation, the Legend-State local-first store, the sync manager, the shared API client, or adding a screen/tab. |
-| [testing](testing/SKILL.md) | Open this when writing or debugging an apps/api test — how makeApp()/call()/signUp() work, the forced PGlite/local/fake-Stripe env, and how to add a DoD-style black-box test. |
-| [conventions-and-gotchas](conventions-and-gotchas/SKILL.md) | Open before bumping a dependency, touching tsconfig/eslint/imports, adding an error path or serializer, or when a build/lint/typecheck breaks after an upgrade — the pinned versions and traps that already bit us. |
+| Skill                                                           | What it's for                                                                                                                                                                                                       |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [architecture-overview](architecture-overview/SKILL.md)         | Start here when you're new to Iris or unsure where a feature lives — the whole-repo map and how one API request flows from route to database.                                                                       |
+| [tenant-isolation](tenant-isolation/SKILL.md)                   | Read before writing or reviewing any query, table, migration, or service — how workspace scoping is enforced end to end and how to avoid punching a hole in it.                                                     |
+| [database-and-migrations](database-and-migrations/SKILL.md)     | Open when changing the DB — adding a table/column, writing a migration, adding RLS for a new tenant table, or debugging PGlite-vs-Postgres behavior.                                                                |
+| [add-an-api-route](add-an-api-route/SKILL.md)                   | Open when adding, extending, or debugging a REST endpoint on apps/api — the end-to-end recipe from zod schema to client method to route to service to test.                                                         |
+| [notes-and-versioning](notes-and-versioning/SKILL.md)           | Open when touching note CRUD, version history, baseVersion/CAS conflicts, restore/undo, or soft delete — anything that mutates a note or reads its history.                                                         |
+| [search-and-tags](search-and-tags/SKILL.md)                     | Open when touching note tags (jsonb array, filtering, tag list) or full-text search (generated tsvector, ranking) — added in phase 2 (ADR-010).                                                                     |
+| [activity-and-undo](activity-and-undo/SKILL.md)                 | Open when touching the activity feed, the undo endpoint, note_versions/activity_log rows, or debugging why an action shows (or won't show) as undone.                                                               |
+| [agent-actors-and-tokens](agent-actors-and-tokens/SKILL.md)     | Open when issuing, hashing, scoping, verifying, or revoking agent tokens, debugging agent 401/403s, or adding/changing agent scopes.                                                                                |
+| [sync-protocol](sync-protocol/SKILL.md)                         | Open when touching the local-first change-feed — database cursors, request receipts, base_version pushes, conflict surfacing, durable outbox staging, or the coordinator (ADR-005/011/012).                         |
+| [billing-and-the-sync-gate](billing-and-the-sync-gate/SKILL.md) | Open when touching Stripe/checkout/webhooks, the multi-device 402 gate, subscription state, or writing/fixing tests that drive billing without live keys.                                                           |
+| [auth-provider-seam](auth-provider-seam/SKILL.md)               | Open when swapping Iris's local email+password auth for a managed provider (Clerk/Supabase), adding OAuth/password-reset/email-verification, or changing how sign-up provisions a tenant.                           |
+| [client-architecture](client-architecture/SKILL.md)             | Open when working on the Expo mobile client — routing/navigation, the Legend-State local-first store, the sync manager, the shared API client, or adding a screen/tab.                                              |
+| [testing](testing/SKILL.md)                                     | Open this when writing or debugging an apps/api test — how makeApp()/call()/signUp() work, the forced PGlite/local/fake-Stripe env, and how to add a DoD-style black-box test.                                      |
+| [conventions-and-gotchas](conventions-and-gotchas/SKILL.md)     | Open before bumping a dependency, touching tsconfig/eslint/imports, adding an error path or serializer, or when a build/lint/typecheck breaks after an upgrade — the pinned versions and traps that already bit us. |
 
 ## Source-of-truth notes
 

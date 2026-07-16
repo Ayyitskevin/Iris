@@ -4,7 +4,9 @@ import type { ActivityAction } from '@iris/shared';
 import { activityLog, noteVersions, notes } from '../db/schema';
 import type { NoteRow } from '../db/schema';
 import type { Ctx } from '../context';
+import { conflict, notFound } from '../lib/errors';
 import { newId } from '../lib/ids';
+import { serializeNote } from '../serialize';
 
 export async function loadNote(ctx: Ctx, id: string): Promise<NoteRow | undefined> {
   const rows = await ctx.db
@@ -12,6 +14,17 @@ export async function loadNote(ctx: Ctx, id: string): Promise<NoteRow | undefine
     .from(notes)
     .where(and(eq(notes.id, id), eq(notes.workspaceId, ctx.workspaceId)));
   return rows[0];
+}
+
+/** Convert a lost compare-and-swap into the latest authoritative API state. */
+export async function throwConcurrentNoteChange(
+  ctx: Ctx,
+  id: string,
+  message = 'This note changed while your request was being saved',
+): Promise<never> {
+  const latest = await loadNote(ctx, id);
+  if (!latest) throw notFound('Note not found');
+  throw conflict(message, serializeNote(latest));
 }
 
 /**
