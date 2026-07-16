@@ -18,7 +18,7 @@ export class ReplicaRepositoryError extends Error {
   }
 }
 
-function assertSerializedOwner(ownerKey: string, serializedReplica: string): void {
+export function assertSerializedReplicaOwner(ownerKey: string, serializedReplica: string): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(serializedReplica) as unknown;
@@ -61,7 +61,7 @@ export class SerializedKvReplicaRepository implements OwnerReplicaRepository {
     try {
       // Validate only immutable routing metadata. The payload is written byte-for-byte so
       // a newer mutation shape remains lossless until its owning client can interpret it.
-      assertSerializedOwner(ownerKey, serializedReplica);
+      assertSerializedReplicaOwner(ownerKey, serializedReplica);
     } catch (error) {
       return Promise.reject(error);
     }

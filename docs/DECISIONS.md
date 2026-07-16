@@ -627,6 +627,43 @@ Cross-tab web ownership, recovery import, and native acceptance remain release g
 
 ---
 
+## ADR-017 — Revision-fenced transactional owner-replica storage foundation
+
+**Accepted as an unwired web storage primitive; runtime authority is unchanged.**
+
+The persisted mobile root is already the atomic unit for notes, cursor, device identity,
+outbox, exact pending request, sync issue, and conflicts. The first transactional
+platform primitive therefore keeps that root opaque instead of normalizing fields into
+another schema: one IndexedDB object stores `schemaVersion`, immutable `ownerKey`, a
+hidden positive monotonic `revision`, and the exact serialized replica bytes. Embedded
+ownership is validated both before a write and after every read.
+
+The shared repository queues reads and commits per owner while independent owners remain
+independent. A repository that has not read an existing record may not overwrite it.
+IndexedDB performs get, expected-revision comparison, and replacement in one read/write
+transaction and reports success only after transaction completion. The repository then
+reads the durable record back and accepts only exact desired bytes, including when the
+transaction committed before surfacing an error or another writer already committed the
+identical bytes.
+
+A different-byte revision conflict fences that repository instance. It does not silently
+refresh its revision because optimistic edits may still be projected from the losing
+root. An explicit authoritative read clears the fence; the caller must fully rehydrate
+those bytes before attempting another commit. Node tests using `fake-indexeddb` cover
+separate-connection races, exact bytes and revisions, owner isolation, same-owner
+ordering, read/commit ordering, stale and unseen writers, idempotent conflicts,
+mutate-then-throw verification, queue recovery, and corrupt owner routing.
+
+This decision does **not** select IndexedDB in production, promote or delete a
+localStorage record, coordinate browser session/network leadership, change the persisted
+root to the `/v2` resource envelope, change the coordinator from `/v1`, add SQLite or
+native dependencies, or decide native at-rest protection. Real-browser multi-tab
+lifecycle evidence, owner-specific promotion and mixed-version fencing, runtime stale
+writer recovery, native storage/security policy, recovery import, and device/simulator
+acceptance remain required before authority changes.
+
+---
+
 ## Summary: the shape these decisions produce
 
 One TypeScript monorepo → one Fastify service → one Postgres (PGlite locally). Auth,

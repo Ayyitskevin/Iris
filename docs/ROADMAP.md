@@ -103,21 +103,30 @@ These were named as out of scope and are staying out until the foundation is pro
   client validates the new responses, but the
   production mobile coordinator intentionally remains on `/v1` pending transactional
   platform repositories; no project/task resource or migration was added.
+- **Phase 2.7 — revision-fenced IndexedDB foundation** (ADR-017): an unwired web store
+  preserves each opaque serialized owner root behind an atomic monotonic-revision
+  compare-and-swap. Same-owner operations are queued, separate connections cannot both
+  win one revision, exact committed bytes are verified, and a stale writer is fenced
+  until an explicit authoritative read. Evidence currently comes from Node plus
+  `fake-indexeddb`; localStorage remains production authority and no native code changed.
 
 ## Near-term follow-ups (next things)
 
-1. **Complete Sync v2's platform repository/runtime cutover and release gates**: SQLite
-   on native, IndexedDB plus cross-tab session coordination on web, transactional
-   resource+outbox writes, request-correlated push-result reconciliation, and a
-   user-facing recovery/import path for quarantined legacy `iris:state:v1` data, followed
-   by native iOS/Android device or simulator acceptance.
+1. **Complete Sync v2's platform repository/runtime cutover and release gates**:
+   owner-specific localStorage-to-IndexedDB promotion plus mixed-version and cross-tab
+   session leadership on web; SQLite plus an explicit at-rest protection policy on
+   native; transactional resource+outbox writes; request-correlated push-result
+   reconciliation; and a user-facing recovery/import path for quarantined
+   legacy `iris:state:v1` data, followed by real-browser and native iOS/Android device
+   or simulator acceptance.
    The owner-bound repository/root reducer and additive generic resource transport are
-   integrated, but the current adapter still stores one size-limited per-owner
+   integrated, and the IndexedDB compare-and-swap primitive exists, but it is deliberately
+   not runtime-selected. The current adapter still stores one size-limited per-owner
    SecureStore/localStorage value and the production coordinator still dispatches the
    frozen `/v1` payload. Persisting the exact `/v2` resource set, cursor, and pending
-   envelope belongs in the transactional platform cutover. That interim backend,
-   missing web cross-tab ownership, missing recovery import, and unrun native acceptance
-   are explicit blockers before the work queue.
+   envelope belongs in the transactional runtime cutover. Missing promotion and web
+   leadership, native storage and protection decisions, recovery import, and browser/
+   native acceptance are explicit blockers before the work queue.
 2. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
    accountable human-or-agent assignee, reversible writes, and the same sync resource
    envelope. Keep activity, check-in, delegation, and durable claim/run semantics

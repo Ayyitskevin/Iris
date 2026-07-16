@@ -136,11 +136,12 @@ strict `notes-v1` resource envelope now coexists on `/v2/sync/*`: its immutable
 resource-set cursor cannot cross routes or workspaces, and exact note operations replay
 the frozen receipt-v1 outcome across `/v1` and `/v2` without another resource mutation,
 receipt, or logical cursor advance (ADR-016).
-The production mobile coordinator intentionally remains on `/v1` until SQLite/IndexedDB
-repositories can persist the resource-set cursor and exact pending envelope
-transactionally. Those platform repositories, web cross-tab coordination, recovery
-import, request-correlated push-result reconciliation, and native device/simulator
-acceptance remain explicit release blockers.
+The production mobile coordinator intentionally remains on `/v1`. An unwired IndexedDB
+primitive now preserves one exact owner root behind atomic revision checks and fences a
+stale writer, but production still selects the size-limited SecureStore/localStorage
+adapter. Owner-specific localStorage promotion, cross-tab session leadership, native
+SQLite and its at-rest protection policy, request-correlated `/v2` reconciliation,
+recovery import, and browser/native acceptance remain explicit release blockers.
 GitHub Actions run `29506816638` passed the PostgreSQL 16
 independent-connection commit-order and concurrent device-gate gate for commit
 `8a8785114623d3e601f26ddf7b6eed21b23415cf`.
@@ -171,3 +172,10 @@ pushes project losslessly into receipt version 1, so a lost response can retry t
 either route exactly once. Wrapped pull and push responses retain the finite transport
 budgets and the single recognized legacy-oversize exception. This is the generic
 protocol seam, not the mobile runtime cutover or a claim that projects/tasks exist.
+
+ADR-017 adds the unwired web storage primitive: an opaque whole-root IndexedDB record
+keyed by owner and guarded by a hidden monotonic revision. Atomic compare-and-swap
+transactions reject stale tabs without overwriting the winner; an explicit authoritative
+read is required before the losing projection may write again. Node tests exercise the
+IndexedDB API and transaction semantics through `fake-indexeddb`, but no deployed storage
+authority, native backend, coordinator route, or persisted replica shape changed.
