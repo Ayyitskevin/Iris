@@ -60,12 +60,12 @@ describe('tenant isolation', () => {
       token: bob.token,
     });
     expect(bobHistory.status).toBe(404);
-    const bobRestore = await call(t.app, 'POST', `/v1/notes/${noteId}/restore`, {
+    const bobRestore = await call(t.app, 'POST', `/v2/notes/${noteId}/restore`, {
       token: bob.token,
       body: { versionId: aliceVersionId, baseVersion: 1 },
     });
     expect(bobRestore.status).toBe(404);
-    const bobUndo = await call(t.app, 'POST', `/v1/activity/${aliceActivityId}/undo`, {
+    const bobUndo = await call(t.app, 'POST', `/v2/activity/${aliceActivityId}/undo`, {
       token: bob.token,
     });
     expect(bobUndo.status).toBe(404);

@@ -643,10 +643,34 @@ const NOTE_VERSION_ORGANIZATION_SIGNATURE: LegacySignature = {
   ],
 };
 
+/**
+ * Exact 0005 delta. NULL is the fail-safe legacy state, so the absence of a default is
+ * load-bearing and verified alongside the preexisting tenant policies.
+ */
+const NOTE_VERSION_TOMBSTONE_SIGNATURE: LegacySignature = {
+  name: '0005_note_version_tombstone.sql',
+  columnDefinitions: [
+    {
+      table: 'note_versions',
+      column: 'is_deleted',
+      dataType: 'boolean',
+      nullable: true,
+    },
+  ],
+  policies: [
+    workspaceIsolationPolicy('notes', true),
+    workspaceIsolationPolicy('note_versions', true),
+  ],
+};
+
 // Additive successors retain earlier load-bearing artifacts. Every receipt in this
 // list is therefore re-proven on startup; a future superseding migration must replace
 // its signature deliberately rather than disabling verification by accident.
-const MIGRATION_ARTIFACT_SIGNATURES = [SYNC_V2_SIGNATURE, NOTE_VERSION_ORGANIZATION_SIGNATURE];
+const MIGRATION_ARTIFACT_SIGNATURES = [
+  SYNC_V2_SIGNATURE,
+  NOTE_VERSION_ORGANIZATION_SIGNATURE,
+  NOTE_VERSION_TOMBSTONE_SIGNATURE,
+];
 
 const pgliteMigrationQueues = new WeakMap<PGlite, Promise<void>>();
 

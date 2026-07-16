@@ -1,16 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { FlatList, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import { useFocusEffect } from 'expo-router';
-import { ApiRequestError, type ActivityEntry } from '@iris/shared';
+import { ApiRequestError, UNDO_PROTOCOL_VERSION, type ActivityEntry } from '@iris/shared';
 import { Button, Muted, Screen, Title } from '../../src/components/ui';
 import { authenticatedRequest } from '../../src/api';
 import {
   classifyMutationFailure,
   latestUndoableActivityIds,
+  mergeAuthoritativeNoteIfSafe,
+  noteHasPendingWork,
   requestStillCurrent,
+  undoResultNotice,
 } from '../../src/history-safety';
 import { useObs } from '../../src/state/hooks';
-import { assertCurrentSession, store$ } from '../../src/state/store';
+import { assertCurrentSession, store$, updateReplicaForLease } from '../../src/state/store';
 import { sync } from '../../src/sync/manager';
 import { theme } from '../../src/theme';
 
@@ -18,12 +21,15 @@ const ACTION_LABEL: Record<string, string> = {
   'note.create': 'created a note',
   'note.update': 'edited a note',
   'note.delete': 'deleted a note',
-  'note.restore': 'restored a version',
+  'note.restore': 'restored a note',
   'note.undo': 'undid an action',
 };
 
 export default function Activity() {
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
+  const outbox = useObs(() => store$.outbox.get());
+  const pendingPush = useObs(() => store$.pendingPush.get());
+  const conflictMap = useObs(() => store$.conflicts.get());
   const [items, setItems] = useState<ActivityEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -52,6 +58,8 @@ export default function Activity() {
     };
     setLoading(true);
     setLoadError(null);
+    // Existing rows stay visible during refresh, but their mutation capability is stale.
+    setUndoProtocolVersion(null);
     try {
       const { lease, value } = await authenticatedRequest((api) => api.listActivity());
       assertCurrentSession(lease);
@@ -99,7 +107,20 @@ export default function Activity() {
   );
 
   async function undo(entry: ActivityEntry) {
-    if (undoProtocolVersion !== 1 || undoingId) return;
+    if (undoProtocolVersion !== UNDO_PROTOCOL_VERSION || loading || undoingId || !entry.noteId) {
+      return;
+    }
+    if (
+      noteHasPendingWork(
+        entry.noteId,
+        store$.outbox.get(),
+        store$.pendingPush.get(),
+        Boolean(store$.conflicts.get()[entry.noteId]),
+      )
+    ) {
+      setUndoNotice("Sync or resolve this note's pending change before undoing activity.");
+      return;
+    }
     const ownerAtStart = ownerKey;
     const pendingRequest = {
       identity: ownerKey ?? '',
@@ -109,6 +130,14 @@ export default function Activity() {
     setUndoNotice(null);
     try {
       const { lease, value } = await authenticatedRequest((api) => api.undoActivity(entry.id));
+      assertCurrentSession(lease);
+      let authoritativeApplied = false;
+      await updateReplicaForLease(lease, (current) => {
+        const merged = mergeAuthoritativeNoteIfSafe(current, value.note);
+        authoritativeApplied = merged !== current;
+        return merged;
+      });
+      void sync();
       assertCurrentSession(lease);
       if (
         !requestStillCurrent(
@@ -120,12 +149,10 @@ export default function Activity() {
         return;
       }
       setUndoNotice(
-        value.folderRestored
-          ? null
-          : "The server could not confirm an exact organizational undo. Review the note's folder and tags.",
+        undoResultNotice(value) +
+          (authoritativeApplied ? '' : ' A newer local change was kept and is syncing.'),
       );
       await load();
-      void sync();
     } catch (error) {
       if (
         requestStillCurrent(
@@ -184,7 +211,7 @@ export default function Activity() {
           {loadError}
         </Text>
       ) : null}
-      {undoProtocolVersion !== null && undoProtocolVersion !== 1 ? (
+      {undoProtocolVersion !== null && undoProtocolVersion !== UNDO_PROTOCOL_VERSION ? (
         <Text style={styles.notice} accessibilityRole="alert">
           This client can show activity but does not support the server's undo protocol. Update Iris
           before undoing.
@@ -215,6 +242,10 @@ export default function Activity() {
         renderItem={({ item }) => {
           const isAgent = item.actorType === 'agent';
           const canOfferUndo = undoableActivityIds.has(item.id);
+          const pendingForNote = Boolean(
+            item.noteId &&
+            noteHasPendingWork(item.noteId, outbox, pendingPush, Boolean(conflictMap[item.noteId])),
+          );
           return (
             <View style={styles.row}>
               <View style={styles.rowMain}>
@@ -235,11 +266,20 @@ export default function Activity() {
               </View>
               {canOfferUndo ? (
                 <Button
-                  label="Undo"
+                  label={pendingForNote ? 'Sync pending' : 'Undo'}
                   variant="ghost"
                   loading={undoingId === item.id}
-                  disabled={undoProtocolVersion !== 1 || undoingId !== null}
-                  accessibilityLabel={`Undo ${ACTION_LABEL[item.action] ?? item.action}`}
+                  disabled={
+                    loading ||
+                    pendingForNote ||
+                    undoProtocolVersion !== UNDO_PROTOCOL_VERSION ||
+                    undoingId !== null
+                  }
+                  accessibilityLabel={
+                    pendingForNote
+                      ? `Sync or resolve pending changes before undoing ${ACTION_LABEL[item.action] ?? item.action}`
+                      : `Undo ${ACTION_LABEL[item.action] ?? item.action}`
+                  }
                   onPress={() => undo(item)}
                 />
               ) : item.undone ? (

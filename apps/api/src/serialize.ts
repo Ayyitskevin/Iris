@@ -40,6 +40,7 @@ export function serializeVersion(r: NoteVersionRow): NoteVersion {
     bodyMd: r.bodyMd,
     folder: r.folder,
     folderSnapshotKnown: r.folderSnapshotKnown,
+    isDeleted: r.isDeleted,
     tags: r.tags ?? [],
     authorType: r.authorType as NoteVersion['authorType'],
     authorId: r.authorId,

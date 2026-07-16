@@ -21,8 +21,8 @@ A thin, end-to-end vertical slice that proves the architecture:
 - **Notes core** — create/edit/delete Markdown notes in folders, with versioned content
   history and forward-only restore. **Tags + full-text search** (phase 2, ADR-010):
   ranked search and tag filtering, both workspace-scoped. New history snapshots restore
-  folders and tags exactly; legacy snapshots expose unknown folder state instead of
-  pretending it was captured (ADR-013).
+  folders, tags, and live/deleted state exactly; legacy snapshots expose unknown state
+  instead of pretending it was captured (ADR-013/014).
 - **Owner-isolated local-first sync** — edits apply instantly/offline; each user/workspace
   has a private replica and fixed-token sync lease; a change-feed reconciles to Postgres;
   conflicts retain both versions in a dedicated Review inbox.
@@ -88,7 +88,7 @@ curl -s localhost:4000/v1/notes -H "authorization: Bearer <AGENT_TOKEN>" \
 
 # 4. See it in the activity feed, then undo it
 curl -s localhost:4000/v1/activity -H "authorization: Bearer <SESSION>"
-curl -s localhost:4000/v1/activity/<ACTIVITY_ID>/undo -X POST -H "authorization: Bearer <SESSION>"
+curl -s localhost:4000/v2/activity/<ACTIVITY_ID>/undo -X POST -H "authorization: Bearer <SESSION>"
 ```
 
 ## Scripts
@@ -137,10 +137,12 @@ independent-connection commit-order and concurrent device-gate gate for commit
 `8a8785114623d3e601f26ddf7b6eed21b23415cf`.
 
 ADR-013 adds migration `0004` and closes folder/tag parity for new version snapshots,
-direct restore, and head-safe activity undo. History responses bind restore to one
-authoritative head and advertise the safe protocol. New clients disable mutation against
-non-current protocol while retaining read-only history/activity; the new server rejects
-old restore requests that lack a precondition. Old snapshots preserve a visibly
-unknown folder rather than silently treating SQL `NULL` as historical root.
-Deleted/tombstone state is not yet part of version snapshots, so exact undo of a restore
-or sync revival remains a tracked correctness gap in ROADMAP.
+direct restore, and head-safe activity undo. GitHub Actions run `29512373454` passed
+that exact slice at commit `06d3f4e958f1747a767d8592bef48eb164e0c012`.
+
+ADR-014 adds migration `0005` and a tri-state lifecycle snapshot: `false` is captured
+live, `true` is captured deleted, and SQL `NULL` is legacy unknown. Direct restore and
+whole-snapshot undo now reconstruct known lifecycle state; legacy restore requires
+explicit preservation, while incomplete undo fails without a fake compensating write.
+Restore/undo protocol 2 uses distinct `/v2` mutation paths, and the retired v1 paths
+return 428 so mixed old/new routing cannot silently apply legacy always-revive semantics.

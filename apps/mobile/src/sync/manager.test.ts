@@ -61,13 +61,23 @@ vi.mock('../api', () => ({
 import {
   adoptSession,
   loadState,
+  openSessionLease,
   ownerKeyFor,
   saveState,
   stateStorageKeys,
   store$,
+  updateReplicaForLease,
   type Session,
 } from '../state/store';
-import { keepLocalConflict, recoverSyncIssue, sync, useServerConflict } from './manager';
+import { mergeAuthoritativeNoteIfSafe } from '../history-safety';
+import {
+  deleteNoteLocal,
+  keepLocalConflict,
+  recoverSyncIssue,
+  sync,
+  updateNoteLocal,
+  useServerConflict,
+} from './manager';
 
 const workspaceA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const workspaceB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -200,6 +210,75 @@ describe('owner-fenced conflict decisions', () => {
     expect(await useServerConflict(ownerKeyFor(sessionA), noteId, 'op-local')).toBe(false);
     expect(store$.conflicts.get()[noteId]?.localMutation.opId).toBe('op-local');
     expect(store$.status.get()).toBe('error');
+  });
+});
+
+describe('local tombstone guards', () => {
+  it('does not edit, retag, or re-delete a tombstoned note', () => {
+    const tombstone = {
+      ...note(workspaceA, 'deleted body'),
+      deletedAt: '2026-07-15T12:00:00.000Z',
+    };
+    store$.conflicts.set({});
+    store$.notes.set({ [noteId]: tombstone });
+    store$.outbox.set([]);
+
+    expect(updateNoteLocal(noteId, { title: 'accidental resurrection' })).toBe(false);
+    expect(updateNoteLocal(noteId, { tags: ['accidental'] })).toBe(false);
+    expect(deleteNoteLocal(noteId)).toBe(false);
+    expect(store$.notes.get()[noteId]).toEqual(tombstone);
+    expect(store$.outbox.get()).toEqual([]);
+  });
+});
+
+describe('authoritative direct-mutation commit fence', () => {
+  it('retains a post-dispatch draft and collapses the next edit without losing fields', async () => {
+    const original = note(workspaceA, 'Original body');
+    store$.notes.set({ [noteId]: original });
+    store$.outbox.set([]);
+    store$.pendingPush.set(null);
+    store$.conflicts.set({});
+    // Keep the automatically scheduled sync inert while this test models the direct
+    // response arriving between two synchronous local edits.
+    store$.syncIssue.set({
+      code: 'test_hold',
+      message: 'Hold background sync for deterministic commit-fence coverage',
+      affectedOpIds: [],
+      recoveryKind: 'retry',
+    });
+
+    expect(updateNoteLocal(noteId, { title: 'Local title' })).toBe(true);
+    const authoritativeUndo = {
+      ...original,
+      title: 'Server title',
+      bodyMd: 'Server body',
+      version: 4,
+      updatedAt: '2026-07-15T12:00:00.000Z',
+    };
+    await updateReplicaForLease(openSessionLease()!, (current) =>
+      mergeAuthoritativeNoteIfSafe(current, authoritativeUndo),
+    );
+
+    expect(store$.notes.get()[noteId]).toMatchObject({
+      title: 'Local title',
+      bodyMd: 'Original body',
+      version: 3,
+    });
+    expect(store$.outbox.get()).toHaveLength(1);
+
+    expect(updateNoteLocal(noteId, { bodyMd: 'Local body' })).toBe(true);
+    expect(store$.notes.get()[noteId]).toMatchObject({
+      title: 'Local title',
+      bodyMd: 'Local body',
+      version: 3,
+    });
+    expect(store$.outbox.get()).toHaveLength(1);
+    expect(store$.outbox.get()[0]).toMatchObject({
+      type: 'upsert',
+      baseVersion: 3,
+      note: { id: noteId, title: 'Local title', bodyMd: 'Local body' },
+    });
+    expect(await saveState()).toBe(true);
   });
 });
 

@@ -173,7 +173,7 @@ export function createApiClient(options: ApiClientOptions) {
         (value) => NoteVersionListResponseSchema.parse(value),
       ),
     restoreVersion: (id: string, b: RestoreVersionRequest) =>
-      request<RestoreVersionResponse>('POST', `/v1/notes/${id}/restore`, b, undefined, (value) =>
+      request<RestoreVersionResponse>('POST', `/v2/notes/${id}/restore`, b, undefined, (value) =>
         RestoreVersionResponseSchema.parse(value),
       ),
 
@@ -189,7 +189,7 @@ export function createApiClient(options: ApiClientOptions) {
         ActivityListResponseSchema.parse(value),
       ),
     undoActivity: (id: string) =>
-      request<UndoResponse>('POST', `/v1/activity/${id}/undo`, undefined, undefined, (value) =>
+      request<UndoResponse>('POST', `/v2/activity/${id}/undo`, undefined, undefined, (value) =>
         UndoResponseSchema.parse(value),
       ),
 

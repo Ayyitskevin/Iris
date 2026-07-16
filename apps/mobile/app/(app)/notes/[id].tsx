@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
-import type { NoteVersion } from '@iris/shared';
+import { RESTORE_PROTOCOL_VERSION, type NoteVersion } from '@iris/shared';
 import { Button, Muted } from '../../../src/components/ui';
 import { useObs } from '../../../src/state/hooks';
 import {
@@ -21,17 +21,37 @@ import {
 } from '../../../src/sync/manager';
 import { authenticatedRequest } from '../../../src/api';
 import {
+  buildRestoreRequest,
   canRestoreHistory,
   classifyMutationFailure,
+  conflictResolutionLabels,
+  mergeAuthoritativeNoteIfSafe,
+  noteHasPendingWork,
   requestStillCurrent,
+  restoreResultNotice,
+  restoreVersionLabel,
+  versionStateLabel,
 } from '../../../src/history-safety';
 import { theme } from '../../../src/theme';
+
+function normalizeTags(value: string): string[] {
+  return [
+    ...new Set(
+      value
+        .split(',')
+        .map((tag) => tag.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  ];
+}
 
 export default function NoteEditor() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const note = useObs(() => (id ? store$.notes[id].get() : undefined));
   const conflict = useObs(() => (id ? store$.conflicts.get()[id] : undefined));
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
+  const outbox = useObs(() => store$.outbox.get());
+  const pendingPush = useObs(() => store$.pendingPush.get());
   const [versions, setVersions] = useState<NoteVersion[] | null>(null);
   const [historyBaseVersion, setHistoryBaseVersion] = useState<number | null>(null);
   const [restoreProtocolVersion, setRestoreProtocolVersion] = useState<number | null>(null);
@@ -39,11 +59,13 @@ export default function NoteEditor() {
   const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
   const [restoringVersionId, setRestoringVersionId] = useState<string | null>(null);
   const [tagsText, setTagsText] = useState('');
+  const [tagsEdited, setTagsEdited] = useState(false);
   const historyRequestRef = useRef(0);
   const restoreRequestRef = useRef(0);
   const routeIdentity = `${ownerKey ?? ''}:${id ?? ''}`;
   const routeIdentityRef = useRef(routeIdentity);
   routeIdentityRef.current = routeIdentity;
+  const parsedTags = normalizeTags(tagsText);
 
   useEffect(() => {
     // Best-effort: pull the latest server state for this note when opening.
@@ -55,6 +77,7 @@ export default function NoteEditor() {
   useEffect(() => {
     // Seed only when the note identity changes, not on every tag edit.
     if (note) setTagsText(note.tags.join(', '));
+    setTagsEdited(false);
     historyRequestRef.current += 1;
     restoreRequestRef.current += 1;
     setVersions(null);
@@ -66,16 +89,8 @@ export default function NoteEditor() {
   }, [note?.id, ownerKey]);
 
   function commitTags() {
-    if (!id) return;
-    const parsed = [
-      ...new Set(
-        tagsText
-          .split(',')
-          .map((s) => s.trim().toLowerCase())
-          .filter(Boolean),
-      ),
-    ];
-    updateNoteLocal(id, { tags: parsed });
+    if (!id || !tagsEdited || note?.deletedAt || restoringVersionId) return;
+    if (updateNoteLocal(id, { tags: parsedTags })) setTagsEdited(false);
   }
 
   if (!id || !note) {
@@ -87,6 +102,18 @@ export default function NoteEditor() {
   }
 
   async function loadHistory() {
+    if (
+      tagsEdited ||
+      noteHasPendingWork(
+        id,
+        store$.outbox.get(),
+        store$.pendingPush.get(),
+        Boolean(store$.conflicts.get()[id]),
+      )
+    ) {
+      setHistoryError("Sync or resolve this note's pending change before opening history.");
+      return;
+    }
     const ownerAtStart = ownerKey;
     const pendingRequest = {
       identity: routeIdentityRef.current,
@@ -106,7 +133,7 @@ export default function NoteEditor() {
       setRestoreProtocolVersion(value.restoreProtocolVersion);
       setHistoryBaseVersion(value.headVersion ?? null);
       if (
-        value.restoreProtocolVersion === 1 &&
+        value.restoreProtocolVersion === RESTORE_PROTOCOL_VERSION &&
         store$.notes[id].get()?.version !== value.headVersion
       ) {
         void sync();
@@ -124,16 +151,30 @@ export default function NoteEditor() {
     }
   }
 
+  const historyBlocked =
+    tagsEdited || noteHasPendingWork(id, outbox, pendingPush, Boolean(conflict));
   const historyHeadMismatch = historyBaseVersion !== null && note.version !== historyBaseVersion;
   const restoreAllowed = canRestoreHistory({
     protocolVersion: restoreProtocolVersion,
     historyHeadVersion: historyBaseVersion,
     localHeadVersion: note.version,
-    blocked: Boolean(conflict || restoringVersionId),
+    blocked: Boolean(historyBlocked || restoringVersionId),
   });
 
   async function restore(version: NoteVersion) {
-    if (!restoreAllowed || historyBaseVersion === null) return;
+    if (
+      !restoreAllowed ||
+      historyBaseVersion === null ||
+      tagsEdited ||
+      noteHasPendingWork(
+        id,
+        store$.outbox.get(),
+        store$.pendingPush.get(),
+        Boolean(store$.conflicts.get()[id]),
+      )
+    ) {
+      return;
+    }
     const ownerAtStart = ownerKey;
     const pendingRequest = {
       identity: routeIdentityRef.current,
@@ -147,27 +188,28 @@ export default function NoteEditor() {
     try {
       const { lease, value } = await authenticatedRequest((api, requestLease) => {
         restoreLease = requestLease;
-        return api.restoreVersion(id, {
-          versionId: version.id,
-          baseVersion,
-          preserveCurrentFolderIfUnknown: !version.folderSnapshotKnown,
-        });
+        return api.restoreVersion(id, buildRestoreRequest(version, baseVersion));
       });
-      await updateReplicaForLease(lease, (current) => ({
-        ...current,
-        notes: { ...current.notes, [id]: value.note },
-      }));
+      let authoritativeApplied = false;
+      await updateReplicaForLease(lease, (current) => {
+        const merged = mergeAuthoritativeNoteIfSafe(current, value.note);
+        authoritativeApplied = merged !== current;
+        return merged;
+      });
+      void sync();
       assertCurrentSession(lease);
       if (
         !requestStillCurrent(pendingRequest, routeIdentityRef.current, restoreRequestRef.current)
       ) {
         return;
       }
-      setTagsText(value.note.tags.join(', '));
+      if (authoritativeApplied) {
+        setTagsText(value.note.tags.join(', '));
+        setTagsEdited(false);
+      }
       setRestoreNotice(
-        value.folderRestored
-          ? null
-          : 'This legacy version restored its content and tags while keeping the current folder.',
+        restoreResultNotice(value) +
+          (authoritativeApplied ? '' : ' A newer local change was kept and is syncing.'),
       );
       setVersions(null);
       setHistoryBaseVersion(null);
@@ -213,8 +255,16 @@ export default function NoteEditor() {
   }
 
   function onDelete() {
+    if (restoringVersionId) return;
     if (deleteNoteLocal(id)) router.back();
   }
+
+  const serverConflictDeleted = Boolean(conflict?.serverNote.deletedAt);
+  const localConflictDeletes = conflict?.localMutation.type === 'delete';
+  const conflictLabels = conflictResolutionLabels({
+    serverDeleted: serverConflictDeleted,
+    localDeletes: localConflictDeletes,
+  });
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={{ padding: theme.space(4) }}>
@@ -222,7 +272,9 @@ export default function NoteEditor() {
         <View style={styles.conflict}>
           <Text style={styles.conflictTitle}>This note changed elsewhere</Text>
           <Text style={styles.conflictText}>
-            Your draft is retained in this account. Review it, then choose which version to keep.
+            {serverConflictDeleted
+              ? 'The server version is deleted. Your local draft is retained until you explicitly restore it or keep the deletion.'
+              : 'Your draft is retained in this account. Review it, then choose which version to keep.'}
           </Text>
           <Text style={styles.conflictPreview}>
             {conflict.localMutation.type === 'delete'
@@ -233,7 +285,7 @@ export default function NoteEditor() {
           </Text>
           <View style={styles.conflictActions}>
             <Button
-              label="Keep my edit"
+              label={conflictLabels.keepLocal}
               onPress={() => {
                 if (ownerKey) {
                   keepLocalConflict(ownerKey, id, conflict.localMutation.opId);
@@ -241,7 +293,7 @@ export default function NoteEditor() {
               }}
             />
             <Button
-              label="Use server"
+              label={conflictLabels.useServer}
               variant="ghost"
               onPress={() => {
                 if (ownerKey) {
@@ -253,57 +305,86 @@ export default function NoteEditor() {
         </View>
       ) : null}
 
-      <TextInput
-        style={styles.title}
-        placeholder="Title"
-        placeholderTextColor={theme.colors.textDim}
-        value={note.title}
-        onChangeText={(t) => updateNoteLocal(id, { title: t })}
-        editable={!conflict}
-      />
-      <Text style={styles.meta}>
-        v{note.version}
-        {note.version === 0 ? ' (unsynced)' : ''} · Markdown
-      </Text>
+      {note.deletedAt ? (
+        <View style={styles.deletedPanel}>
+          <Text style={styles.deletedTitle}>Deleted note</Text>
+          <Text style={styles.deletedMeta}>
+            Deleted {new Date(note.deletedAt).toLocaleString()} · v{note.version}
+          </Text>
+          <Text style={styles.deletedNoteTitle}>{note.title || 'Untitled'}</Text>
+          <Text style={styles.deletedBody}>{note.bodyMd || 'No content'}</Text>
+          <View style={styles.actions}>
+            <Button
+              label={versions ? 'Hide history' : 'View history'}
+              variant="ghost"
+              disabled={!versions && historyBlocked}
+              onPress={() => (versions ? closeHistory() : loadHistory())}
+            />
+          </View>
+        </View>
+      ) : (
+        <>
+          <TextInput
+            style={styles.title}
+            placeholder="Title"
+            placeholderTextColor={theme.colors.textDim}
+            value={note.title}
+            onChangeText={(t) => updateNoteLocal(id, { title: t })}
+            editable={!conflict && !restoringVersionId}
+          />
+          <Text style={styles.meta}>
+            v{note.version}
+            {note.version === 0 ? ' (unsynced)' : ''} · Markdown
+          </Text>
 
-      <TextInput
-        style={styles.tags}
-        placeholder="tags, comma, separated"
-        placeholderTextColor={theme.colors.textDim}
-        value={tagsText}
-        onChangeText={setTagsText}
-        onBlur={commitTags}
-        onSubmitEditing={commitTags}
-        autoCapitalize="none"
-        editable={!conflict}
-      />
+          <TextInput
+            style={styles.tags}
+            placeholder="tags, comma, separated"
+            placeholderTextColor={theme.colors.textDim}
+            value={tagsText}
+            onChangeText={(value) => {
+              setTagsText(value);
+              setTagsEdited(true);
+            }}
+            onBlur={commitTags}
+            onSubmitEditing={commitTags}
+            autoCapitalize="none"
+            editable={!conflict && !restoringVersionId}
+          />
 
-      {/* The editor is a plain view over Markdown — no proprietary block tree (pillar #1). */}
-      <TextInput
-        style={styles.body}
-        placeholder={'# Start writing\n\nMarkdown is the storage format.'}
-        placeholderTextColor={theme.colors.textDim}
-        value={note.bodyMd}
-        onChangeText={(t) => updateNoteLocal(id, { bodyMd: t })}
-        multiline
-        textAlignVertical="top"
-        editable={!conflict}
-      />
+          {/* The editor is a plain view over Markdown — no proprietary block tree (pillar #1). */}
+          <TextInput
+            style={styles.body}
+            placeholder={'# Start writing\n\nMarkdown is the storage format.'}
+            placeholderTextColor={theme.colors.textDim}
+            value={note.bodyMd}
+            onChangeText={(t) => updateNoteLocal(id, { bodyMd: t })}
+            multiline
+            textAlignVertical="top"
+            editable={!conflict && !restoringVersionId}
+          />
 
-      <View style={styles.actions}>
-        <Button
-          label={versions ? 'Hide history' : 'View history'}
-          variant="ghost"
-          disabled={Boolean(conflict)}
-          onPress={() => (versions ? closeHistory() : loadHistory())}
-        />
-        <Button
-          label="Delete note"
-          variant="danger"
-          disabled={Boolean(conflict)}
-          onPress={onDelete}
-        />
-      </View>
+          <View style={styles.actions}>
+            <Button
+              label={versions ? 'Hide history' : 'View history'}
+              variant="ghost"
+              disabled={!versions && historyBlocked}
+              onPress={() => (versions ? closeHistory() : loadHistory())}
+            />
+            <Button
+              label="Delete note"
+              variant="danger"
+              disabled={Boolean(conflict || restoringVersionId)}
+              onPress={onDelete}
+            />
+          </View>
+        </>
+      )}
+      {historyBlocked && !conflict ? (
+        <Text style={styles.historyWarning} accessibilityRole="alert">
+          Sync this note's pending change before opening or restoring history.
+        </Text>
+      ) : null}
       {historyError ? (
         <Text
           style={styles.historyWarning}
@@ -326,7 +407,8 @@ export default function NoteEditor() {
       {versions ? (
         <View style={styles.history}>
           <Text style={styles.historyTitle}>Version history</Text>
-          {restoreProtocolVersion !== null && restoreProtocolVersion !== 1 ? (
+          {restoreProtocolVersion !== null &&
+          restoreProtocolVersion !== RESTORE_PROTOCOL_VERSION ? (
             <Text style={styles.historyWarning} accessibilityRole="alert">
               This client can show history but does not support the server's restore protocol.
               Update Iris before restoring.
@@ -348,6 +430,12 @@ export default function NoteEditor() {
                 </Text>
                 <Text style={styles.versionMeta}>{new Date(v.createdAt).toLocaleString()}</Text>
                 <Text style={styles.versionMeta}>
+                  {versionStateLabel(v)}
+                  {v.isDeleted === null
+                    ? `; restore keeps this note ${note.deletedAt ? 'deleted' : 'live'}`
+                    : ''}
+                </Text>
+                <Text style={styles.versionMeta}>
                   {v.folderSnapshotKnown
                     ? `Folder: ${v.folder === null ? 'Root' : v.folder}`
                     : 'Folder was not captured; restore keeps the current folder'}
@@ -355,11 +443,11 @@ export default function NoteEditor() {
                 </Text>
               </View>
               <Button
-                label={v.folderSnapshotKnown ? 'Restore' : 'Restore content'}
-                variant="ghost"
+                label={restoreVersionLabel(v, Boolean(note.deletedAt))}
+                variant={v.isDeleted === true ? 'danger' : 'ghost'}
                 loading={restoringVersionId === v.id}
                 disabled={!restoreAllowed}
-                accessibilityLabel={`${v.folderSnapshotKnown ? 'Restore' : 'Restore content from'} version ${v.version}`}
+                accessibilityLabel={`${restoreVersionLabel(v, Boolean(note.deletedAt))} version ${v.version}`}
                 onPress={() => restore(v)}
               />
             </View>
@@ -395,6 +483,22 @@ const styles = StyleSheet.create({
     gap: theme.space(2),
     marginTop: theme.space(2),
   },
+  deletedPanel: {
+    backgroundColor: theme.colors.surface,
+    borderColor: theme.colors.danger,
+    borderWidth: 1,
+    borderRadius: theme.radius,
+    padding: theme.space(4),
+  },
+  deletedTitle: { color: theme.colors.danger, fontSize: 18, fontWeight: '700' },
+  deletedMeta: { color: theme.colors.textDim, fontSize: 12, marginTop: theme.space(1) },
+  deletedNoteTitle: {
+    color: theme.colors.text,
+    fontSize: 20,
+    fontWeight: '600',
+    marginTop: theme.space(3),
+  },
+  deletedBody: { color: theme.colors.textDim, fontSize: 15, lineHeight: 22, marginTop: 8 },
   title: {
     color: theme.colors.text,
     fontSize: 24,

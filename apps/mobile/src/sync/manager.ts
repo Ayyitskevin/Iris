@@ -192,7 +192,7 @@ export function updateNoteLocal(id: string, patch: NotePatch): boolean {
   const lease = currentLease();
   if (store$.conflicts.get()[id]) return false;
   const current = store$.notes[id].get();
-  if (!current || current.workspaceId !== lease.workspaceId) return false;
+  if (!current || current.workspaceId !== lease.workspaceId || current.deletedAt) return false;
   const next: Note = {
     ...current,
     title: patch.title ?? current.title,
@@ -222,7 +222,7 @@ export function deleteNoteLocal(id: string): boolean {
   const lease = currentLease();
   if (store$.conflicts.get()[id]) return false;
   const current = store$.notes[id].get();
-  if (!current || current.workspaceId !== lease.workspaceId) return false;
+  if (!current || current.workspaceId !== lease.workspaceId || current.deletedAt) return false;
   assertCurrentSession(lease);
   store$.notes[id].set({ ...current, deletedAt: nowIso() });
   enqueue(lease, {

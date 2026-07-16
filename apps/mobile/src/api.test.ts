@@ -215,6 +215,18 @@ describe('successful version-history response validation', () => {
     authorName: sessionA.displayName,
     createdAt: '2026-07-16T12:00:00.000Z',
   };
+  const restoredNote = {
+    id: 'note-1',
+    workspaceId: sessionA.workspaceId,
+    title: 'Restored',
+    bodyMd: 'Body',
+    folder: 'current/folder',
+    tags: ['legacy'],
+    version: 2,
+    createdAt: '2026-07-16T12:00:00.000Z',
+    updatedAt: '2026-07-16T12:01:00.000Z',
+    deletedAt: null,
+  };
 
   it('normalizes fields omitted by an older server to honest legacy values', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
@@ -228,6 +240,7 @@ describe('successful version-history response validation', () => {
       folder: null,
       folderSnapshotKnown: false,
       tags: [],
+      isDeleted: null,
     });
   });
 
@@ -278,25 +291,20 @@ describe('successful version-history response validation', () => {
     );
   });
 
-  it('rejects restore protocol 1 without its authoritative head', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ versions: [legacyVersion], restoreProtocolVersion: 1 }), {
-        status: 200,
-      }),
-    );
-
-    await expect(apiForLease(openSessionLease()!).listVersions('note-1')).rejects.toBeInstanceOf(
-      ApiResponseValidationError,
-    );
-  });
-
-  it('rejects legacy field omissions under restore protocol 1', async () => {
+  it('rejects current restore protocol without its authoritative head', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
-          versions: [{ ...legacyVersion, tags: [] }],
-          headVersion: 1,
-          restoreProtocolVersion: 1,
+          versions: [
+            {
+              ...legacyVersion,
+              folder: null,
+              folderSnapshotKnown: true,
+              tags: [],
+              isDeleted: false,
+            },
+          ],
+          restoreProtocolVersion: 2,
         }),
         { status: 200 },
       ),
@@ -305,6 +313,79 @@ describe('successful version-history response validation', () => {
     await expect(apiForLease(openSessionLease()!).listVersions('note-1')).rejects.toBeInstanceOf(
       ApiResponseValidationError,
     );
+  });
+
+  it('rejects missing lifecycle metadata under current restore protocol', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          versions: [
+            {
+              ...legacyVersion,
+              folder: null,
+              folderSnapshotKnown: true,
+              tags: [],
+            },
+          ],
+          headVersion: 1,
+          restoreProtocolVersion: 2,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    await expect(apiForLease(openSessionLease()!).listVersions('note-1')).rejects.toBeInstanceOf(
+      ApiResponseValidationError,
+    );
+  });
+
+  it('keeps protocol 1 readable with explicitly unknown lifecycle state', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          versions: [
+            {
+              ...legacyVersion,
+              folder: 'projects',
+              folderSnapshotKnown: true,
+              tags: ['legacy'],
+            },
+          ],
+          headVersion: 1,
+          restoreProtocolVersion: 1,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const result = await apiForLease(openSessionLease()!).listVersions('note-1');
+    expect(result.restoreProtocolVersion).toBe(1);
+    expect(result.versions[0]).toMatchObject({ isDeleted: null, folder: 'projects' });
+  });
+
+  it('accepts complete protocol-2 tombstone metadata', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          versions: [
+            {
+              ...legacyVersion,
+              folder: null,
+              folderSnapshotKnown: true,
+              tags: [],
+              isDeleted: true,
+            },
+          ],
+          headVersion: 1,
+          restoreProtocolVersion: 2,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const result = await apiForLease(openSessionLease()!).listVersions('note-1');
+    expect(result.restoreProtocolVersion).toBe(2);
+    expect(result.versions[0]?.isDeleted).toBe(true);
   });
 
   it('keeps a future restore protocol readable but distinguishable', async () => {
@@ -320,33 +401,23 @@ describe('successful version-history response validation', () => {
             },
           ],
           headVersion: 1,
-          restoreProtocolVersion: 2,
+          restoreProtocolVersion: 3,
         }),
         { status: 200 },
       ),
     );
 
     const result = await apiForLease(openSessionLease()!).listVersions('note-1');
-    expect(result.restoreProtocolVersion).toBe(2);
+    expect(result.restoreProtocolVersion).toBe(3);
     expect(result.versions).toHaveLength(1);
   });
 
-  it('rejects an older restore response that cannot prove its folder result', async () => {
+  it('rejects a restore response that cannot prove both partial-result dimensions', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
-          note: {
-            id: 'note-1',
-            workspaceId: sessionA.workspaceId,
-            title: 'Restored',
-            bodyMd: 'Body',
-            folder: 'current/folder',
-            tags: ['legacy'],
-            version: 2,
-            createdAt: '2026-07-16T12:00:00.000Z',
-            updatedAt: '2026-07-16T12:01:00.000Z',
-            deletedAt: null,
-          },
+          note: restoredNote,
+          folderRestored: true,
         }),
         { status: 200 },
       ),
@@ -357,8 +428,31 @@ describe('successful version-history response validation', () => {
         versionId: 'version-1',
         baseVersion: 1,
         preserveCurrentFolderIfUnknown: true,
+        preserveCurrentDeletionStateIfUnknown: true,
       }),
     ).rejects.toBeInstanceOf(ApiResponseValidationError);
+  });
+
+  it('uses the v2 restore path and accepts an authoritative tombstone result', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          note: { ...restoredNote, deletedAt: '2026-07-16T12:02:00.000Z' },
+          folderRestored: true,
+          deletionStateRestored: true,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const result = await apiForLease(openSessionLease()!).restoreVersion('note-1', {
+      versionId: 'version-1',
+      baseVersion: 1,
+      preserveCurrentFolderIfUnknown: false,
+      preserveCurrentDeletionStateIfUnknown: false,
+    });
+    expect(result.note.deletedAt).toBe('2026-07-16T12:02:00.000Z');
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/v2/notes/note-1/restore');
   });
 });
 
@@ -390,19 +484,27 @@ describe('successful activity response validation', () => {
 
   it('keeps a future undo protocol readable but distinguishable', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ activity: [activity], undoProtocolVersion: 2 }), {
+      new Response(JSON.stringify({ activity: [activity], undoProtocolVersion: 3 }), {
         status: 200,
       }),
     );
 
     const result = await apiForLease(openSessionLease()!).listActivity();
-    expect(result.undoProtocolVersion).toBe(2);
+    expect(result.undoProtocolVersion).toBe(3);
     expect(result.activity).toHaveLength(1);
   });
 
-  it('rejects an older undo response that cannot prove its organization result', async () => {
+  it('rejects an older undo response without an authoritative tombstone', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ undo: activity, note: null }), { status: 200 }),
+      new Response(
+        JSON.stringify({
+          undo: activity,
+          note: null,
+          folderRestored: true,
+          deletionStateRestored: true,
+        }),
+        { status: 200 },
+      ),
     );
 
     await expect(apiForLease(openSessionLease()!).undoActivity(activity.id)).rejects.toBeInstanceOf(
@@ -410,15 +512,89 @@ describe('successful activity response validation', () => {
     );
   });
 
-  it('rejects malformed undo organization metadata', async () => {
+  it('rejects an undo response that omits lifecycle proof', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ undo: activity, note: null, folderRestored: 'yes' }), {
-        status: 200,
-      }),
+      new Response(
+        JSON.stringify({
+          undo: activity,
+          note: {
+            id: 'note-1',
+            workspaceId: sessionA.workspaceId,
+            title: 'Deleted',
+            bodyMd: 'Body',
+            folder: null,
+            tags: [],
+            version: 3,
+            createdAt: '2026-07-16T12:00:00.000Z',
+            updatedAt: '2026-07-16T12:02:00.000Z',
+            deletedAt: '2026-07-16T12:02:00.000Z',
+          },
+          folderRestored: true,
+        }),
+        { status: 200 },
+      ),
     );
 
     await expect(apiForLease(openSessionLease()!).undoActivity(activity.id)).rejects.toBeInstanceOf(
       ApiResponseValidationError,
     );
+  });
+
+  it('rejects an undo response that claims lifecycle state was not restored', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          undo: activity,
+          note: {
+            id: 'note-1',
+            workspaceId: sessionA.workspaceId,
+            title: 'Live note',
+            bodyMd: 'Body',
+            folder: null,
+            tags: [],
+            version: 3,
+            createdAt: '2026-07-16T12:00:00.000Z',
+            updatedAt: '2026-07-16T12:02:00.000Z',
+            deletedAt: null,
+          },
+          folderRestored: true,
+          deletionStateRestored: false,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    await expect(apiForLease(openSessionLease()!).undoActivity(activity.id)).rejects.toBeInstanceOf(
+      ApiResponseValidationError,
+    );
+  });
+
+  it('uses the v2 undo path and accepts its authoritative tombstone', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          undo: activity,
+          note: {
+            id: 'note-1',
+            workspaceId: sessionA.workspaceId,
+            title: 'Deleted',
+            bodyMd: 'Body',
+            folder: null,
+            tags: [],
+            version: 3,
+            createdAt: '2026-07-16T12:00:00.000Z',
+            updatedAt: '2026-07-16T12:02:00.000Z',
+            deletedAt: '2026-07-16T12:02:00.000Z',
+          },
+          folderRestored: true,
+          deletionStateRestored: true,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const result = await apiForLease(openSessionLease()!).undoActivity(activity.id);
+    expect(result.note.deletedAt).toBe('2026-07-16T12:02:00.000Z');
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/v2/activity/activity-1/undo');
   });
 });

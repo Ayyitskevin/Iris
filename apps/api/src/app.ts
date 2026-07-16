@@ -16,9 +16,11 @@ import {
   RestoreVersionRequest,
   SignInRequest,
   SignUpRequest,
+  RESTORE_PROTOCOL_VERSION,
   SYNC_HTTP_BODY_LIMIT_BYTES,
   SyncChangesRequest,
   SyncPushRequest,
+  UNDO_PROTOCOL_VERSION,
   UpdateNoteRequest,
   type AuthResponse,
 } from '@iris/shared';
@@ -243,12 +245,25 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
       return {
         versions: history.versions.map(serializeVersion),
         headVersion: history.headVersion,
-        restoreProtocolVersion: 1,
+        restoreProtocolVersion: RESTORE_PROTOCOL_VERSION,
       };
     }),
   );
 
+  // Protocol-1 restore always revived a note and cannot safely interpret tombstone
+  // snapshots. Keep the old path as an explicit no-mutation cutover for rolling clients.
   app.post('/v1/notes/:id/restore', guarded, (req) =>
+    tenant(req, async (ctx) => {
+      requireScope(ctx, 'notes:write');
+      throw new HttpError(
+        428,
+        'restore_protocol_upgrade_required',
+        'Reload version history with a current Iris client before restoring',
+      );
+    }),
+  );
+
+  app.post('/v2/notes/:id/restore', guarded, (req) =>
     tenant(req, async (ctx) => {
       requireScope(ctx, 'notes:write');
       if (
@@ -269,6 +284,7 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
         input.versionId,
         input.baseVersion,
         input.preserveCurrentFolderIfUnknown,
+        input.preserveCurrentDeletionStateIfUnknown,
       );
     }),
   );
@@ -306,11 +322,28 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
   app.get('/v1/activity', guarded, (req) =>
     tenant(req, async (ctx) => {
       requireScope(ctx, 'notes:read');
-      return { activity: await activityService.listActivity(ctx), undoProtocolVersion: 1 };
+      return {
+        activity: await activityService.listActivity(ctx),
+        undoProtocolVersion: UNDO_PROTOCOL_VERSION,
+      };
     }),
   );
 
+  // As with restore, the legacy mutation path is intentionally inert during a rolling
+  // protocol cutover. A v2 client routed to an old server receives 404; an old client
+  // routed here receives 428. Neither mismatch can silently apply legacy semantics.
   app.post('/v1/activity/:id/undo', guarded, (req) =>
+    tenant(req, async (ctx) => {
+      requireUser(ctx.principal);
+      throw new HttpError(
+        428,
+        'undo_protocol_upgrade_required',
+        'Reload activity with a current Iris client before undoing',
+      );
+    }),
+  );
+
+  app.post('/v2/activity/:id/undo', guarded, (req) =>
     tenant(req, async (ctx) => {
       requireUser(ctx.principal);
       return activityService.undoActivity(ctx, (req.params as { id: string }).id);

@@ -78,21 +78,30 @@ These were named as out of scope and are staying out until the foundation is pro
   root/folder distinctions, stale restores and undos, route/request invalidation,
   unconfirmed mutation outcomes, explicit legacy preservation, tenant isolation, and
   fail-loud incomplete undo history.
+- **Phase 2.4 — tombstone history parity** (ADR-014): migration `0005` stores logical
+  live/deleted state as a tri-state snapshot with no default, backfilling only provable
+  current heads and leaving older/old-binary rows unknown. Direct restore reconstructs
+  known lifecycle state or requires explicit legacy preservation; whole-snapshot undo
+  fails closed on unknown state and can re-tombstone a direct or sync revival. Protocol
+  2 moves restore/undo mutations to distinct `/v2` paths while retired v1 paths return
+  428, so a mixed binary cannot reinterpret the new semantics. Successful undo returns
+  the authoritative note including tombstones for immediate replica fencing. Focused
+  tests cover restore-to-delete, undo-delete, undo-create, restore/sync revival undo,
+  legacy uncertainty, migration drift/RLS, and mixed-path no-mutation behavior.
 
 ## Near-term follow-ups (next things)
 
-1. **Complete Sync v2's resource/repository boundary and release gates**: generic resource envelopes,
+1. **Make resurrection an explicit sync intent**: ordinary upsert against a tombstone
+   still revives at a matching base version. Add a dedicated `resurrect` mutation,
+   make normal upsert conflict with tombstones, retain the local draft, and give the
+   operator explicit “Restore my draft” versus “Keep deleted” choices across devices.
+2. **Complete Sync v2's resource/repository boundary and release gates**: generic resource envelopes,
    SQLite on native, IndexedDB plus cross-tab session coordination on web,
    transactional note+outbox writes, and a user-facing recovery/import path for
    quarantined legacy `iris:state:v1` data, followed by native iOS/Android device or
    simulator acceptance. The current note-only wire contract and size-limited per-owner
    SecureStore value, missing web cross-tab ownership, missing recovery import, and
    unrun native acceptance are explicit blockers before the work queue.
-2. **Complete tombstone-state reversibility**: include deleted/live state in version
-   snapshots and make direct restore plus activity undo reconstruct it exactly. Today a
-   restore or sync update can revive a tombstoned note, but its prior deleted state is
-   not represented in `note_versions`, so a later compensating undo cannot recreate that
-   tombstone without guessing.
 3. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
    accountable human-or-agent assignee, reversible writes, and the same sync resource
    envelope. Keep activity, check-in, delegation, and durable claim/run semantics

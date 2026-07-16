@@ -29,8 +29,9 @@ export async function listActivity(ctx: Ctx): Promise<ActivityEntry[]> {
 
 export interface UndoResult {
   undo: ActivityEntry;
-  note: Note | null;
+  note: Note;
   folderRestored: boolean;
+  deletionStateRestored: boolean;
 }
 
 export async function undoActivity(ctx: Ctx, activityId: string): Promise<UndoResult> {
@@ -93,12 +94,20 @@ export async function undoActivity(ctx: Ctx, activityId: string): Promise<UndoRe
         'incomplete_history',
       );
     }
+    if (prior.isDeleted === null) {
+      throw badRequest(
+        'The snapshot required to undo this action did not capture its live/deleted state',
+        'incomplete_history',
+      );
+    }
     newTitle = prior.title;
     newBody = prior.bodyMd;
     newTags = prior.tags ?? [];
     folderRestored = prior.folderSnapshotKnown;
     if (folderRestored) newFolder = prior.folder;
-    newDeletedAt = null; // undoing back to a live state revives the note
+    // Undo is a new compensating write, so recreating a tombstone records when the
+    // compensation happened instead of backdating the current note.
+    newDeletedAt = prior.isDeleted ? new Date() : null;
   } else {
     // Undoing the very first create => the note should cease to exist.
     newDeletedAt = new Date();
@@ -133,7 +142,8 @@ export async function undoActivity(ctx: Ctx, activityId: string): Promise<UndoRe
 
   return {
     undo: serializeActivity(undoRows[0]!, false),
-    note: head.deletedAt ? null : serializeNote(head),
+    note: serializeNote(head),
     folderRestored,
+    deletionStateRestored: true,
   };
 }

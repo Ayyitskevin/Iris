@@ -474,10 +474,53 @@ and ambiguous completion classification. The screens distinguish load failure fr
 empty list, announce errors, label legacy content-only restores, refresh the tag editor
 after restore, and surface any unproven organization state.
 
-This ADR does **not** claim full state reversibility. `note_versions` still omits the
-deleted/tombstone bit, so restoring or syncing a write over a deleted note can revive it
-without leaving enough history for a later undo to reconstruct the prior tombstone. That
-separate correctness gate remains explicit in ROADMAP.
+This ADR did **not** claim full state reversibility: `note_versions` still omitted the
+deleted/tombstone bit. ADR-014 closes that lifecycle-history gap without rewriting this
+decision's organization contract.
+
+---
+
+## ADR-014 — Tri-state tombstone history and rollout-safe lifecycle restore
+
+**Accepted.**
+
+Migration `0005` adds nullable `note_versions.is_deleted` with deliberately no
+default: `false` means captured live state, `true` means captured tombstone state, and
+`NULL` means the legacy or old-binary writer never recorded lifecycle state. A default
+of `false` would let a rolled-back binary fabricate known-live history. Upgrade
+backfills only a version row provably equal to its note's current head; older rows stay
+unknown. As in ADR-013, the migration suspends FORCE RLS only inside its transaction,
+restores ENABLE + FORCE, and joins the additive artifact gate with exact type,
+nullability, no-default, and policy checks.
+
+Every current writer records `is_deleted` at the shared version/activity choke point.
+The snapshot stores logical lifecycle state rather than a historical deletion timestamp:
+restore and undo are new compensating writes, so recreating a tombstone receives the
+new write's timestamp instead of backdating the current note.
+
+Direct restore copies known live/deleted state into a new head. Unknown state fails
+`incomplete_version_snapshot` unless the caller explicitly preserves today's state;
+the response's `deletionStateRestored` prevents that partial operation from posing as
+exact. Whole-snapshot undo is stricter: a missing or lifecycle-unknown prior snapshot
+returns `incomplete_history` and records no note, version, or activity write. Known
+state lets undo-delete revive a note and lets undo of direct or sync revival recreate
+the prior tombstone. Successful undo returns the authoritative `Note` even when it is
+a tombstone, so the client can fence editing immediately rather than waiting for pull.
+
+This semantic change uses `restoreProtocolVersion = 2` and
+`undoProtocolVersion = 2`. Current mutations live at
+`POST /v2/notes/:id/restore` and `POST /v2/activity/:id/undo`; the corresponding v1
+paths are intentionally inert and return 428. This path split is load-bearing during a
+rolling deployment: an old server cannot understand a new path and returns 404, while a
+new server cannot execute an old client's legacy mutation. A request field alone would
+not suffice because an old Zod handler could strip it and still mutate.
+
+The mobile client keeps non-current protocols read-only, labels live/deleted/unknown
+history, explicitly preserves unknown legacy state, applies authoritative tombstone
+responses immediately, blocks history mutation while the same note has local pending
+work, and treats direct tombstone routes as read-only. Ordinary sync upsert can still
+revive a matching tombstone; making that an explicit `resurrect` mutation and conflict
+choice remains the next lifecycle-safety slice in ROADMAP.
 
 ---
 

@@ -12,8 +12,12 @@ describe('Sync v2 migration', () => {
       const organization = migrations.find(
         (migration) => migration.name === '0004_note_version_organization.sql',
       );
+      const tombstone = migrations.find(
+        (migration) => migration.name === '0005_note_version_tombstone.sql',
+      );
       expect(syncV2).toBeDefined();
       expect(organization).toBeDefined();
+      expect(tombstone).toBeDefined();
       for (const migration of migrations.filter((item) => item.name < '0003_sync_v2.sql')) {
         await client.exec(migration.sql);
       }
@@ -47,8 +51,10 @@ describe('Sync v2 migration', () => {
         ],
       );
       await client.query(
-        'UPDATE notes SET folder = $1, version = 2 WHERE workspace_id = $2 AND id = $3',
-        ['projects/current', workspaceA, noteA1],
+        `UPDATE notes
+         SET folder = $1, version = 2, deleted_at = $2
+         WHERE workspace_id = $3 AND id = $4`,
+        ['projects/current', '2026-01-04T00:00:00.000Z', workspaceA, noteA1],
       );
       const authorId = randomUUID();
       await client.query(
@@ -57,12 +63,13 @@ describe('Sync v2 migration', () => {
             author_type, author_id, author_name)
          VALUES
            ($1, $2, $3, 1, 'A old', 'old body', '["old"]'::jsonb, 'user', $4, 'Owner'),
-           ($5, $2, $3, 2, 'A one', 'current body', '["current"]'::jsonb, 'user', $4, 'Owner')`,
-        [randomUUID(), noteA1, workspaceA, authorId, randomUUID()],
+           ($5, $2, $3, 2, 'A one', 'current body', '["current"]'::jsonb, 'user', $4, 'Owner'),
+           ($6, $7, $3, 1, 'A two', '', '[]'::jsonb, 'user', $4, 'Owner')`,
+        [randomUUID(), noteA1, workspaceA, authorId, randomUUID(), randomUUID(), noteA2],
       );
 
       // This is the supported upgrade path: the ledger baselines a recognized legacy
-      // schema instead of replaying shipped migrations, then applies 0003 and 0004.
+      // schema instead of replaying shipped migrations, then applies 0003 through 0005.
       await applyMigrationsPglite(client);
       const firstLedger = (
         await client.query(
@@ -83,6 +90,7 @@ describe('Sync v2 migration', () => {
         '0002_search_and_tags.sql',
         '0003_sync_v2.sql',
         '0004_note_version_organization.sql',
+        '0005_note_version_tombstone.sql',
       ]);
       const receiptColumn = (
         await client.query(
@@ -102,9 +110,27 @@ describe('Sync v2 migration', () => {
         is_nullable: 'NO',
         column_default: '1',
       });
+      const tombstoneColumn = (
+        await client.query(
+          `SELECT data_type, is_nullable, column_default
+           FROM information_schema.columns
+           WHERE table_schema = current_schema()
+             AND table_name = 'note_versions'
+             AND column_name = 'is_deleted'`,
+        )
+      ).rows[0] as {
+        data_type: string;
+        is_nullable: 'YES' | 'NO';
+        column_default: string | null;
+      };
+      expect(tombstoneColumn).toEqual({
+        data_type: 'boolean',
+        is_nullable: 'YES',
+        column_default: null,
+      });
       const organizationHistory = (
         await client.query(
-          `SELECT version, folder, folder_snapshot_known
+          `SELECT version, folder, folder_snapshot_known, is_deleted
            FROM note_versions
            WHERE workspace_id = $1 AND note_id = $2
            ORDER BY version`,
@@ -114,13 +140,28 @@ describe('Sync v2 migration', () => {
         version: number;
         folder: string | null;
         folder_snapshot_known: boolean;
+        is_deleted: boolean | null;
       }>;
       expect(organizationHistory).toEqual([
-        { version: 1, folder: null, folder_snapshot_known: false },
-        { version: 2, folder: 'projects/current', folder_snapshot_known: true },
+        { version: 1, folder: null, folder_snapshot_known: false, is_deleted: null },
+        {
+          version: 2,
+          folder: 'projects/current',
+          folder_snapshot_known: true,
+          is_deleted: true,
+        },
       ]);
+      const liveCurrentHead = (
+        await client.query(
+          `SELECT is_deleted
+           FROM note_versions
+           WHERE workspace_id = $1 AND note_id = $2 AND version = 1`,
+          [workspaceA, noteA2],
+        )
+      ).rows[0] as { is_deleted: boolean | null };
+      expect(liveCurrentHead.is_deleted).toBe(false);
 
-      // An old rolled-back server omitting both 0004 columns stays fail-safe.
+      // An old rolled-back server omitting the 0004/0005 columns stays fail-safe.
       await client.query(
         `INSERT INTO note_versions
            (id, note_id, workspace_id, version, title, body_md, tags,
@@ -131,13 +172,21 @@ describe('Sync v2 migration', () => {
       );
       const oldBinary = (
         await client.query(
-          `SELECT folder, folder_snapshot_known
+          `SELECT folder, folder_snapshot_known, is_deleted
            FROM note_versions
            WHERE workspace_id = $1 AND note_id = $2 AND version = 3`,
           [workspaceA, noteA1],
         )
-      ).rows[0] as { folder: string | null; folder_snapshot_known: boolean };
-      expect(oldBinary).toEqual({ folder: null, folder_snapshot_known: false });
+      ).rows[0] as {
+        folder: string | null;
+        folder_snapshot_known: boolean;
+        is_deleted: boolean | null;
+      };
+      expect(oldBinary).toEqual({
+        folder: null,
+        folder_snapshot_known: false,
+        is_deleted: null,
+      });
 
       const backfilled = (
         await client.query(
@@ -192,6 +241,158 @@ describe('Sync v2 migration', () => {
     }
   });
 
+  it('backfills identical note ids independently across workspaces', async () => {
+    const client = new PGlite();
+    try {
+      const migrations = migrationSql();
+      const tombstone = migrations.find(
+        (migration) => migration.name === '0005_note_version_tombstone.sql',
+      );
+      expect(tombstone).toBeDefined();
+      for (const migration of migrations.filter(
+        (item) => item.name < '0005_note_version_tombstone.sql',
+      )) {
+        await client.exec(migration.sql);
+      }
+
+      const workspaceA = randomUUID();
+      const workspaceB = randomUUID();
+      const sharedNoteId = randomUUID();
+      const authorId = randomUUID();
+      await client.query('INSERT INTO workspaces (id, name) VALUES ($1, $2), ($3, $4)', [
+        workspaceA,
+        'Workspace A',
+        workspaceB,
+        'Workspace B',
+      ]);
+
+      await client.query(`SELECT set_config('app.current_workspace', $1, false)`, [workspaceA]);
+      await client.query(
+        `INSERT INTO notes (id, workspace_id, title)
+         VALUES ($1, $2, 'Live note')`,
+        [sharedNoteId, workspaceA],
+      );
+      await client.query(
+        `INSERT INTO note_versions
+           (id, note_id, workspace_id, version, title, body_md, tags,
+            author_type, author_id, author_name)
+         VALUES ($1, $2, $3, 1, 'Live note', '', '[]'::jsonb, 'user', $4, 'Owner')`,
+        [randomUUID(), sharedNoteId, workspaceA, authorId],
+      );
+
+      await client.query(`SELECT set_config('app.current_workspace', $1, false)`, [workspaceB]);
+      await client.query(
+        `INSERT INTO notes (id, workspace_id, title, deleted_at)
+         VALUES ($1, $2, 'Deleted note', $3)`,
+        [sharedNoteId, workspaceB, '2026-07-16T12:00:00.000Z'],
+      );
+      await client.query(
+        `INSERT INTO note_versions
+           (id, note_id, workspace_id, version, title, body_md, tags,
+            author_type, author_id, author_name)
+         VALUES ($1, $2, $3, 1, 'Deleted note', '', '[]'::jsonb, 'user', $4, 'Owner')`,
+        [randomUUID(), sharedNoteId, workspaceB, authorId],
+      );
+
+      await client.exec(tombstone!.sql);
+
+      const states = (
+        await client.query(
+          `SELECT workspace_id, is_deleted
+           FROM note_versions
+           WHERE note_id = $1
+           ORDER BY workspace_id`,
+          [sharedNoteId],
+        )
+      ).rows as Array<{ workspace_id: string; is_deleted: boolean | null }>;
+      expect(states).toHaveLength(2);
+      expect(states.find((row) => row.workspace_id === workspaceA)?.is_deleted).toBe(false);
+      expect(states.find((row) => row.workspace_id === workspaceB)?.is_deleted).toBe(true);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('rolls back the tombstone artifact, receipt, and RLS suspension on backfill failure', async () => {
+    const client = new PGlite();
+    try {
+      await applyMigrationsPglite(client);
+      const workspaceId = randomUUID();
+      const noteId = randomUUID();
+      await client.query('INSERT INTO workspaces (id, name) VALUES ($1, $2)', [
+        workspaceId,
+        'Rollback workspace',
+      ]);
+      await client.query(`SELECT set_config('app.current_workspace', $1, false)`, [workspaceId]);
+      await client.query('INSERT INTO notes (id, workspace_id, title) VALUES ($1, $2, $3)', [
+        noteId,
+        workspaceId,
+        'Rollback note',
+      ]);
+      await client.query(
+        `INSERT INTO note_versions
+           (id, note_id, workspace_id, version, title, body_md, tags,
+            author_type, author_id, author_name)
+         VALUES ($1, $2, $3, 1, 'Rollback note', '', '[]'::jsonb,
+                 'user', $4, 'Owner')`,
+        [randomUUID(), noteId, workspaceId, randomUUID()],
+      );
+      await client.exec(`
+        DELETE FROM iris_schema_migrations
+        WHERE name = '0005_note_version_tombstone.sql';
+        ALTER TABLE note_versions DROP COLUMN is_deleted;
+        CREATE FUNCTION reject_tombstone_backfill() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'forced tombstone backfill failure';
+        END
+        $$;
+        CREATE TRIGGER reject_tombstone_backfill
+        BEFORE UPDATE ON note_versions
+        FOR EACH ROW EXECUTE FUNCTION reject_tombstone_backfill()
+      `);
+
+      await expect(applyMigrationsPglite(client)).rejects.toThrow(
+        'forced tombstone backfill failure',
+      );
+
+      const column = (
+        await client.query(
+          `SELECT EXISTS (
+             SELECT 1 FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'note_versions'
+               AND column_name = 'is_deleted'
+           ) AS present`,
+        )
+      ).rows[0] as { present: boolean };
+      expect(column.present).toBe(false);
+      const receipt = (
+        await client.query(
+          `SELECT count(*)::text AS count FROM iris_schema_migrations
+           WHERE name = '0005_note_version_tombstone.sql'`,
+        )
+      ).rows[0] as { count: string };
+      expect(receipt.count).toBe('0');
+      const rls = (
+        await client.query(
+          `SELECT relname AS table_name,
+                  relrowsecurity AS enabled,
+                  relforcerowsecurity AS forced
+           FROM pg_class
+           WHERE oid IN (to_regclass('public.notes'), to_regclass('public.note_versions'))
+           ORDER BY relname`,
+        )
+      ).rows as Array<{ table_name: string; enabled: boolean; forced: boolean }>;
+      expect(rls).toEqual([
+        { table_name: 'note_versions', enabled: true, forced: true },
+        { table_name: 'notes', enabled: true, forced: true },
+      ]);
+    } finally {
+      await client.close();
+    }
+  });
+
   it('serializes concurrent fresh runs and rejects checksum drift', async () => {
     const client = new PGlite();
     try {
@@ -203,6 +404,7 @@ describe('Sync v2 migration', () => {
         '0002_search_and_tags.sql',
         '0003_sync_v2.sql',
         '0004_note_version_organization.sql',
+        '0005_note_version_tombstone.sql',
       ]);
 
       await client.query(
@@ -250,6 +452,7 @@ describe('Sync v2 migration', () => {
         '0002_search_and_tags.sql',
         '0003_sync_v2.sql',
         '0004_note_version_organization.sql',
+        '0005_note_version_tombstone.sql',
       ]);
     } finally {
       await client.close();
@@ -329,7 +532,11 @@ describe('Sync v2 migration', () => {
       await applyMigrationsPglite(client);
       await client.exec(`
         DELETE FROM iris_schema_migrations
-        WHERE name IN ('0003_sync_v2.sql', '0004_note_version_organization.sql');
+        WHERE name IN (
+          '0003_sync_v2.sql',
+          '0004_note_version_organization.sql',
+          '0005_note_version_tombstone.sql'
+        );
         DROP TRIGGER notes_sync_seq_assign ON notes;
       `);
 
@@ -345,12 +552,51 @@ describe('Sync v2 migration', () => {
     const client = new PGlite();
     try {
       await applyMigrationsPglite(client);
-      await client.exec(
-        `DELETE FROM iris_schema_migrations WHERE name = '0004_note_version_organization.sql'`,
-      );
+      await client.exec(`
+        DELETE FROM iris_schema_migrations
+        WHERE name IN (
+          '0004_note_version_organization.sql',
+          '0005_note_version_tombstone.sql'
+        )
+      `);
 
       await expect(applyMigrationsPglite(client)).rejects.toThrow(
         'Database contains unledgered 0004_note_version_organization.sql artifacts',
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('rejects unledgered 0005 artifacts in a nonempty ledger', async () => {
+    const client = new PGlite();
+    try {
+      await applyMigrationsPglite(client);
+      await client.exec(
+        `DELETE FROM iris_schema_migrations WHERE name = '0005_note_version_tombstone.sql'`,
+      );
+
+      await expect(applyMigrationsPglite(client)).rejects.toThrow(
+        'Database contains unledgered 0005_note_version_tombstone.sql artifacts',
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('rejects a malformed partial 0005 artifact without a receipt', async () => {
+    const client = new PGlite();
+    try {
+      await applyMigrationsPglite(client);
+      await client.exec(`
+        DELETE FROM iris_schema_migrations
+        WHERE name = '0005_note_version_tombstone.sql';
+        ALTER TABLE note_versions
+          ALTER COLUMN is_deleted TYPE text USING is_deleted::text
+      `);
+
+      await expect(applyMigrationsPglite(client)).rejects.toThrow(
+        'Database contains unledgered 0005_note_version_tombstone.sql artifacts',
       );
     } finally {
       await client.close();
@@ -455,7 +701,7 @@ describe('Sync v2 migration', () => {
       `,
       artifact: 'function iris_assign_note_sync_seq drifted',
     },
-  ])('rejects $kind after the additive 0004 migration', async ({ sql, artifact }) => {
+  ])('rejects $kind after the additive 0005 migration', async ({ sql, artifact }) => {
     const client = new PGlite();
     try {
       await applyMigrationsPglite(client);
@@ -484,6 +730,39 @@ describe('Sync v2 migration', () => {
       artifact: 'column definition note_versions.folder drifted',
     },
   ])('rejects 0004 $kind', async ({ sql, artifact }) => {
+    const client = new PGlite();
+    try {
+      await applyMigrationsPglite(client);
+      await client.exec(sql);
+
+      await expect(applyMigrationsPglite(client)).rejects.toThrow(artifact);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it.each([
+    {
+      kind: 'dropped tombstone-state column',
+      sql: 'ALTER TABLE note_versions DROP COLUMN is_deleted',
+      artifact: 'column definition note_versions.is_deleted missing',
+    },
+    {
+      kind: 'manufactured live-state default',
+      sql: 'ALTER TABLE note_versions ALTER COLUMN is_deleted SET DEFAULT false',
+      artifact: 'column definition note_versions.is_deleted drifted',
+    },
+    {
+      kind: 'lost legacy unknown state',
+      sql: 'ALTER TABLE note_versions ALTER COLUMN is_deleted SET NOT NULL',
+      artifact: 'column definition note_versions.is_deleted drifted',
+    },
+    {
+      kind: 'changed tombstone-state type',
+      sql: 'ALTER TABLE note_versions ALTER COLUMN is_deleted TYPE text USING is_deleted::text',
+      artifact: 'column definition note_versions.is_deleted drifted',
+    },
+  ])('rejects 0005 $kind', async ({ sql, artifact }) => {
     const client = new PGlite();
     try {
       await applyMigrationsPglite(client);
@@ -647,8 +926,9 @@ describe('Sync v2 migration', () => {
         'RLS workspace',
       ]);
       await client.query(
-        'INSERT INTO notes (id, workspace_id, title, folder) VALUES ($1, $2, $3, $4)',
-        [noteId, workspaceId, 'RLS legacy note', 'rls/folder'],
+        `INSERT INTO notes (id, workspace_id, title, folder, deleted_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [noteId, workspaceId, 'RLS legacy note', 'rls/folder', '2026-01-05T00:00:00.000Z'],
       );
       await client.query(
         `INSERT INTO note_versions
@@ -686,21 +966,38 @@ describe('Sync v2 migration', () => {
       expect(note.sync_seq).toBe('1');
       const version = (
         await client.query(
-          `SELECT folder, folder_snapshot_known
+          `SELECT folder, folder_snapshot_known, is_deleted
            FROM note_versions
            WHERE workspace_id = $1 AND note_id = $2 AND version = 1`,
           [workspaceId, noteId],
         )
-      ).rows[0] as { folder: string | null; folder_snapshot_known: boolean };
-      expect(version).toEqual({ folder: 'rls/folder', folder_snapshot_known: true });
+      ).rows[0] as {
+        folder: string | null;
+        folder_snapshot_known: boolean;
+        is_deleted: boolean | null;
+      };
+      expect(version).toEqual({
+        folder: 'rls/folder',
+        folder_snapshot_known: true,
+        is_deleted: true,
+      });
       const rls = (
         await client.query(
-          `SELECT relrowsecurity AS enabled, relforcerowsecurity AS forced
+          `SELECT relname AS table_name,
+                  relrowsecurity AS enabled,
+                  relforcerowsecurity AS forced
            FROM pg_class
-           WHERE oid = to_regclass('public.notes')`,
+           WHERE oid IN (
+             to_regclass('public.notes'),
+             to_regclass('public.note_versions')
+           )
+           ORDER BY relname`,
         )
-      ).rows[0] as { enabled: boolean; forced: boolean };
-      expect(rls).toEqual({ enabled: true, forced: true });
+      ).rows as Array<{ table_name: string; enabled: boolean; forced: boolean }>;
+      expect(rls).toEqual([
+        { table_name: 'note_versions', enabled: true, forced: true },
+        { table_name: 'notes', enabled: true, forced: true },
+      ]);
     } finally {
       if (roleSet) await client.exec('RESET ROLE');
       await client.close();

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { call, makeApp, signUp, type TestApp } from './helpers';
 
@@ -60,8 +61,15 @@ describe('agent actors, activity feed, and undo', () => {
     expect(agentAction.actorName).toBe('Researcher');
     expect(agentAction.undone).toBe(false);
 
+    // The retired path is inert, even though the activity id is otherwise valid.
+    const retired = await call(t.app, 'POST', `/v1/activity/${agentAction.id}/undo`, {
+      token: user.token,
+    });
+    expect(retired.status).toBe(428);
+    expect(retired.json.error.code).toBe('undo_protocol_upgrade_required');
+
     // Operator undoes the agent's action → the prior version is restored.
-    const undo = await call(t.app, 'POST', `/v1/activity/${agentAction.id}/undo`, {
+    const undo = await call(t.app, 'POST', `/v2/activity/${agentAction.id}/undo`, {
       token: user.token,
     });
     expect(undo.status).toBe(200);
@@ -69,6 +77,7 @@ describe('agent actors, activity feed, and undo', () => {
     expect(undo.json.note.folder).toBe('operator/folder');
     expect(undo.json.note.tags).toEqual(['operator']);
     expect(undo.json.folderRestored).toBe(true);
+    expect(undo.json.deletionStateRestored).toBe(true);
     expect(undo.json.note.version).toBe(3); // append-only: a new head version
 
     // The note really is back to the operator's text.
@@ -85,6 +94,7 @@ describe('agent actors, activity feed, and undo', () => {
       version: 3,
       folder: 'operator/folder',
       folderSnapshotKnown: true,
+      isDeleted: false,
       tags: ['operator'],
     });
 
@@ -95,7 +105,7 @@ describe('agent actors, activity feed, and undo', () => {
     expect(feed2.json.activity.some((a: any) => a.action === 'note.undo')).toBe(true);
 
     // Undoing twice is refused.
-    const undoAgain = await call(t.app, 'POST', `/v1/activity/${agentAction.id}/undo`, {
+    const undoAgain = await call(t.app, 'POST', `/v2/activity/${agentAction.id}/undo`, {
       token: user.token,
     });
     expect(undoAgain.status).toBe(400);
@@ -121,11 +131,12 @@ describe('agent actors, activity feed, and undo', () => {
       (a: any) => a.actorType === 'agent' && a.action === 'note.create',
     );
 
-    const undo = await call(t.app, 'POST', `/v1/activity/${createAction.id}/undo`, {
+    const undo = await call(t.app, 'POST', `/v2/activity/${createAction.id}/undo`, {
       token: user.token,
     });
     expect(undo.status).toBe(200);
-    expect(undo.json.note).toBeNull(); // create undone => note gone
+    expect(undo.json.note.deletedAt).toEqual(expect.any(String)); // create undone => tombstone
+    expect(undo.json.deletionStateRestored).toBe(true);
 
     const list = await call(t.app, 'GET', '/v1/notes', { token: user.token });
     expect(list.json.notes.find((n: any) => n.id === created.json.note.id)).toBeUndefined();
@@ -159,7 +170,7 @@ describe('agent actors, activity feed, and undo', () => {
       (entry: any) => entry.action === 'note.update' && entry.resultingVersion === 2,
     );
 
-    const undo = await call(t.app, 'POST', `/v1/activity/${update.id}/undo`, {
+    const undo = await call(t.app, 'POST', `/v2/activity/${update.id}/undo`, {
       token: user.token,
     });
     expect(changed.json.note.folder).toBe('after/folder');
@@ -193,7 +204,7 @@ describe('agent actors, activity feed, and undo', () => {
       [user.workspaceId, note.id],
     );
 
-    const undo = await call(t.app, 'POST', `/v1/activity/${update.id}/undo`, {
+    const undo = await call(t.app, 'POST', `/v2/activity/${update.id}/undo`, {
       token: user.token,
     });
     expect(undo.status).toBe(400);
@@ -209,6 +220,180 @@ describe('agent actors, activity feed, and undo', () => {
     expect(afterFeed.json.activity.find((entry: any) => entry.id === update.id).undone).toBe(false);
   });
 
+  it('fails closed when prior deletion state was never captured', async () => {
+    const user = await signUp(t.app);
+    const note = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: user.token,
+        body: { title: 'Legacy lifecycle', bodyMd: 'before', folder: 'known' },
+      })
+    ).json.note;
+    await t.client.query(
+      `UPDATE note_versions SET is_deleted = NULL
+       WHERE workspace_id = $1 AND note_id = $2 AND version = 1`,
+      [user.workspaceId, note.id],
+    );
+    await call(t.app, 'PATCH', `/v1/notes/${note.id}`, {
+      token: user.token,
+      body: { bodyMd: 'after', baseVersion: 1 },
+    });
+    const feed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    const update = feed.json.activity.find(
+      (entry: any) => entry.action === 'note.update' && entry.resultingVersion === 2,
+    );
+
+    const refused = await call(t.app, 'POST', `/v2/activity/${update.id}/undo`, {
+      token: user.token,
+    });
+    expect(refused.status).toBe(400);
+    expect(refused.json.error.code).toBe('incomplete_history');
+    const unchanged = await call(t.app, 'GET', `/v1/notes/${note.id}`, {
+      token: user.token,
+    });
+    expect(unchanged.json.note).toMatchObject({ bodyMd: 'after', version: 2, deletedAt: null });
+    const afterFeed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    expect(afterFeed.json.activity.find((entry: any) => entry.id === update.id).undone).toBe(false);
+    const history = await call(t.app, 'GET', `/v1/notes/${note.id}/versions`, {
+      token: user.token,
+    });
+    expect(history.json.versions.map((version: any) => version.version)).toEqual([2, 1]);
+  });
+
+  it('undoes a restore revival back to a tombstone', async () => {
+    const user = await signUp(t.app);
+    const note = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: user.token,
+        body: { title: 'Restore lifecycle', bodyMd: 'before deletion' },
+      })
+    ).json.note;
+    await call(t.app, 'DELETE', `/v1/notes/${note.id}`, {
+      token: user.token,
+      body: { baseVersion: 1 },
+    });
+    const history = await call(t.app, 'GET', `/v1/notes/${note.id}/versions`, {
+      token: user.token,
+    });
+    const liveV1 = history.json.versions.find((version: any) => version.version === 1);
+    await call(t.app, 'POST', `/v2/notes/${note.id}/restore`, {
+      token: user.token,
+      body: { versionId: liveV1.id, baseVersion: 2 },
+    });
+    const feed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    const revival = feed.json.activity.find(
+      (entry: any) => entry.action === 'note.restore' && entry.resultingVersion === 3,
+    );
+
+    const undo = await call(t.app, 'POST', `/v2/activity/${revival.id}/undo`, {
+      token: user.token,
+    });
+    expect(undo.status).toBe(200);
+    expect(undo.json.deletionStateRestored).toBe(true);
+    expect(undo.json.note).toMatchObject({ version: 4 });
+    expect(undo.json.note.deletedAt).toEqual(expect.any(String));
+    const ordinaryRead = await call(t.app, 'GET', `/v1/notes/${note.id}`, {
+      token: user.token,
+    });
+    expect(ordinaryRead.status).toBe(404);
+    const finalHistory = await call(t.app, 'GET', `/v1/notes/${note.id}/versions`, {
+      token: user.token,
+    });
+    expect(finalHistory.json.versions[0]).toMatchObject({ version: 4, isDeleted: true });
+  });
+
+  it('undoes a delete back to a live note', async () => {
+    const user = await signUp(t.app);
+    const note = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: user.token,
+        body: { title: 'Undo deletion', bodyMd: 'still here' },
+      })
+    ).json.note;
+    await call(t.app, 'DELETE', `/v1/notes/${note.id}`, {
+      token: user.token,
+      body: { baseVersion: 1 },
+    });
+    const feed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    const deletion = feed.json.activity.find(
+      (entry: any) => entry.action === 'note.delete' && entry.resultingVersion === 2,
+    );
+
+    const undo = await call(t.app, 'POST', `/v2/activity/${deletion.id}/undo`, {
+      token: user.token,
+    });
+    expect(undo.json).toMatchObject({
+      deletionStateRestored: true,
+      note: { version: 3, deletedAt: null, bodyMd: 'still here' },
+    });
+    const ordinaryRead = await call(t.app, 'GET', `/v1/notes/${note.id}`, {
+      token: user.token,
+    });
+    expect(ordinaryRead.status).toBe(200);
+  });
+
+  it('undoes a sync revival back to its prior tombstone', async () => {
+    const user = await signUp(t.app);
+    const deviceId = `device-${randomUUID()}`;
+    await call(t.app, 'POST', '/v1/devices', {
+      token: user.token,
+      body: { id: deviceId, name: 'Revival test', platform: 'web' },
+    });
+    const note = (
+      await call(t.app, 'POST', '/v1/notes', {
+        token: user.token,
+        body: { title: 'Sync lifecycle', bodyMd: 'before deletion', tags: ['before'] },
+      })
+    ).json.note;
+    await call(t.app, 'DELETE', `/v1/notes/${note.id}`, {
+      token: user.token,
+      body: { baseVersion: 1 },
+    });
+    const revival = await call(t.app, 'POST', '/v1/sync/push', {
+      token: user.token,
+      body: {
+        deviceId,
+        mutations: [
+          {
+            opId: `revive-${randomUUID()}`,
+            type: 'upsert',
+            note: {
+              id: note.id,
+              title: 'Sync lifecycle',
+              bodyMd: 'revived draft',
+              folder: null,
+              tags: ['revived'],
+            },
+            baseVersion: 2,
+          },
+        ],
+      },
+    });
+    expect(revival.json.applied[0].note).toMatchObject({
+      version: 3,
+      deletedAt: null,
+      bodyMd: 'revived draft',
+    });
+    const feed = await call(t.app, 'GET', '/v1/activity', { token: user.token });
+    const revivalAction = feed.json.activity.find(
+      (entry: any) => entry.action === 'note.update' && entry.resultingVersion === 3,
+    );
+
+    const undo = await call(t.app, 'POST', `/v2/activity/${revivalAction.id}/undo`, {
+      token: user.token,
+    });
+    expect(undo.status).toBe(200);
+    expect(undo.json.note).toMatchObject({ version: 4, bodyMd: 'before deletion' });
+    expect(undo.json.note.deletedAt).toEqual(expect.any(String));
+    const history = await call(t.app, 'GET', `/v1/notes/${note.id}/versions`, {
+      token: user.token,
+    });
+    expect(history.json.versions.slice(0, 3)).toEqual([
+      expect.objectContaining({ version: 4, isDeleted: true }),
+      expect.objectContaining({ version: 3, isDeleted: false }),
+      expect.objectContaining({ version: 2, isDeleted: true }),
+    ]);
+  });
+
   it('refuses to apply an old whole-snapshot undo over a newer head', async () => {
     const user = await signUp(t.app);
     const note = (
@@ -222,7 +407,7 @@ describe('agent actors, activity feed, and undo', () => {
       body: { bodyMd: 'v2', folder: 'v2', tags: ['v2'], baseVersion: 1 },
     });
     const afterV2 = await call(t.app, 'GET', '/v1/activity', { token: user.token });
-    expect(afterV2.json.undoProtocolVersion).toBe(1);
+    expect(afterV2.json.undoProtocolVersion).toBe(2);
     const target = afterV2.json.activity.find(
       (entry: any) => entry.action === 'note.update' && entry.resultingVersion === 2,
     );
@@ -231,7 +416,7 @@ describe('agent actors, activity feed, and undo', () => {
       body: { bodyMd: 'v3', folder: 'v3', tags: ['v3'], baseVersion: 2 },
     });
 
-    const refused = await call(t.app, 'POST', `/v1/activity/${target.id}/undo`, {
+    const refused = await call(t.app, 'POST', `/v2/activity/${target.id}/undo`, {
       token: user.token,
     });
     expect(refused.status).toBe(409);

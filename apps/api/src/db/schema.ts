@@ -150,6 +150,10 @@ export const noteVersions = pgTable(
     // default false so an older rolled-back server cannot manufacture a known root.
     folder: text('folder'),
     folderSnapshotKnown: boolean('folder_snapshot_known').notNull().default(false),
+    // Tri-state: false = captured live, true = captured deleted, null = legacy
+    // snapshot whose lifecycle state was never recorded. No default keeps old
+    // binaries honest after a rolling migration.
+    isDeleted: boolean('is_deleted'),
     tags: jsonb('tags').$type<string[]>().notNull().default([]),
     authorType: text('author_type').notNull(),
     authorId: uuid('author_id').notNull(),

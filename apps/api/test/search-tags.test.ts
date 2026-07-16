@@ -42,7 +42,7 @@ describe('tags', () => {
     expect(v1.tags).toEqual(['alpha']);
 
     // Restoring v1 brings ['alpha'] back as the new head.
-    const restored = await call(t.app, 'POST', `/v1/notes/${id}/restore`, {
+    const restored = await call(t.app, 'POST', `/v2/notes/${id}/restore`, {
       token: u.token,
       body: { versionId: v1.id, baseVersion: 2 },
     });

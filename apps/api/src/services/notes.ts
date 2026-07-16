@@ -138,6 +138,7 @@ export async function restoreVersion(
   versionId: string,
   baseVersion: number,
   preserveCurrentFolderIfUnknown = false,
+  preserveCurrentDeletionStateIfUnknown = false,
 ): Promise<RestoreVersionResponse> {
   const current = await loadNote(ctx, id);
   if (!current) throw notFound('Note not found');
@@ -164,6 +165,14 @@ export async function restoreVersion(
     );
   }
   const folderRestored = target.folderSnapshotKnown;
+  if (target.isDeleted === null && !preserveCurrentDeletionStateIfUnknown) {
+    throw badRequest(
+      "This legacy version did not capture whether the note was deleted; explicitly preserve today's deletion state to restore its other fields",
+      'incomplete_version_snapshot',
+    );
+  }
+  const deletionStateRestored = target.isDeleted !== null;
+  const now = new Date();
 
   const updated = await ctx.db
     .update(notes)
@@ -173,8 +182,8 @@ export async function restoreVersion(
       folder: folderRestored ? target.folder : current.folder,
       tags: target.tags ?? [],
       version: current.version + 1,
-      deletedAt: null,
-      updatedAt: new Date(),
+      deletedAt: deletionStateRestored ? (target.isDeleted ? now : null) : current.deletedAt,
+      updatedAt: now,
     })
     .where(
       and(
@@ -186,7 +195,7 @@ export async function restoreVersion(
     .returning();
   const note = updated[0] ?? (await throwConcurrentNoteChange(ctx, id));
   await recordVersionAndActivity(ctx, note, 'note.restore');
-  return { note: serializeNote(note), folderRestored };
+  return { note: serializeNote(note), folderRestored, deletionStateRestored };
 }
 
 export async function listVersions(ctx: Ctx, id: string) {

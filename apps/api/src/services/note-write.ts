@@ -48,6 +48,7 @@ export async function recordVersionAndActivity(
     bodyMd: note.bodyMd,
     folder: note.folder,
     folderSnapshotKnown: true,
+    isDeleted: note.deletedAt !== null,
     tags: note.tags ?? [],
     authorType: ctx.principal.type,
     authorId: ctx.principal.id,

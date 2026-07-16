@@ -5,6 +5,7 @@ import { Button, Card, Muted, Screen, Title } from '../../src/components/ui';
 import { useObs } from '../../src/state/hooks';
 import { store$ } from '../../src/state/store';
 import { keepLocalConflict, useServerConflict } from '../../src/sync/manager';
+import { conflictResolutionLabels } from '../../src/history-safety';
 import { theme } from '../../src/theme';
 
 function draftPreview(mutation: SyncMutation): string {
@@ -41,57 +42,72 @@ export default function ConflictInbox() {
             <Muted>New conflicts will appear here and on the affected note.</Muted>
           </Card>
         }
-        renderItem={({ item }) => (
-          <Card style={styles.conflictCard}>
-            <View style={styles.heading}>
-              <Text style={styles.noteTitle}>{item.serverNote.title || 'Untitled'}</Text>
-              <Text style={styles.time}>{new Date(item.detectedAt).toLocaleString()}</Text>
-            </View>
+        renderItem={({ item }) => {
+          const serverDeleted = Boolean(item.serverNote.deletedAt);
+          const localDeletes = item.localMutation.type === 'delete';
+          const labels = conflictResolutionLabels({ serverDeleted, localDeletes });
+          return (
+            <Card style={styles.conflictCard}>
+              <View style={styles.heading}>
+                <Text style={styles.noteTitle}>{item.serverNote.title || 'Untitled'}</Text>
+                <Text style={styles.time}>{new Date(item.detectedAt).toLocaleString()}</Text>
+                {serverDeleted ? (
+                  <Text style={styles.deletedWarning}>
+                    The server version is deleted. Restoring your draft will make the note live
+                    again.
+                  </Text>
+                ) : null}
+              </View>
 
-            <View style={styles.versionPanel}>
-              <Text style={styles.versionLabel}>YOUR LOCAL DRAFT</Text>
-              <Text style={styles.versionTitle}>
-                {item.localMutation.type === 'delete'
-                  ? 'Pending deletion'
-                  : item.localMutation.note.title || 'Untitled'}
-              </Text>
-              <Text style={styles.preview} numberOfLines={6}>
-                {draftPreview(item.localMutation)}
-              </Text>
-            </View>
+              <View style={styles.versionPanel}>
+                <Text style={styles.versionLabel}>YOUR LOCAL DRAFT</Text>
+                <Text style={styles.versionTitle}>
+                  {item.localMutation.type === 'delete'
+                    ? 'Pending deletion'
+                    : item.localMutation.note.title || 'Untitled'}
+                </Text>
+                <Text style={styles.preview} numberOfLines={6}>
+                  {draftPreview(item.localMutation)}
+                </Text>
+              </View>
 
-            <View style={styles.versionPanel}>
-              <Text style={styles.versionLabel}>SERVER VERSION · V{item.serverNote.version}</Text>
-              <Text style={styles.versionTitle}>{item.serverNote.title || 'Untitled'}</Text>
-              <Text style={styles.preview} numberOfLines={6}>
-                {item.serverNote.bodyMd || 'No content'}
-              </Text>
-            </View>
+              <View style={styles.versionPanel}>
+                <Text style={styles.versionLabel}>
+                  SERVER STATE · {serverDeleted ? 'DELETED' : 'LIVE'} · V{item.serverNote.version}
+                </Text>
+                <Text style={styles.versionTitle}>
+                  {serverDeleted ? 'Deleted note' : item.serverNote.title || 'Untitled'}
+                </Text>
+                <Text style={styles.preview} numberOfLines={6}>
+                  {item.serverNote.bodyMd || 'No content'}
+                </Text>
+              </View>
 
-            <Button
-              label="Keep my edit"
-              onPress={() => {
-                if (ownerKey) {
-                  keepLocalConflict(ownerKey, item.noteId, item.localMutation.opId);
-                }
-              }}
-            />
-            <Button
-              label="Use server version"
-              variant="ghost"
-              onPress={() => {
-                if (ownerKey) {
-                  useServerConflict(ownerKey, item.noteId, item.localMutation.opId);
-                }
-              }}
-            />
-            <Button
-              label="Open note"
-              variant="ghost"
-              onPress={() => router.push('/notes/' + item.noteId)}
-            />
-          </Card>
-        )}
+              <Button
+                label={labels.keepLocal}
+                onPress={() => {
+                  if (ownerKey) {
+                    keepLocalConflict(ownerKey, item.noteId, item.localMutation.opId);
+                  }
+                }}
+              />
+              <Button
+                label={labels.useServer}
+                variant="ghost"
+                onPress={() => {
+                  if (ownerKey) {
+                    useServerConflict(ownerKey, item.noteId, item.localMutation.opId);
+                  }
+                }}
+              />
+              <Button
+                label="Open note"
+                variant="ghost"
+                onPress={() => router.push('/notes/' + item.noteId)}
+              />
+            </Card>
+          );
+        }}
       />
     </Screen>
   );
@@ -110,6 +126,7 @@ const styles = StyleSheet.create({
   heading: { marginBottom: theme.space(3) },
   noteTitle: { color: theme.colors.text, fontSize: 18, fontWeight: '700' },
   time: { color: theme.colors.textDim, fontSize: 11, marginTop: theme.space(1) },
+  deletedWarning: { color: theme.colors.danger, fontSize: 12, marginTop: theme.space(2) },
   versionPanel: {
     backgroundColor: theme.colors.bg,
     borderColor: theme.colors.border,
