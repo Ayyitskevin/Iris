@@ -246,8 +246,14 @@ describe('successful sync response validation', () => {
       new Response(
         JSON.stringify({
           resourceSet: SYNC_V2_RESOURCE_SET,
-          applied: [{ opId: 'resource-op', resource: syncedResource }],
-          conflicts: [],
+          applied: [{ opId: 'resource-op', resource: syncedResource }, { opId: 'delete-op' }],
+          conflicts: [
+            {
+              opId: 'conflict-op',
+              reason: 'version_mismatch',
+              serverResource: syncedResource,
+            },
+          ],
         }),
         { status: 200 },
       ),
@@ -266,11 +272,32 @@ describe('successful sync response validation', () => {
           },
           baseVersion: 0,
         },
+        {
+          opId: 'delete-op',
+          type: 'delete' as const,
+          resource: {
+            type: 'note' as const,
+            id: syncedResource.id,
+            data: { title: 'Resource note', bodyMd: 'Markdown', folder: null, tags: [] },
+          },
+          baseVersion: 1,
+        },
+        {
+          opId: 'conflict-op',
+          type: 'upsert' as const,
+          resource: {
+            type: 'note' as const,
+            id: syncedResource.id,
+            data: { title: 'Resource note', bodyMd: 'Markdown', folder: null, tags: [] },
+          },
+          baseVersion: 1,
+        },
       ],
     };
     await expect(client.syncV2Push(body)).resolves.toMatchObject({
       resourceSet: SYNC_V2_RESOURCE_SET,
-      applied: [{ opId: 'resource-op' }],
+      applied: [{ opId: 'resource-op' }, { opId: 'delete-op' }],
+      conflicts: [{ opId: 'conflict-op', reason: 'version_mismatch' }],
     });
     expect(String(fetchMock.mock.calls[1]?.[0])).toMatch(/\/v2\/sync\/push$/);
     expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
@@ -321,26 +348,103 @@ describe('successful sync response validation', () => {
       ).rejects.toBeInstanceOf(ApiResponseValidationError);
     }
 
-    fetchMock.mockResolvedValueOnce(
-      new Response(
-        JSON.stringify({
-          resourceSet: SYNC_V2_RESOURCE_SET,
-          applied: [
-            { opId: 'duplicate-result', resource: syncedResource },
-            { opId: 'duplicate-result', resource: syncedResource },
-          ],
-          conflicts: [],
-        }),
-        { status: 200 },
-      ),
-    );
-    await expect(
-      client.syncV2Push({
+    const strictOperationId = 'strict-response-op';
+    const validApplied = { opId: strictOperationId, resource: syncedResource };
+    const invalidPushResponses = [
+      {
         resourceSet: SYNC_V2_RESOURCE_SET,
-        deviceId: store$.deviceId.get(),
-        mutations: [],
-      }),
-    ).rejects.toBeInstanceOf(ApiResponseValidationError);
+        applied: [validApplied, validApplied],
+        conflicts: [],
+      },
+      {
+        resourceSet: 'future-v1',
+        applied: [validApplied],
+        conflicts: [],
+      },
+      {
+        resourceSet: SYNC_V2_RESOURCE_SET,
+        applied: [validApplied],
+        conflicts: [],
+        future: true,
+      },
+      {
+        resourceSet: SYNC_V2_RESOURCE_SET,
+        applied: [{ ...validApplied, future: true }],
+        conflicts: [],
+      },
+      {
+        resourceSet: SYNC_V2_RESOURCE_SET,
+        applied: [],
+        conflicts: [
+          {
+            opId: strictOperationId,
+            reason: 'version_mismatch',
+            serverResource: syncedResource,
+            future: true,
+          },
+        ],
+      },
+      {
+        resourceSet: SYNC_V2_RESOURCE_SET,
+        applied: [
+          {
+            opId: strictOperationId,
+            resource: { ...syncedResource, type: 'project' },
+          },
+        ],
+        conflicts: [],
+      },
+      {
+        resourceSet: SYNC_V2_RESOURCE_SET,
+        applied: [
+          {
+            opId: strictOperationId,
+            resource: {
+              ...syncedResource,
+              data: { ...syncedResource.data, future: true },
+            },
+          },
+        ],
+        conflicts: [],
+      },
+      {
+        resourceSet: SYNC_V2_RESOURCE_SET,
+        applied: [],
+        conflicts: [
+          {
+            opId: strictOperationId,
+            reason: 'merged',
+            serverResource: syncedResource,
+          },
+        ],
+      },
+    ];
+
+    const strictPushRequest = {
+      resourceSet: SYNC_V2_RESOURCE_SET,
+      deviceId: store$.deviceId.get(),
+      mutations: [
+        {
+          opId: strictOperationId,
+          type: 'upsert' as const,
+          resource: {
+            type: 'note' as const,
+            id: syncedResource.id,
+            data: { title: 'Strict response', bodyMd: 'Markdown', folder: null, tags: [] },
+          },
+          baseVersion: 0,
+        },
+      ],
+    };
+    let expectedFetchCount = fetchMock.mock.calls.length;
+    for (const payload of invalidPushResponses) {
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(payload), { status: 200 }));
+      await expect(client.syncV2Push(strictPushRequest)).rejects.toBeInstanceOf(
+        ApiResponseValidationError,
+      );
+      expectedFetchCount += 1;
+      expect(fetchMock).toHaveBeenCalledTimes(expectedFetchCount);
+    }
   });
 });
 

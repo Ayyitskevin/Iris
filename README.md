@@ -140,7 +140,8 @@ The production mobile coordinator intentionally remains on `/v1`. An unwired Ind
 primitive now preserves one exact owner root behind atomic revision checks and fences a
 stale writer, but production still selects the size-limited SecureStore/localStorage
 adapter. Owner-specific localStorage promotion, cross-tab session leadership, native
-SQLite and its at-rest protection policy, request-correlated `/v2` reconciliation,
+SQLite and its at-rest protection policy, durable `/v2` envelope/cursor staging,
+lease/device-bound dispatch, runtime correlator invocation, atomic result application,
 recovery import, and browser/native acceptance remain explicit release blockers.
 GitHub Actions run `29506816638` passed the PostgreSQL 16
 independent-connection commit-order and concurrent device-gate gate for commit
@@ -179,3 +180,11 @@ transactions reject stale tabs without overwriting the winner; an explicit autho
 read is required before the losing projection may write again. Node tests exercise the
 IndexedDB API and transaction semantics through `fake-indexeddb`, but no deployed storage
 authority, native backend, coordinator route, or persisted replica shape changed.
+
+ADR-018 adds a pure, unwired `/v2` push-result correlator. Given a strictly parsed
+request and response plus the expected workspace, it requires a one-to-one operation
+result set, returns request order, and rejects wrong resource identity, workspace, or
+lifecycle semantics without mutating the request. Returned operation and result snapshots
+are deeply frozen and do not expose request/response aliases. The production coordinator
+still uses `/v1`; this does not stage, dispatch, retry, apply, or durably clear a `/v2`
+request.

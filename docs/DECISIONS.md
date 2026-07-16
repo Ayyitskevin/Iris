@@ -664,6 +664,55 @@ acceptance remain required before authority changes.
 
 ---
 
+## ADR-018 — Request-bound Sync v2 push-result correlation
+
+**Accepted as an unwired pure client seam; the production coordinator remains on
+`/v1`.**
+
+The strict standalone `SyncV2PushResponse` schema can reject widened fields, future
+resource sets/types/reasons, duplicate response operation ids, and malformed resources.
+It cannot know which exact request was dispatched or which authenticated workspace is
+current. Given a strictly parsed `SyncV2PushRequest`, its parsed response, and the
+expected workspace, the pure correlator therefore requires the literal `notes-v1` set,
+unique case-sensitive submitted operation ids, and exactly one applied-or-conflict result
+for every submitted operation. Unknown, duplicate, and omitted results fail before any
+correlated output is returned; valid results are returned in request order regardless of
+response ordering or bucket.
+
+Correlated output contains the request index plus deeply frozen copies of the complete
+submitted mutation and validated server result. A later mutation of either parsed input
+therefore cannot invalidate the identity, ownership, or lifecycle checks before a future
+atomic consumer applies the output.
+
+Every returned resource must retain the submitted note type and UUID identity and belong
+to the expected workspace. UUID comparison is case-insensitive because PostgreSQL emits
+canonical lowercase text, but the supplied request is never normalized or mutated:
+receipt fingerprints bind its literal fields. Applied upserts and resurrections require a
+live resource. An applied delete permits either a tombstone or the schema-defined absent
+resource for a never-existing idempotent delete. A delete conflict must carry a live
+authoritative resource; upsert and resurrection conflicts may carry either a live head or
+tombstone. Authoritative content and version are deliberately not compared with the
+mutation because tags are server-normalized, conflicts may return any current head, and
+frozen receipts may replay an older valid outcome.
+
+Focused tests cover reordered mixed results, repeated resource ids, operation-set
+bijection, resource/workspace binding, the complete lifecycle matrix, canonical UUID
+comparison, detached frozen results, and byte-identical frozen requests after both
+rejection and deterministic replay. API-client tests separately prove that successful
+widened/future response shapes
+become `ApiResponseValidationError`; the correlator itself accepts typed, already-parsed
+inputs rather than serving as a general wire parser.
+
+This seam does **not** prove the supplied request was durably staged; bind device, token,
+actor, or session generation; dispatch or retry network work; apply or merge results;
+clear pending state; correlate pull pages; or change the coordinator, persisted root,
+storage authority, server, or wire protocol. Runtime cutover still requires exact
+`/v2` envelope/set/cursor persistence, checked lease/device dispatch, all-or-none result
+application with newer-edit rebasing and conflict retention, durable pending clear,
+`/v2` pull, terminal recovery, and restart/lost-response/stale-session evidence.
+
+---
+
 ## Summary: the shape these decisions produce
 
 One TypeScript monorepo → one Fastify service → one Postgres (PGlite locally). Auth,

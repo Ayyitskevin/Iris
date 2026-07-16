@@ -109,24 +109,34 @@ These were named as out of scope and are staying out until the foundation is pro
   win one revision, exact committed bytes are verified, and a stale writer is fenced
   until an explicit authoritative read. Evidence currently comes from Node plus
   `fake-indexeddb`; localStorage remains production authority and no native code changed.
+- **Phase 2.8 — request-bound Sync v2 push correlation** (ADR-018): a pure, unwired
+  client kernel binds every result in a strictly parsed response one-to-one to its
+  strictly parsed request under the expected workspace. It rejects duplicate, unknown,
+  omitted, wrong-resource,
+  foreign-workspace, and lifecycle-incoherent results, then returns request order without
+  mutating the supplied request or exposing mutable request/response aliases. Strict
+  API-client tests reject future response shapes. The production coordinator remains on
+  `/v1`; no dispatch or replica application changed.
 
 ## Near-term follow-ups (next things)
 
 1. **Complete Sync v2's platform repository/runtime cutover and release gates**:
    owner-specific localStorage-to-IndexedDB promotion plus mixed-version and cross-tab
    session leadership on web; SQLite plus an explicit at-rest protection policy on
-   native; transactional resource+outbox writes; request-correlated push-result
-   reconciliation; and a user-facing recovery/import path for quarantined
-   legacy `iris:state:v1` data, followed by real-browser and native iOS/Android device
-   or simulator acceptance.
+   native; transactional resource+outbox writes; durable `/v2` envelope/set/cursor
+   staging; lease/device-bound dispatch; runtime correlator invocation; atomic all-or-none
+   result application and pending clear; and a user-facing recovery/import path for
+   quarantined legacy `iris:state:v1` data, followed by real-browser and native
+   iOS/Android device or simulator acceptance.
    The owner-bound repository/root reducer and additive generic resource transport are
-   integrated, and the IndexedDB compare-and-swap primitive exists, but it is deliberately
-   not runtime-selected. The current adapter still stores one size-limited per-owner
-   SecureStore/localStorage value and the production coordinator still dispatches the
-   frozen `/v1` payload. Persisting the exact `/v2` resource set, cursor, and pending
-   envelope belongs in the transactional runtime cutover. Missing promotion and web
-   leadership, native storage and protection decisions, recovery import, and browser/
-   native acceptance are explicit blockers before the work queue.
+   integrated, and the IndexedDB compare-and-swap primitive plus push correlator exist,
+   but neither is runtime-selected. The current adapter still stores one size-limited
+   per-owner SecureStore/localStorage value and the production coordinator still
+   dispatches the frozen `/v1` payload. Persisting and applying the exact `/v2`
+   resource set, cursor, and pending envelope belongs in the transactional runtime
+   cutover. Missing promotion and web leadership, native storage and protection
+   decisions, recovery import, and browser/native acceptance are explicit blockers
+   before the work queue.
 2. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
    accountable human-or-agent assignee, reversible writes, and the same sync resource
    envelope. Keep activity, check-in, delegation, and durable claim/run semantics
