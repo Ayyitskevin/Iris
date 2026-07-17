@@ -131,12 +131,30 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
     "genuine non-fence failure still rolls back"). _Residual for step 3:_ adopt-authoritative
     discards a fenced writer's optimistic delta by design, so step 3 must pair the flip with
     cross-tab leadership (below) so an actively-edited tab is not the losing writer.
-  - **Step 3 — platform store selection (IndexedDB web / SQLite native) + flip production
-    authority** with promotion, then port the coordinator to `/v2` and freeze the v1 path.
-  - _Also (per the A2 insight): the transactional store's CAS already prevents cross-tab
-    data loss, so web "leader election" (A2) folds in here as an optimization, not a
-    separate blocker._ _DoD:_ mobile suite green on the wired path; real-device A→B switch,
-    lost response, and restart scenarios pass (device-acceptance gated).
+  - **Step 3 — platform store selection + flip production authority**, then port the
+    coordinator to `/v2` and freeze the v1 path. Itself staged:
+    - **Step 3a — platform-selection factory, opt-in-gated. ✅ SHIPPED.**
+      `select-owner-replica-repository.ts` assembles the production `ownerReplicaRepository`:
+      it picks the platform's fenced transactional store (IndexedDB web / lazy SQLite native,
+      via capability detection — no static `react-native` import so it stays Node/test-safe),
+      wraps it in `TransactionalOwnerReplicaRepository` then `PromotingOwnerReplicaRepository`
+      over the legacy KV repo. **Gated behind `EXPO_PUBLIC_DURABLE_STORAGE` (default off):**
+      flag off — or a platform with no transactional store (Node/SSR) — returns the legacy
+      `SerializedKvReplicaRepository` unchanged, so production + every test are byte-identical.
+      The singleton was relocated out of `replica-repository.ts` (now pure building blocks) to
+      keep this a cycle-free leaf. 7 new tests cover the selection matrix + the lazy store's
+      open-once/retry. `export:web` re-verified now that these modules are in the app graph.
+      Turning the flag on for real-device/browser testing is safe because `store.ts` is
+      fence-aware (step 2). _Flipping the default on is step 3c, gated on leadership + device
+      acceptance._
+    - **Step 3b — cross-tab web leadership** (Web Locks / BroadcastChannel) so only the leader
+      commits and an actively-edited follower is never the fence loser. _(Per the A2 insight:
+      the transactional CAS already prevents cross-tab data **loss**, so this is the
+      optimization that prevents fence **thrash**, not a separate data-safety blocker.)_
+    - **Step 3c — flip the default on + port the coordinator to `/v2` + freeze v1**, after
+      device acceptance.
+  - _DoD:_ mobile suite green on the wired path; real-device A→B switch, lost response, and
+    restart scenarios pass (device-acceptance gated).
 - **A4 · 🟣 Opus (design) → 🔵 Sonnet (implement) · One-command deploy + secrets.**
   Dockerfile for `apps/api`; a `fly.toml`/`render.yaml`; migrations-run-on-deploy step
   (the ledger + advisory lock already make this safe); documented secret set

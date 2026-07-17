@@ -157,21 +157,31 @@ null`; route keys include the owner so component state cannot survive an account
   switch. Sign-out must first commit its token-free tombstone.
 - **`useObs` selector identity matters.** Its `subscribe` is memoized on `[selector]`, so an inline arrow re-subscribes every render (works, but churns). For hot lists prefer a stable module-level selector like `selectVisibleNotes`. Every observable you read _inside_ the selector becomes a dependency — read only what the component renders.
 - **`Tabs.Screen`/`Stack.Screen` `name` must equal the filename** (sans extension); route groups `(auth)`/`(app)` and the `notes/` folder are path segments, but parenthesized groups are stripped from the URL. A mismatched `name` silently drops the screen from the navigator.
-- **Native replica capacity: the primitives exist and the store is fence-aware, but
-  authority is not flipped yet.** Production still writes the whole replica to one SecureStore
+- **Native replica capacity: the wiring exists behind an opt-in flag; authority is not
+  flipped by default yet.** Production defaults to writing the whole replica to one SecureStore
   value (a small per-value ceiling). The transactional stores for real capacity exist for both
   platforms — `IndexedDbTransactionalReplicaStore` (web, ADR-017) and
   `ExpoSqliteTransactionalReplicaStore` (native, ADR-020, `node:sqlite`-tested) — plus a
   `PromotingOwnerReplicaRepository` that lazily migrates an existing key/value replica into a
-  transactional store on first read. `store.ts` is now **fence-aware**: a
+  transactional store on first read. `store.ts` is **fence-aware**: a
   `ReplicaRepositoryStaleWriterError` from any save triggers _read + rehydrate authoritative
-  bytes_ (adopt the winner, ADR-017), never a rollback, so wiring a fencing repo can't strand
-  the client. All of this is still runtime-dormant — production uses the non-fencing
-  `SerializedKvReplicaRepository`. The remaining CUTOVER is: select the platform store, flip
-  `ownerReplicaRepository` to the promoting/transactional repo, add cross-tab web leadership
-  (so an actively-edited tab is not the fence loser), port the coordinator to `/v2`, then
-  device-acceptance. Writes are verified and non-fence failures set `error`; staging failure
-  prevents dispatch.
+  bytes_ (adopt the winner, ADR-017), never a rollback.
+  - **The singleton lives in `select-owner-replica-repository.ts`** (not `replica-repository.ts`,
+    which is now pure building blocks). `store.ts` imports `ownerReplicaRepository` from there.
+    It picks the platform store by capability detection (IndexedDB present → web; a
+    `navigator.product === 'ReactNative'` runtime → native SQLite; else Node/SSR → none) with
+    **no static `react-native` import**, so it loads under vitest/tsc.
+  - **The flip is gated by `EXPO_PUBLIC_DURABLE_STORAGE` (default off).** Off — or a platform
+    with no transactional store — returns the legacy `SerializedKvReplicaRepository` unchanged,
+    so production + every test are byte-identical. Set it to `1`/`true` for real-device/browser
+    testing; it's safe because the store is fence-aware.
+  - **`expo-sqlite` is native-only in the bundle:** the opener is platform-split
+    (`open-expo-sqlite-store.native.ts` real vs `open-expo-sqlite-store.ts` stub) so Metro never
+    pulls `expo-sqlite` into the **web** bundle. If you add another native-only dependency to the
+    replica path, split it the same way and re-run `pnpm --filter @iris/mobile run export:web`.
+  - Remaining CUTOVER: add cross-tab web leadership (so an actively-edited tab is not the fence
+    loser), flip the flag default on after device acceptance, and port the coordinator to `/v2`.
+    Writes are verified and non-fence failures set `error`; staging failure prevents dispatch.
 - **Everything is workspace-scoped by a fixed-token lease.** The client never sends a
   `workspaceId`; the server derives it. Do not replace `apiForLease` with a mutable
   token callback for authenticated work.

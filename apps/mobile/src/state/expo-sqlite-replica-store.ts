@@ -177,14 +177,6 @@ export class ExpoSqliteTransactionalReplicaStore implements TransactionalReplica
   }
 }
 
-/**
- * Open the real native store on an `expo-sqlite` database. Imported lazily so neither the
- * store module nor its Node tests load the native module. Unwired until plan A3.
- */
-export async function openExpoSqliteReplicaStore(
-  databaseName = 'iris-owner-replicas.db',
-): Promise<ExpoSqliteTransactionalReplicaStore> {
-  const SQLite = await import('expo-sqlite');
-  const database = await SQLite.openDatabaseAsync(databaseName);
-  return new ExpoSqliteTransactionalReplicaStore(database as unknown as ReplicaSqliteDatabase);
-}
+// The `expo-sqlite`-backed opener lives in `open-expo-sqlite-store.native.ts` (with a web/Node
+// stub in `open-expo-sqlite-store.ts`), so `expo-sqlite` is only ever pulled into a native
+// bundle. This module stays free of any `expo-sqlite` reference so it loads under web + Node.
