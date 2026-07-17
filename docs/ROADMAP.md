@@ -117,6 +117,16 @@ These were named as out of scope and are staying out until the foundation is pro
   mutating the supplied request or exposing mutable request/response aliases. Strict
   API-client tests reject future response shapes. The production coordinator remains on
   `/v1`; no dispatch or replica application changed.
+- **Phase 2.9 — transactional Sync v2 owner-root kernel** (ADR-019): a strict, unwired
+  version-3 document stores the exact `notes-v1` set, workspace cursor, resource
+  projections, one coalesced local draft per resource, full pending request, durable
+  issue, and retained conflicts behind the revision-fenced repository. Pure staging
+  preserves the exact bounded envelope before dispatch; pure application requires that
+  same durable envelope plus checked workspace/device context, validates every result
+  through ADR-018, then returns one all-or-none root with exact acknowledgement,
+  newer-edit rebasing (including replay-safe retention of a newer delete), or both sides
+  of a conflict. No production storage selection, network dispatch, or `/v2` pull
+  changed.
 
 ## Near-term follow-ups (next things)
 
@@ -129,14 +139,14 @@ These were named as out of scope and are staying out until the foundation is pro
    quarantined legacy `iris:state:v1` data, followed by real-browser and native
    iOS/Android device or simulator acceptance.
    The owner-bound repository/root reducer and additive generic resource transport are
-   integrated, and the IndexedDB compare-and-swap primitive plus push correlator exist,
-   but neither is runtime-selected. The current adapter still stores one size-limited
-   per-owner SecureStore/localStorage value and the production coordinator still
-   dispatches the frozen `/v1` payload. Persisting and applying the exact `/v2`
-   resource set, cursor, and pending envelope belongs in the transactional runtime
-   cutover. Missing promotion and web leadership, native storage and protection
-   decisions, recovery import, and browser/native acceptance are explicit blockers
-   before the work queue.
+   integrated. The IndexedDB compare-and-swap primitive, push correlator, and strict
+   owner-root staging/application kernel now exist, but none is runtime-selected. The
+   current adapter still stores one size-limited per-owner SecureStore/localStorage value
+   and the production coordinator still dispatches the frozen `/v1` payload. Selecting
+   the transactional root, lease-bound `/v2` dispatch, durable CAS application, and `/v2`
+   pull remain part of the runtime cutover. Missing promotion and web leadership, native
+   storage and protection decisions, recovery import, and browser/native acceptance are
+   explicit blockers before the work queue.
 2. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
    accountable human-or-agent assignee, reversible writes, and the same sync resource
    envelope. Keep activity, check-in, delegation, and durable claim/run semantics

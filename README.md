@@ -188,3 +188,13 @@ lifecycle semantics without mutating the request. Returned operation and result 
 are deeply frozen and do not expose request/response aliases. The production coordinator
 still uses `/v1`; this does not stage, dispatch, retry, apply, or durably clear a `/v2`
 request.
+
+ADR-019 adds the next unwired client kernel: a strict version-3 owner root persists the
+literal resource set, workspace-bound cursor, resource projection, coalesced outbox,
+complete pending `/v2` envelope, durable issue, and retained conflicts as one opaque
+transactional document. Pure staging preserves an exact request without consuming the
+outbox, and pure application binds an exact durable request through ADR-018 before it
+atomically clears pending work, applies authoritative heads, rebases one newer local
+draft (including replay-safe retention of a newer delete), or retains both sides of a
+conflict. IndexedDB and the production coordinator do not import this kernel;
+localStorage/SecureStore and `/v1` remain runtime authority.

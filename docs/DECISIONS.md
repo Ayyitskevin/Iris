@@ -713,6 +713,63 @@ application with newer-edit rebasing and conflict retention, durable pending cle
 
 ---
 
+## ADR-019 — Transactional Sync v2 owner-root staging and push application
+
+**Accepted as an unwired pure client kernel; production storage and network authority
+remain unchanged.**
+
+The revision-fenced repository needs one self-validating document before it can safely
+store Sync v2 state opaquely. Version 3 therefore binds the canonical-lowercase
+workspace+user owner, device, literal `notes-v1` set, workspace cursor, resource
+projections, coalesced outbox, complete pending push envelope, durable issue, and retained
+conflicts. Unknown keys, malformed or noncanonical owner UUIDs, malformed cursors, foreign
+resources, duplicate resources or operation identities, divergent outbox projections,
+unbacked version-zero projections, invalid lifecycle projections, and queued/conflicted
+overlap fail closed. One current outbox draft owns each resource; an older exact pending
+envelope may coexist only when that resource has a matching current projection. Parse and
+serialize detach the complete document, whose exact bytes remain the transactional
+repository's atomic compare-and-swap payload.
+
+Pure staging validates the whole root first, leaves an existing pending request, issue,
+or empty outbox unchanged, and selects at most six operations within the 1,900,000-byte
+request ceiling. It persists the complete set+device+mutation envelope without consuming
+the outbox. Current mutation field bounds make an individually schema-valid operation fit
+the envelope; malformed persisted mutations are integrity failures, while the staging
+guards remain explicit for future request-level rules or widened field bounds. A runtime
+must commit the returned whole root before it may dispatch those exact bytes.
+
+Pure application requires a valid root with no durable issue, the exact pending envelope,
+and matching workspace and device context. It strictly parses the supplied request and
+response and invokes ADR-018 correlation before constructing output. Applied results
+replace the resource projection with authoritative server state or remove an absent
+idempotent delete; a single newer local draft is rebased onto the returned positive
+version while retaining its content, explicit lifecycle, and local edit timestamps.
+Version-zero server results fail before acknowledgement. Conflict outcomes normally remove
+the queued draft but keep that newest local mutation beside the exact server resource; a
+post-dispatch draft may have a different lifecycle from the operation that produced the
+conflict. The replay-safe exception is a newer local delete beside a returned tombstone:
+that draft is rebased and requeued rather than converted to a conflict or consumed. The
+result may be a frozen receipt older than a later server resurrection, so only another
+idempotent push or current conflict can safely settle that intent. When one request contains
+several operations for the same resource, only its final request-ordered result defines the
+final authoritative head. Success returns one complete root with
+`pendingPush: null`; any error leaves every input object and the durable pending envelope
+untouched.
+
+Focused tests cover strict root ownership and internal consistency, opaque repository
+round-trip, restart replay, staging gates and operation bounds, exact context/request
+fences, lifecycle outcomes, reordered and repeated-resource results, newer-edit rebasing,
+multi-conflict retention, input detachment, and atomic failure. The existing production
+coordinator imports none of these modules and continues to persist version 2 through
+SecureStore/localStorage and dispatch `/v1`.
+
+This decision does **not** promote IndexedDB, add or select native SQLite, coordinate
+cross-tab ownership, bind dispatch to a live session lease, call `/v2`, apply pull pages,
+clear terminal recovery issues, import quarantined legacy state, or provide browser and
+native acceptance evidence. Those remain runtime-cutover and release gates.
+
+---
+
 ## Summary: the shape these decisions produce
 
 One TypeScript monorepo → one Fastify service → one Postgres (PGlite locally). Auth,
