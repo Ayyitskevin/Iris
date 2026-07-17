@@ -157,14 +157,21 @@ null`; route keys include the owner so component state cannot survive an account
   switch. Sign-out must first commit its token-free tombstone.
 - **`useObs` selector identity matters.** Its `subscribe` is memoized on `[selector]`, so an inline arrow re-subscribes every render (works, but churns). For hot lists prefer a stable module-level selector like `selectVisibleNotes`. Every observable you read _inside_ the selector becomes a dependency — read only what the component renders.
 - **`Tabs.Screen`/`Stack.Screen` `name` must equal the filename** (sans extension); route groups `(auth)`/`(app)` and the `notes/` folder are path segments, but parenthesized groups are stripped from the URL. A mismatched `name` silently drops the screen from the navigator.
-- **Native replica capacity: the primitive now exists but is unwired.** Production still
-  writes the whole replica to one SecureStore value (a small per-value ceiling). The
-  transactional stores for real capacity exist for both platforms —
-  `IndexedDbTransactionalReplicaStore` (web, ADR-017) and `ExpoSqliteTransactionalReplicaStore`
-  (native, ADR-020, `node:sqlite`-tested) — but neither is runtime-selected. The blocker is
-  now the fenced CUTOVER (select the store, promote existing replicas, cross-tab web
-  leadership) + device acceptance, not a missing store. Writes are verified and failures
-  set `error`; staging failure prevents dispatch.
+- **Native replica capacity: the primitives exist and the store is fence-aware, but
+  authority is not flipped yet.** Production still writes the whole replica to one SecureStore
+  value (a small per-value ceiling). The transactional stores for real capacity exist for both
+  platforms — `IndexedDbTransactionalReplicaStore` (web, ADR-017) and
+  `ExpoSqliteTransactionalReplicaStore` (native, ADR-020, `node:sqlite`-tested) — plus a
+  `PromotingOwnerReplicaRepository` that lazily migrates an existing key/value replica into a
+  transactional store on first read. `store.ts` is now **fence-aware**: a
+  `ReplicaRepositoryStaleWriterError` from any save triggers _read + rehydrate authoritative
+  bytes_ (adopt the winner, ADR-017), never a rollback, so wiring a fencing repo can't strand
+  the client. All of this is still runtime-dormant — production uses the non-fencing
+  `SerializedKvReplicaRepository`. The remaining CUTOVER is: select the platform store, flip
+  `ownerReplicaRepository` to the promoting/transactional repo, add cross-tab web leadership
+  (so an actively-edited tab is not the fence loser), port the coordinator to `/v2`, then
+  device-acceptance. Writes are verified and non-fence failures set `error`; staging failure
+  prevents dispatch.
 - **Everything is workspace-scoped by a fixed-token lease.** The client never sends a
   `workspaceId`; the server derives it. Do not replace `apiForLease` with a mutable
   token callback for authenticated work.

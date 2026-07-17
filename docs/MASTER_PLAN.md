@@ -118,8 +118,19 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
     transactional repo's `StaleWriterError` is a _fence_ that only clears on an explicit
     `read()`, so the current store would get permanently stuck on the first cross-tab
     conflict. Hence:
-  - **Step 2 — make `store.ts` fence-aware** (a `ReplicaRepositoryStaleWriterError` must
-    trigger read + rehydrate, not a plain rollback). Delicate; the prerequisite to flipping.
+  - **Step 2 — make `store.ts` fence-aware. ✅ SHIPPED.** A `ReplicaRepositoryStaleWriterError`
+    from any replica save now triggers _read + rehydrate authoritative bytes_ (adopt the
+    winner), never the old rollback — the verbatim ADR-017 contract ("the caller must fully
+    rehydrate those bytes"). Every save site is covered: the hot optimistic-edit path (the
+    durable promise now _resolves_ via adopt instead of rejecting), `saveState`, the
+    fresh-empty-replica creation race in `loadReplica`, and the account-switch/sign-out
+    saves (a fence there is swallowed — the durable copy is already newer). **Crucially every
+    non-fence path is byte-for-byte unchanged, and production still uses the non-fencing
+    `SerializedKvReplicaRepository`, so this is provably dormant until step 3 flips authority.**
+    6 new tests drive a fenced fake repo through all paths (incl. "never permanently stuck" and
+    "genuine non-fence failure still rolls back"). _Residual for step 3:_ adopt-authoritative
+    discards a fenced writer's optimistic delta by design, so step 3 must pair the flip with
+    cross-tab leadership (below) so an actively-edited tab is not the losing writer.
   - **Step 3 — platform store selection (IndexedDB web / SQLite native) + flip production
     authority** with promotion, then port the coordinator to `/v2` and freeze the v1 path.
   - _Also (per the A2 insight): the transactional store's CAS already prevents cross-tab
