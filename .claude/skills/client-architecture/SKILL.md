@@ -157,10 +157,14 @@ null`; route keys include the owner so component state cannot survive an account
   switch. Sign-out must first commit its token-free tombstone.
 - **`useObs` selector identity matters.** Its `subscribe` is memoized on `[selector]`, so an inline arrow re-subscribes every render (works, but churns). For hot lists prefer a stable module-level selector like `selectVisibleNotes`. Every observable you read _inside_ the selector becomes a dependency — read only what the component renders.
 - **`Tabs.Screen`/`Stack.Screen` `name` must equal the filename** (sans extension); route groups `(auth)`/`(app)` and the `notes/` folder are path segments, but parenthesized groups are stripped from the URL. A mismatched `name` silently drops the screen from the navigator.
-- **Native replica capacity is still a release blocker.** SecureStore has a small
-  per-value ceiling. Writes are verified and failures set `error`; request staging
-  failure prevents dispatch, including the concurrent-edit interleaving via pending-batch
-  reconfirmation. SQLite/IndexedDB is still required for real capacity and transactions.
+- **Native replica capacity: the primitive now exists but is unwired.** Production still
+  writes the whole replica to one SecureStore value (a small per-value ceiling). The
+  transactional stores for real capacity exist for both platforms —
+  `IndexedDbTransactionalReplicaStore` (web, ADR-017) and `ExpoSqliteTransactionalReplicaStore`
+  (native, ADR-020, `node:sqlite`-tested) — but neither is runtime-selected. The blocker is
+  now the fenced CUTOVER (select the store, promote existing replicas, cross-tab web
+  leadership) + device acceptance, not a missing store. Writes are verified and failures
+  set `error`; staging failure prevents dispatch.
 - **Everything is workspace-scoped by a fixed-token lease.** The client never sends a
   `workspaceId`; the server derives it. Do not replace `apiForLease` with a mutable
   token callback for authenticated work.

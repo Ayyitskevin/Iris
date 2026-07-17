@@ -221,6 +221,9 @@ To add a synced field: add it to `SyncMutation.note` and `Note` in `schemas.ts`,
   performs the explicit registration step and treats its 402 as `syncGated`; local
   edits still work.
 - **Everything runs inside `runTenant`'s single transaction**, workspace-scoped via the RLS GUC. A push batch is atomic per request; `loadNote`/writes already filter by `ctx.workspaceId`. Never reach around `ctx.db`.
-- **Local repository durability is not done.** The owner JSON value is still
-  SecureStore/localStorage. SQLite/IndexedDB and cross-tab coordination remain release
-  blockers even though network retry ambiguity and terminal retry loops are closed.
+- **Local repository durability is not wired yet.** The production owner JSON value is
+  still SecureStore/localStorage. The revision-fenced transactional primitives now exist
+  for BOTH platforms — `IndexedDbTransactionalReplicaStore` (web, ADR-017) and
+  `ExpoSqliteTransactionalReplicaStore` (native, ADR-020) — but neither is runtime-selected.
+  The remaining blockers are the CUTOVER (selecting them, promoting existing replicas,
+  cross-tab web leadership) and device/browser acceptance, not a missing store.
