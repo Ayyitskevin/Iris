@@ -9,6 +9,7 @@ import { observable } from '@legendapp/state';
 import type { Note, SyncMutation } from '@iris/shared';
 import type { SyncConflictDraft } from '../sync/reconcile';
 import { ownerReplicaRepository, replicaStorageKey } from './replica-repository';
+import { ReplicaRepositoryStaleWriterError } from './transactional-replica-repository';
 import { storage } from './storage';
 
 export interface Session {
@@ -352,8 +353,50 @@ async function enqueueReplicaSave(replica: PersistedReplica): Promise<void> {
   try {
     await ownerReplicaRepository.commit(snapshot.ownerKey, raw);
   } catch (cause) {
+    // A stale-writer fence is not a persistence failure: another tab/process advanced the
+    // durable replica (ADR-017). It must reach the caller intact so the projection is
+    // rehydrated from the authoritative bytes rather than rolled back to the losing root.
+    if (cause instanceof ReplicaRepositoryStaleWriterError) throw cause;
     throw new StatePersistenceError('Could not persist the owner replica', { cause });
   }
+}
+
+/**
+ * Resolve a stale-writer fence for the active owner (ADR-017).
+ *
+ * The fenced commit has already failed; an explicit authoritative read clears the fence and
+ * returns the winning bytes. While that owner is still the active projection, it is fully
+ * rehydrated from those bytes — the losing optimistic delta is intentionally discarded, not
+ * rolled back, because it was computed from a superseded revision. Selecting a fencing
+ * repository (plan A3 step 3) pairs this with cross-tab leadership so an active edit is not
+ * the losing writer; until then production uses a non-fencing repository and this is dormant.
+ */
+async function adoptAuthoritativeReplica(ownerKey: string): Promise<void> {
+  let authoritative: string | null;
+  try {
+    authoritative = await ownerReplicaRepository.read(ownerKey);
+  } catch (cause) {
+    throw new StatePersistenceError(
+      'Could not read the authoritative replica after a stale-writer fence',
+      { cause },
+    );
+  }
+  const session = store$.session.get();
+  // Only rehydrate while the fenced owner is still active; an account switch that happened
+  // during the read must not be clobbered by the old owner's bytes.
+  if (!session || store$.activeOwnerKey.get() !== ownerKey || ownerKeyFor(session) !== ownerKey) {
+    return;
+  }
+  if (authoritative === null) return;
+  let replica: PersistedReplica;
+  try {
+    replica = parseReplica(authoritative, session);
+  } catch {
+    // Corrupt or foreign authoritative bytes: leave the projection in place. The fence is
+    // already cleared, so a later genuine save can still surface a real failure.
+    return;
+  }
+  publishReplicaProjection(replica);
 }
 
 function enqueueSessionWrite(task: () => Promise<void>): Promise<void> {
@@ -467,8 +510,19 @@ function activate(session: Session, replica: PersistedReplica): void {
 async function loadReplica(session: Session): Promise<PersistedReplica> {
   const ownerKey = ownerKeyFor(session);
   const raw = await ownerReplicaRepository.read(ownerKey);
-  const replica = raw ? parseReplica(raw, session) : emptyReplica(session);
-  if (!raw) await enqueueReplicaSave(replica);
+  if (raw) return parseReplica(raw, session);
+  const replica = emptyReplica(session);
+  try {
+    await enqueueReplicaSave(replica);
+  } catch (error) {
+    // Another writer created this owner's replica between our read and our write. Adopt the
+    // winner rather than the fresh empty one; the read that surfaces it also cleared the fence.
+    if (error instanceof ReplicaRepositoryStaleWriterError) {
+      const authoritative = await ownerReplicaRepository.read(ownerKey);
+      if (authoritative) return parseReplica(authoritative, session);
+    }
+    throw error;
+  }
   return replica;
 }
 
@@ -667,7 +721,18 @@ export async function saveState(): Promise<boolean> {
   try {
     await enqueueReplicaSave(replica);
     return true;
-  } catch {
+  } catch (error) {
+    if (error instanceof ReplicaRepositoryStaleWriterError) {
+      // The durable replica was advanced by another writer. Adopt it rather than reporting a
+      // persistence error; local editing continues from the authoritative bytes (ADR-017).
+      try {
+        await adoptAuthoritativeReplica(replica.ownerKey);
+        return true;
+      } catch {
+        if (store$.activeOwnerKey.get() === replica.ownerKey) store$.status.set('error');
+        return false;
+      }
+    }
     if (store$.activeOwnerKey.get() === replica.ownerKey) store$.status.set('error');
     return false;
   }
@@ -799,7 +864,18 @@ function applyReplicaChange<Result>(
   // Register durable ordering before the root publication. Legend-State observers run
   // synchronously and may re-enter this function with a newer local change; that newer
   // snapshot must queue after this one rather than be overwritten by it after restart.
-  const durable = enqueueReplicaSave(next).then(() => assertCurrentSession(lease));
+  const durable = enqueueReplicaSave(next).then(
+    () => assertCurrentSession(lease),
+    (error) => {
+      // A stale-writer fence is resolved by adopting authoritative bytes, not by failing the
+      // save; the optimistic projection is replaced in place (ADR-017). Any other error
+      // propagates so callers roll back the losing change exactly as before.
+      if (error instanceof ReplicaRepositoryStaleWriterError) {
+        return adoptAuthoritativeReplica(lease.ownerKey);
+      }
+      throw error;
+    },
+  );
   publishReplicaProjection(next);
   return { result: change.result, durable, previous, next };
 }
@@ -859,7 +935,15 @@ export function adoptSession(next: Session): Promise<void> {
     beginSessionTransition();
 
     try {
-      if (priorReplica) await enqueueReplicaSave(priorReplica);
+      if (priorReplica) {
+        try {
+          await enqueueReplicaSave(priorReplica);
+        } catch (error) {
+          // The prior owner's durable replica was advanced elsewhere and is already newer
+          // than our snapshot; we are switching away, so a fence must not abort the change.
+          if (!(error instanceof ReplicaRepositoryStaleWriterError)) throw error;
+        }
+      }
       const replica = await loadReplica(next);
       const raw = JSON.stringify(next);
       await persistSessionValue(raw);
@@ -893,7 +977,15 @@ export function signOutSession(): Promise<void> {
     const priorSessionRaw = priorSession ? JSON.stringify(priorSession) : null;
     beginSessionTransition();
     try {
-      if (replica) await enqueueReplicaSave(replica);
+      if (replica) {
+        try {
+          await enqueueReplicaSave(replica);
+        } catch (error) {
+          // A newer durable replica already exists; sign-out retains that authoritative copy,
+          // so a fence must not block the transition.
+          if (!(error instanceof ReplicaRepositoryStaleWriterError)) throw error;
+        }
+      }
       await persistSessionValue(
         sessionTombstone('sign-out', priorSession ? ownerKeyFor(priorSession) : null),
       );
