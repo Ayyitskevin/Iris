@@ -107,14 +107,25 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
   (or BroadcastChannel) leader election so one tab owns replica commits + `storage`-event
   invalidation for followers. _DoD:_ a two-tab test (real browser) shows no lost outbox
   entry; concurrency test added.
-- **A3 · 🟣 Opus · Sync v2 runtime cutover.** Select the transactional root + v3 replica
-  behind the migration ledger; port the coordinator from v1 to `stage-v2`/`apply-v2` + the
-  correlator + `/v2` pull; migrate existing `iris:state:v1` blobs (the quarantine/recovery
-  path already exists); then **freeze or delete the v1 client path** so the two kernels
-  can't drift (`apply-v2` already handles a receipt-replay tombstone case v1 doesn't).
-  _DoD:_ mobile suite green on the v2 coordinator; real-device A→B account switch, lost
-  response, and restart scenarios pass. **Depends on A1 + A2.** This is the single riskiest
-  item in the repo; it is why native storage and web leadership come first.
+- **A3 · 🟣 Opus · Sync v2 runtime cutover — STAGED (in progress).** The single riskiest
+  change in the repo, so it is broken into fenced steps, each shipped tested:
+  - **Step 1 — storage-backend migration primitive. ✅ SHIPPED.**
+    `PromotingOwnerReplicaRepository` lazily adopts an existing key/value replica into the
+    transactional store on first read and handles the concurrent-promotion fence
+    (`StaleWriterError` → re-read the winner). Unwired; tested over real SQLite + a fenced
+    fake. **Key finding that shaped the staging:** flipping authority is NOT a drop-in swap
+    — `store.ts:enqueueReplicaSave` turns every commit failure into a rollback, but the
+    transactional repo's `StaleWriterError` is a _fence_ that only clears on an explicit
+    `read()`, so the current store would get permanently stuck on the first cross-tab
+    conflict. Hence:
+  - **Step 2 — make `store.ts` fence-aware** (a `ReplicaRepositoryStaleWriterError` must
+    trigger read + rehydrate, not a plain rollback). Delicate; the prerequisite to flipping.
+  - **Step 3 — platform store selection (IndexedDB web / SQLite native) + flip production
+    authority** with promotion, then port the coordinator to `/v2` and freeze the v1 path.
+  - _Also (per the A2 insight): the transactional store's CAS already prevents cross-tab
+    data loss, so web "leader election" (A2) folds in here as an optimization, not a
+    separate blocker._ _DoD:_ mobile suite green on the wired path; real-device A→B switch,
+    lost response, and restart scenarios pass (device-acceptance gated).
 - **A4 · 🟣 Opus (design) → 🔵 Sonnet (implement) · One-command deploy + secrets.**
   Dockerfile for `apps/api`; a `fly.toml`/`render.yaml`; migrations-run-on-deploy step
   (the ledger + advisory lock already make this safe); documented secret set
