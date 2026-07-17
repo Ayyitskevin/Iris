@@ -770,6 +770,43 @@ native acceptance evidence. Those remain runtime-cutover and release gates.
 
 ---
 
+## ADR-020 — Native SQLite transactional owner-replica store
+
+**Accepted as an unwired native storage primitive; runtime authority is unchanged.**
+
+ADR-017 gave web a revision-fenced transactional owner-replica store on IndexedDB, but
+native had none — the shipped native replica is still one size-limited `expo-secure-store`
+value (a ~2 KB Android ceiling), so a real workspace cannot durably persist on device.
+That is the #1 launch blocker in the master plan.
+
+`ExpoSqliteTransactionalReplicaStore` is the native counterpart. It implements the exact
+same `TransactionalReplicaStore` contract as the IndexedDB store — `read` plus an atomic
+`compareAndSwap(ownerKey, expectedRevision, bytes)` that creates revision 1 from 0,
+replaces at the observed revision, and returns the authoritative record on any revision
+mismatch without overwriting it — so the existing `TransactionalOwnerReplicaRepository`
+(queueing, read-back verify, stale-writer fence) works over it unchanged. One SQLite row
+per owner holds `{schema_version, owner_key, revision, serialized_replica}`; the swap runs
+inside an EXCLUSIVE (write-locked) transaction, which is the primitive that serializes
+concurrent swaps. A misrouted/corrupt row fails loud, exactly like the web store.
+
+The store depends only on a tiny async SQLite seam (`ReplicaSqliteDatabase`): the app
+satisfies it with an `expo-sqlite` database (via a lazily-imported factory so neither the
+module nor its tests load the native binding), and the tests satisfy it with Node's
+built-in `node:sqlite`. The full compare-and-swap contract — create/read/revision
+monotonicity, conflict-without-overwrite, owner isolation, repository fencing, corrupt-row
+rejection, and the exclusive-lock primitive — therefore runs against **real SQLite
+off-device** and is green in CI.
+
+This decision does **not** select SQLite in production, promote the existing
+SecureStore/localStorage replica, change the `/v1` coordinator or the persisted root
+shape, or move the bearer token out of the OS keystore. Native force-quit durability and
+true multi-connection concurrency are **device-acceptance gates** (as the IndexedDB
+primitive's real-browser behavior is), and the fenced storage cutover — selecting this
+store for native, promoting existing replicas, and porting the coordinator to `/v2` — is
+the runtime work tracked as plan item A3.
+
+---
+
 ## Summary: the shape these decisions produce
 
 One TypeScript monorepo → one Fastify service → one Postgres (PGlite locally). Auth,

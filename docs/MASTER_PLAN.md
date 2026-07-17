@@ -49,11 +49,11 @@ metrics, EAS build config (`eas.json`), and app-store assets in `app.json`. Auth
 **You cannot ship to the App Store / Play Store until three blockers are closed.** They are
 independent of feature count and independent of the Sync v2 machinery being clever:
 
-| # | Blocker | Why it blocks launch | Evidence |
-|---|---------|----------------------|----------|
-| **B-1** | **Native durable storage** | On iOS/Android the entire owner replica (all notes + outbox) is one `expo-secure-store` value (~2 KB Android ceiling). Past that, **every save fails and edits live only in RAM → lost on process death.** No `expo-sqlite` dep; the IndexedDB store is web-only. | `apps/mobile/src/state/storage.ts:29-42`; `client-architecture` skill already calls this "a release blocker" |
-| **B-2** | **Deploy + secrets + observability** | There is no way to run the API in production, manage `JWT_SECRET`/`STRIPE_*`/`DATABASE_URL`, apply migrations on deploy, or see errors when it breaks. | grep: no Dockerfile/fly/render; no Sentry/otel; `env.ts` |
-| **B-3** | **Account deletion + privacy** | App stores + GDPR/CCPA require a user-initiated delete-my-account + data-export path, and a privacy policy. None exists. | grep: no account-delete route |
+| #       | Blocker                              | Why it blocks launch                                                                                                                                                                                                                                              | Evidence                                                                                                     |
+| ------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| **B-1** | **Native durable storage**           | On iOS/Android the entire owner replica (all notes + outbox) is one `expo-secure-store` value (~2 KB Android ceiling). Past that, **every save fails and edits live only in RAM → lost on process death.** No `expo-sqlite` dep; the IndexedDB store is web-only. | `apps/mobile/src/state/storage.ts:29-42`; `client-architecture` skill already calls this "a release blocker" |
+| **B-2** | **Deploy + secrets + observability** | There is no way to run the API in production, manage `JWT_SECRET`/`STRIPE_*`/`DATABASE_URL`, apply migrations on deploy, or see errors when it breaks.                                                                                                            | grep: no Dockerfile/fly/render; no Sentry/otel; `env.ts`                                                     |
+| **B-3** | **Account deletion + privacy**       | App stores + GDPR/CCPA require a user-initiated delete-my-account + data-export path, and a privacy policy. None exists.                                                                                                                                          | grep: no account-delete route                                                                                |
 
 Everything else in this plan is either **launch-hardening** (should land right around
 launch) or **post-launch product**. Do not let the impressive Sync v2 backlog reorder these.
@@ -97,12 +97,12 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
 
 ### Phase A — Launch blockers (must close before an app-store build)
 
-- **A1 · 🟣 Opus · Native transactional replica store.** Add `expo-sqlite`; implement a
-  `TransactionalReplicaStore` on SQLite that satisfies the **same CAS contract** as
-  `IndexedDbTransactionalReplicaStore` (monotonic revision, read-back verify, per-owner
-  serialization). Keep only the bearer token in `expo-secure-store`. _DoD:_ the existing
-  transactional-store test suite passes against the SQLite adapter; a device/simulator run
-  survives force-quit mid-edit with no data loss. _Closes B-1._
+- **A1 · 🟣 Opus · Native transactional replica store. ✅ SHIPPED (ADR-020).**
+  `ExpoSqliteTransactionalReplicaStore` satisfies the exact `TransactionalReplicaStore`
+  CAS contract, tested against real SQLite via `node:sqlite` (create/read/revision,
+  conflict-no-overwrite, owner isolation, repository fencing, corrupt-row rejection,
+  exclusive-lock primitive). Unwired, like the IndexedDB store. **Remaining for B-1:**
+  the fenced cutover that selects it + device force-quit acceptance — folded into **A3**.
 - **A2 · 🟣 Opus · Web cross-tab leadership.** Before/with the IndexedDB cutover: Web Locks
   (or BroadcastChannel) leader election so one tab owns replica commits + `storage`-event
   invalidation for followers. _DoD:_ a two-tab test (real browser) shows no lost outbox
@@ -225,20 +225,20 @@ Then Phase A5 (account deletion) and the rest of Phase B, then Phase C after a r
 From the adversarial review of the Sync v2 era (server + client agents completed; the other
 six areas are **still to be reviewed** — a follow-up task for an Opus/Sonnet session):
 
-| Sev | Finding | Where | Mapped to |
-|-----|---------|-------|-----------|
-| **blocker** | Native replica can't exceed ~2 KB SecureStore value → RAM-only, lost on quit | `storage.ts:29-42` | A1 |
-| high | Web multi-tab last-writer-wins erases the other tab's outbox | `replica-repository.ts:46,68-79` | A2 |
-| high | 8 s poll, no backoff, sync-per-keystroke → battery/network unfit | `app/_layout.tsx:23-27` | B8 |
-| high | `sync_idempotency` grows forever, full note payload per receipt, no GC | `schema.ts:116-136`, `sync.ts:243-254` | B5 |
-| high | No device deregistration → free user who loses replica is 402-locked forever | `billing.ts:36-42`, `devices.ts:68-75` | B4 |
-| medium | One bad outbox mutation halts all push+pull (head-of-line) | `coordinator.ts:98-148` | B9 |
-| medium | Remote tombstones stored forever; whole-replica rewrite per edit | `coordinator.ts:344-351` | B9 |
-| low | `/v1` push has no response byte budget (v1/v2 divergence) | `sync.ts:417-449` | (B, port v2 cap) |
-| low | Batch-abort 400s omit the failing `operationId` | `sync.ts:269-274` | B12a |
-| low | Device gate is honor-system (spoofable `deviceId`) | `devices.ts:94-100` | B10 (document) |
-| low | `Math.random` UUID fallback risks receipt/id collision on old Hermes | `manager.ts:24-43` | B12b |
-| **doc** | `sync-protocol` skill teaches pre-ADR-015 upsert-resurrect (dangerous) | skill L79-82,148 | D1 |
+| Sev         | Finding                                                                      | Where                                  | Mapped to        |
+| ----------- | ---------------------------------------------------------------------------- | -------------------------------------- | ---------------- |
+| **blocker** | Native replica can't exceed ~2 KB SecureStore value → RAM-only, lost on quit | `storage.ts:29-42`                     | A1               |
+| high        | Web multi-tab last-writer-wins erases the other tab's outbox                 | `replica-repository.ts:46,68-79`       | A2               |
+| high        | 8 s poll, no backoff, sync-per-keystroke → battery/network unfit             | `app/_layout.tsx:23-27`                | B8               |
+| high        | `sync_idempotency` grows forever, full note payload per receipt, no GC       | `schema.ts:116-136`, `sync.ts:243-254` | B5               |
+| high        | No device deregistration → free user who loses replica is 402-locked forever | `billing.ts:36-42`, `devices.ts:68-75` | B4               |
+| medium      | One bad outbox mutation halts all push+pull (head-of-line)                   | `coordinator.ts:98-148`                | B9               |
+| medium      | Remote tombstones stored forever; whole-replica rewrite per edit             | `coordinator.ts:344-351`               | B9               |
+| low         | `/v1` push has no response byte budget (v1/v2 divergence)                    | `sync.ts:417-449`                      | (B, port v2 cap) |
+| low         | Batch-abort 400s omit the failing `operationId`                              | `sync.ts:269-274`                      | B12a             |
+| low         | Device gate is honor-system (spoofable `deviceId`)                           | `devices.ts:94-100`                    | B10 (document)   |
+| low         | `Math.random` UUID fallback risks receipt/id collision on old Hermes         | `manager.ts:24-43`                     | B12b             |
+| **doc**     | `sync-protocol` skill teaches pre-ADR-015 upsert-resurrect (dangerous)       | skill L79-82,148                       | D1               |
 
 **Still-to-review (open task):** migration-ledger robustness, versioning/undo edge cases,
 auth/billing/agents launch-readiness deep pass, CI/testing gaps (no HTTP e2e; PGlite-WASM
