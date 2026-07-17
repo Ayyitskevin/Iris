@@ -216,6 +216,11 @@ export const Device = z.object({
 });
 export type Device = z.infer<typeof Device>;
 
+export const DeviceListResponse = z.object({
+  devices: z.array(Device),
+});
+export type DeviceListResponse = z.infer<typeof DeviceListResponse>;
+
 export const BillingStatus = z.object({
   plan: Plan,
   status: SubscriptionStatus,

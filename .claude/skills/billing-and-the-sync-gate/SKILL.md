@@ -36,6 +36,9 @@ The webhook route has **no auth and no tenant context** (Stripe calls it). It ro
 - `apps/api/src/services/devices.ts` — where the gate is **enforced**.
   - `ensureDevice(ctx, id, meta?)` — the choke point: existing device passes free; new device runs the limit check and throws `paymentRequired(...)` at the limit.
   - `registerDevice` — POST `/v1/devices` handler; returns `{activeDevices}`.
+  - `listDevices` / `deregisterDevice` — GET `/v1/devices` and DELETE `/v1/devices/:id`
+    (user-only). Deregistration **frees a plan slot**: it is the escape hatch so a lost or
+    reinstalled device (fresh random id) is not 402-locked forever behind a stale slot.
   - `requireRegisteredDevice` — sync-only existence check. It updates `lastSeenAt` for
     a known workspace-composite id and returns 403 for an unknown one; it never
     auto-registers or consumes a plan slot.

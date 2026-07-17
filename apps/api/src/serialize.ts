@@ -3,10 +3,19 @@
  * token hashes); the wire types (from @iris/shared) use ISO strings and never leak
  * secrets. This is the one place that translation happens.
  */
-import type { ActivityEntry, AgentToken, Note, NoteVersion, User, Workspace } from '@iris/shared';
+import type {
+  ActivityEntry,
+  AgentToken,
+  Device,
+  Note,
+  NoteVersion,
+  User,
+  Workspace,
+} from '@iris/shared';
 import type {
   ActivityRow,
   AgentTokenRow,
+  DeviceRow,
   NoteRow,
   NoteVersionRow,
   UserRow,
@@ -14,6 +23,17 @@ import type {
 } from './db/schema';
 
 const iso = (d: Date | null): string | null => (d ? d.toISOString() : null);
+
+export function serializeDevice(r: DeviceRow): Device {
+  return {
+    id: r.id,
+    workspaceId: r.workspaceId,
+    name: r.name,
+    platform: r.platform,
+    createdAt: r.createdAt.toISOString(),
+    lastSeenAt: r.lastSeenAt.toISOString(),
+  };
+}
 
 export function serializeNote(r: NoteRow): Note {
   return {

@@ -394,6 +394,21 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
     }),
   );
 
+  app.get('/v1/devices', guarded, (req) =>
+    tenant(req, async (ctx) => {
+      requireUser(ctx.principal);
+      return { devices: await deviceService.listDevices(ctx) };
+    }),
+  );
+
+  // Deregister a device to free its plan slot (lost/reinstalled device recovery).
+  app.delete('/v1/devices/:id', guarded, (req) =>
+    tenant(req, async (ctx) => {
+      requireUser(ctx.principal);
+      return deviceService.deregisterDevice(ctx, (req.params as { id: string }).id);
+    }),
+  );
+
   app.get('/v1/billing/status', guarded, (req) =>
     tenant(req, async (ctx) => billingService.billingStatus(ctx)),
   );

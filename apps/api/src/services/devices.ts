@@ -3,10 +3,12 @@
  * the plan limit is enforced. Sync endpoints accept only an explicitly registered
  * device, so read-only agents cannot allocate billable workspace state.
  */
-import { and, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
+import type { Device } from '@iris/shared';
 import { devices, workspaces } from '../db/schema';
 import type { Ctx } from '../context';
-import { forbidden, paymentRequired } from '../lib/errors';
+import { forbidden, notFound, paymentRequired } from '../lib/errors';
+import { serializeDevice } from '../serialize';
 import { countDevices, deviceLimit, getSubscription } from './billing';
 
 async function findDevice(ctx: Ctx, id: string) {
@@ -87,6 +89,33 @@ export async function registerDevice(
   input: { id: string; name: string; platform: string },
 ): Promise<{ activeDevices: number }> {
   await ensureDevice(ctx, input.id, { name: input.name, platform: input.platform });
+  return { activeDevices: await countDevices(ctx) };
+}
+
+/** List the workspace's registered devices, most-recently-seen first. */
+export async function listDevices(ctx: Ctx): Promise<Device[]> {
+  const rows = await ctx.db
+    .select()
+    .from(devices)
+    .where(eq(devices.workspaceId, ctx.workspaceId))
+    .orderBy(desc(devices.lastSeenAt));
+  return rows.map(serializeDevice);
+}
+
+/**
+ * Remove a device, freeing its plan slot. This is the escape hatch for a lost or
+ * reinstalled device: without it, a free-plan user whose local replica is gone
+ * generates a fresh device id and is 402-locked forever behind the stale slot.
+ */
+export async function deregisterDevice(
+  ctx: Ctx,
+  id: string,
+): Promise<{ activeDevices: number }> {
+  const deleted = await ctx.db
+    .delete(devices)
+    .where(and(eq(devices.id, id), eq(devices.workspaceId, ctx.workspaceId)))
+    .returning({ id: devices.id });
+  if (deleted.length === 0) throw notFound('Device not found');
   return { activeDevices: await countDevices(ctx) };
 }
 

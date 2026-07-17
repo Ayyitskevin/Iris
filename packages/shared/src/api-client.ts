@@ -25,6 +25,7 @@ import type {
   Note,
   NoteListResponse,
   NoteVersionListResponse,
+  DeviceListResponse,
   RegisterDeviceRequest,
   RestoreVersionRequest,
   RestoreVersionResponse,
@@ -228,6 +229,10 @@ export function createApiClient(options: ApiClientOptions) {
     // --- Devices & billing ---
     registerDevice: (b: RegisterDeviceRequest) =>
       request<{ activeDevices: number }>('POST', '/v1/devices', b),
+    listDevices: () => request<DeviceListResponse>('GET', '/v1/devices'),
+    /** Remove a device, freeing its plan slot (e.g. a lost/reinstalled device). */
+    deregisterDevice: (id: string) =>
+      request<{ activeDevices: number }>('DELETE', `/v1/devices/${id}`),
     billingStatus: () => request<BillingStatus>('GET', '/v1/billing/status'),
     createCheckout: () => request<CreateCheckoutResponse>('POST', '/v1/billing/checkout'),
 
