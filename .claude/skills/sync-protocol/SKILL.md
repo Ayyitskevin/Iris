@@ -1,6 +1,6 @@
 ---
 name: sync-protocol
-description: Open when touching the local-first change-feed — database cursors, request receipts, base_version pushes, conflicts, durable outbox staging, or the coordinator (ADR-005/011/012).
+description: Open when touching the local-first change-feed — database cursors, request receipts, base_version pushes, the upsert/delete/resurrect lifecycle, conflicts, durable outbox staging, the /v2 generic resource envelope, or the coordinator (ADR-005, 011–019).
 ---
 
 ## When to use
@@ -24,6 +24,13 @@ transactionally connected halves:
 2. **Push** — every mutation carries `baseVersion` plus a durable `opId`. The server
    permanently binds that id to workspace + actor + device + parsed payload and stores
    the applied-or-conflict outcome in the same transaction as note history/activity.
+3. **Three lifecycle intents** — push dispatches `upsert` | `delete` | `resurrect`
+   (`m.type`). Editing content and reviving a deleted note are **distinct intents**: an
+   upsert against a tombstone is a _conflict_, never a revival. Only the explicit
+   `resurrect` (exact base, chosen by the operator from the Review inbox) revives, and it
+   records `note.restore` (ADR-015). A parallel strict `/v2/sync/{changes,push}` exposes
+   the same notes behind a generic resource envelope (`sync-v2.ts`, ADR-016) so future
+   projects/tasks share one engine — **but the production client still calls `/v1`.**
 
 The client is local-first: edits update Legend-State synchronously and coalesce into the
 outbox. Before network dispatch, the coordinator persists an exact `pendingPush`
@@ -38,10 +45,15 @@ all automatic network work until the user invokes its explicit recovery action.
 - `apps/api/migrations/0003_sync_v2.sql` — workspace-composite note/device identities,
   backfill, workspace counter, note sequencing triggers, request receipts, RLS, and the
   `notes_sync_idx` replacement.
-- `apps/api/src/services/sync.ts` — server protocol.
+- `apps/api/src/services/sync.ts` — `/v1` server protocol.
   - `syncChanges` validates/upgrades the cursor and reads `sync_seq` pages.
   - `applyIdempotently` claims or replays a versioned, fingerprint-bound receipt.
-  - `applyUpsert` / `applyDelete` own note version/conflict semantics.
+  - `applyUpsert` / `applyDelete` / `applyResurrect` own note version + lifecycle +
+    conflict semantics (dispatched by `m.type` in `syncPush`).
+- `apps/api/src/services/sync-v2.ts` — the additive `/v2` generic resource envelope
+  (`resource-v1:notes-v1:<workspace>:<seq>` cursor namespace) that projects losslessly
+  into the same receipt-v1 push path (ADR-016). `apps/api/test/sync-resource-v2.test.ts`
+  is its spec.
 - `packages/shared/src/schemas.ts` — the wire contract (single source of truth).
   - `SyncChangesRequest`, `SyncMutation`, the bounded same-`/v1` push ingress,
     client chunk validation, byte helpers, and validated applied/conflict responses.
@@ -66,22 +78,33 @@ all automatic network work until the user invokes its explicit recovery action.
 
 **Most common task: trace one round-trip and verify a change end-to-end.**
 
-Server push, per mutation (`sync.ts`):
+Server push dispatches by `m.type` → `applyUpsert` / `applyDelete` / `applyResurrect`
+(`sync.ts`):
 
 ```ts
-// applyUpsert
+// applyUpsert  — content edit; NEVER revives a tombstone
 const existing = await loadNote(ctx, m.note.id);
-if (!existing) {                        // created offline → adopt client id
-  insert {...m.note, version: 1};       // NB: server assigns 1, client sent baseVersion 0
+if (!existing) {
+  if (m.baseVersion !== 0) throw badRequest(..., 'invalid_sync_base_version'); // only 0 creates
+  const [note] = insert {...m.note, version: 1}.onConflictDoNothing();          // client sent baseVersion 0
+  if (!note) return conflictResult(m, await loadNote(...));  // lost the create race → surface head
   recordVersionAndActivity(ctx, note, 'note.create');
   return applied;
 }
-if (existing.version !== m.baseVersion) return conflictResult(m, existing);  // stale
-update {...m.note, version: existing.version + 1, deletedAt: null, updatedAt: now};
-recordVersionAndActivity(ctx, note, 'note.update');   // deletedAt:null ⇒ upsert RESURRECTS a tombstone
+if (existing.deletedAt) return conflictResult(m, existing);                 // tombstone ⇒ CONFLICT, not revive
+if (existing.version !== m.baseVersion) return conflictResult(m, existing); // stale
+update {...m.note, version: existing.version + 1, updatedAt: now}
+  .where(eq(notes.version, existing.version));   // CAS: raced writer → conflict, not a dup-version 500
+recordVersionAndActivity(ctx, note, 'note.update');
 ```
 
-`applyDelete` is idempotent: missing note → `applied` (no `note`); already-tombstoned → `applied` echoing the tombstone; version mismatch → conflict; else set `deletedAt`, bump version, record `note.delete`.
+- **`applyResurrect`** is the _only_ revival path (ADR-015): it requires an existing
+  tombstone at the exact `baseVersion`. A live head or stale base → conflict; a missing
+  note → `invalid_sync_resurrection`. Success clears `deletedAt`, bumps version (same CAS
+  predicate), and records `note.restore` — attributable and undoable back to the tombstone.
+- **`applyDelete`** is idempotent: missing note → `applied` (no `note`); already-tombstoned
+  → `applied` echoing the tombstone; version mismatch → conflict; else set `deletedAt`,
+  bump version (CAS-guarded), record `note.delete`.
 
 Client loop (`coordinator.ts`, simplified):
 
@@ -145,7 +168,12 @@ To add a synced field: add it to `SyncMutation.note` and `Note` in `schemas.ts`,
   rejects repeated cursors and caps one drain at `SYNC_CHANGE_PAGE_LIMIT` (1,000)
   unique pages.
 - **Tombstones are pulled, not filtered.** `syncChanges` selects deleted rows too, so deletes propagate. Client-side visibility filtering is `selectVisibleNotes()` in `store.ts` (`!n.deletedAt`). Never add `WHERE deleted_at IS NULL` to the change-feed.
-- **Upsert resurrects a tombstone** (`deletedAt: null` on update). An edit to a note deleted elsewhere un-deletes it. Intended (edit wins over delete for the same version); know it before "fixing" it.
+- **Upsert NEVER revives a tombstone (ADR-015).** An upsert against a deleted note is a
+  _conflict_, even at the exact base version — content edits and revival are distinct
+  operator intents. Revival is only the explicit `resurrect` mutation, chosen from the
+  Review inbox after the operator sees the tombstone. **Do not "simplify" this back to
+  `deletedAt: null` on the update path** — that was the pre-ADR-015 data-loss bug (a delete
+  on one device silently undone by a stale edit on another) that this replaced.
 - **`version: 0` means client-local, unacked.** `createNoteLocal` sets 0 and pushes `baseVersion: 0`; the server insert assigns `version: 1`. A `baseVersion: 0` against an _existing_ row whose version ≠ 0 is a conflict, not an insert — only a truly-absent row inserts.
 - **A missing note plus nonzero `baseVersion` is invalid.** It is neither a create nor a
   representable version conflict, so the server rejects the request and the client
