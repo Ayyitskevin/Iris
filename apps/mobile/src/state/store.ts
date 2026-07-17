@@ -8,7 +8,8 @@
 import { observable } from '@legendapp/state';
 import type { Note, SyncMutation } from '@iris/shared';
 import type { SyncConflictDraft } from '../sync/reconcile';
-import { ownerReplicaRepository, replicaStorageKey } from './replica-repository';
+import { replicaStorageKey } from './replica-repository';
+import { ownerReplicaRepository } from './select-owner-replica-repository';
 import { ReplicaRepositoryStaleWriterError } from './transactional-replica-repository';
 import { storage } from './storage';
 

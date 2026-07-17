@@ -45,39 +45,35 @@ vi.mock('./storage', () => ({
   },
 }));
 
-vi.mock('./replica-repository', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./replica-repository')>();
-  return {
-    ...actual,
-    ownerReplicaRepository: {
-      async read(ownerKey: string): Promise<string | null> {
-        repo.reads.push(ownerKey);
-        // A read is what clears a stale-writer fence and returns the authoritative bytes.
-        repo.fenced.delete(ownerKey);
-        return repo.durable.get(ownerKey) ?? null;
-      },
-      async commit(ownerKey: string, raw: string): Promise<void> {
-        repo.commits.push(ownerKey);
-        if (repo.failCommitKey === ownerKey) {
-          repo.failCommitKey = null;
-          throw new Error('injected non-fence commit failure');
-        }
-        if (repo.raceNextCommit.has(ownerKey)) {
-          // A concurrent winner advanced the durable replica between our read and this
-          // commit, so our compare-and-swap loses. The winner's bytes stay durable and this
-          // instance is fenced until it reads them.
-          repo.raceNextCommit.delete(ownerKey);
-          const winner = repo.winner.get(ownerKey);
-          if (winner !== undefined) repo.durable.set(ownerKey, winner);
-          repo.fenced.add(ownerKey);
-          throw repo.makeStaleError!(ownerKey);
-        }
-        if (repo.fenced.has(ownerKey)) throw repo.makeStaleError!(ownerKey);
-        repo.durable.set(ownerKey, raw);
-      },
+vi.mock('./select-owner-replica-repository', () => ({
+  ownerReplicaRepository: {
+    async read(ownerKey: string): Promise<string | null> {
+      repo.reads.push(ownerKey);
+      // A read is what clears a stale-writer fence and returns the authoritative bytes.
+      repo.fenced.delete(ownerKey);
+      return repo.durable.get(ownerKey) ?? null;
     },
-  };
-});
+    async commit(ownerKey: string, raw: string): Promise<void> {
+      repo.commits.push(ownerKey);
+      if (repo.failCommitKey === ownerKey) {
+        repo.failCommitKey = null;
+        throw new Error('injected non-fence commit failure');
+      }
+      if (repo.raceNextCommit.has(ownerKey)) {
+        // A concurrent winner advanced the durable replica between our read and this commit,
+        // so our compare-and-swap loses. The winner's bytes stay durable and this instance is
+        // fenced until it reads them.
+        repo.raceNextCommit.delete(ownerKey);
+        const winner = repo.winner.get(ownerKey);
+        if (winner !== undefined) repo.durable.set(ownerKey, winner);
+        repo.fenced.add(ownerKey);
+        throw repo.makeStaleError!(ownerKey);
+      }
+      if (repo.fenced.has(ownerKey)) throw repo.makeStaleError!(ownerKey);
+      repo.durable.set(ownerKey, raw);
+    },
+  },
+}));
 
 import { ReplicaRepositoryStaleWriterError } from './transactional-replica-repository';
 import {
@@ -167,10 +163,16 @@ beforeEach(async () => {
 describe('owner store fence-awareness', () => {
   it('saveState adopts authoritative bytes on a stale-writer fence rather than erroring', async () => {
     const lease = await signIn();
-    await updateReplicaForLease(lease, (current) => ({ ...current, notes: { [noteAId]: note(noteAId, 'loser') } }));
+    await updateReplicaForLease(lease, (current) => ({
+      ...current,
+      notes: { [noteAId]: note(noteAId, 'loser') },
+    }));
 
     const ownerKey = ownerKeyFor(sessionA);
-    repo.winner.set(ownerKey, winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()));
+    repo.winner.set(
+      ownerKey,
+      winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()),
+    );
     repo.raceNextCommit.add(ownerKey);
 
     expect(await saveState()).toBe(true);
@@ -182,9 +184,15 @@ describe('owner store fence-awareness', () => {
   it('clears the fence so the next edit persists durably (never permanently stuck)', async () => {
     const lease = await signIn();
     const ownerKey = ownerKeyFor(sessionA);
-    await updateReplicaForLease(lease, (current) => ({ ...current, notes: { [noteAId]: note(noteAId, 'loser') } }));
+    await updateReplicaForLease(lease, (current) => ({
+      ...current,
+      notes: { [noteAId]: note(noteAId, 'loser') },
+    }));
 
-    repo.winner.set(ownerKey, winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()));
+    repo.winner.set(
+      ownerKey,
+      winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()),
+    );
     repo.raceNextCommit.add(ownerKey);
     expect(await saveState()).toBe(true);
 
@@ -200,7 +208,10 @@ describe('owner store fence-awareness', () => {
   it('resolves (not rejects) the hot-path durable promise on a fence and adopts the winner', async () => {
     const lease = await signIn();
     const ownerKey = ownerKeyFor(sessionA);
-    repo.winner.set(ownerKey, winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()));
+    repo.winner.set(
+      ownerKey,
+      winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()),
+    );
     repo.raceNextCommit.add(ownerKey);
 
     const applied = applyReplicaForLease(lease, (current) => ({
@@ -216,7 +227,10 @@ describe('owner store fence-awareness', () => {
   it('does not roll a committed change back on a fence; it adopts authoritative bytes', async () => {
     const lease = await signIn();
     const ownerKey = ownerKeyFor(sessionA);
-    repo.winner.set(ownerKey, winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()));
+    repo.winner.set(
+      ownerKey,
+      winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()),
+    );
     repo.raceNextCommit.add(ownerKey);
 
     await expect(

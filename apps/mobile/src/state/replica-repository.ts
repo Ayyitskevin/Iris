@@ -5,7 +5,7 @@
  * It is intentionally not described as the release SQLite/IndexedDB implementation:
  * callers depend only on owner-keyed reads and serialized, verified replacement commits.
  */
-import { storage, type KVStore } from './storage';
+import { type KVStore } from './storage';
 
 export function replicaStorageKey(ownerKey: string): string {
   return 'iris.replica.v2.' + ownerKey;
@@ -107,6 +107,7 @@ export class SerializedKvReplicaRepository implements OwnerReplicaRepository {
   }
 }
 
-export const ownerReplicaRepository: OwnerReplicaRepository = new SerializedKvReplicaRepository(
-  storage,
-);
+// The production singleton is assembled by `./select-owner-replica-repository`, which picks
+// the platform's fenced transactional store behind an opt-in flag and otherwise falls back to
+// `SerializedKvReplicaRepository`. This module stays a set of building blocks with no runtime
+// storage decision of its own.
