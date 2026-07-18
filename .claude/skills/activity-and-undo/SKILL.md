@@ -13,7 +13,7 @@ description: Open when touching the activity feed, the undo endpoint, note_versi
 
 ## Mental model
 
-The activity log is **append-only**: rows in `activity_log` are never updated or deleted. Every note mutation goes through the single choke point `recordVersionAndActivity` (`services/note-write.ts`), which writes an immutable `note_versions` snapshot of the recorded note fields plus one `activity_log` row describing the action. Undo is not a mutation of history — it is a _forward_ action that restores the currently supported pre-action content as a **new head version** and appends a compensating `note.undo` entry whose `undoOfId` points back at the reversed action. Because of this, "was this action undone?" is **derived at read time**: an entry is undone iff some other row names it as `undoOfId` (`services/activity.ts`). There is no `undone` column. Undo is operator-only (`requireUser`); agents can act but cannot undo. Folder/tag parity is not shipped: snapshots omit folder and activity undo does not restore tags, so ROADMAP keeps that correctness slice ahead of the work queue.
+The activity log is **append-only**: rows in `activity_log` are never updated or deleted. Every note mutation goes through the single choke point `recordVersionAndActivity` (`services/note-write.ts`), which writes an immutable `note_versions` snapshot of the recorded note fields plus one `activity_log` row describing the action. Undo is not a mutation of history — it is a _forward_ action that restores the currently supported pre-action content as a **new head version** and appends a compensating `note.undo` entry whose `undoOfId` points back at the reversed action. Because of this, "was this action undone?" is **derived at read time**: an entry is undone iff some other row names it as `undoOfId` (`services/activity.ts`). There is no `undone` column. Undo is operator-only (`requireUser`); agents can act but cannot undo. Undo restores the prior snapshot's **title, body, tags, and exact known folder**, and restores its captured **live/deleted state** — so undo can revive a note _or_ re-create a tombstone (with a fresh timestamp), and it is stricter than direct restore: a missing or lifecycle-unknown prior snapshot returns `incomplete_history` and writes nothing (no preserve opt-out). Mutations are `POST /v2/activity/:id/undo` (the `/v1` path is inert — `428 undo_protocol_upgrade_required`).
 
 ## Key files
 
@@ -36,11 +36,11 @@ The activity log is **append-only**: rows in `activity_log` are never updated or
 3. Guard `not_undoable`: reject if `target.noteId` is null OR `target.resultingVersion === null` (`activity.ts:46`) — this is what non-note activities hit.
 4. Guard `already_undone`: query for any row with `undoOfId === activityId` in this workspace; if one exists, reject (`activity.ts:51`).
 5. `priorVersion = target.resultingVersion - 1`.
-   - `priorVersion >= 1`: load `note_versions` at that version, restore its `title`/`bodyMd`, set `deletedAt = null` (reviving even a currently-deleted note), and leave the current folder/tags unchanged — `activity.ts:67`.
-   - else (undoing the first `note.create`, whose `resultingVersion` is 1): set `deletedAt = new Date()` — the note ceases to exist (`activity.ts:85`).
-6. Write the new head: `version = currentHead.version + 1`, plus restored title/body/deletedAt (`activity.ts:90`).
-7. `recordVersionAndActivity(ctx, head, 'note.undo', target.id)` — snapshots the restored head and appends the compensating entry with `undoOfId = target.id` (`activity.ts:103`).
-8. Return `{ undo, note: head.deletedAt ? null : serializeNote(head) }`.
+   - `priorVersion >= 1`: load the `note_versions` snapshot at that version. If it is **missing**, or its lifecycle was never captured (`is_deleted === null`), reject with `incomplete_history` and write **nothing** — undo has no "preserve current state" opt-out. Otherwise restore its `title`, `bodyMd`, `tags`, and — when `folder_snapshot_known` — its exact `folder`; set `deletedAt` from the captured state (`prior.isDeleted ? now : null`), so undo **re-creates a tombstone** (fresh timestamp) when the prior snapshot was itself deleted rather than always reviving.
+   - else (undoing the first `note.create`, whose `resultingVersion` is 1): tombstone the note — `deletedAt = new Date()` — so it ceases to exist (tags/folder are left as-is since the note is going away).
+6. Write the new head: `version = currentHead.version + 1`, plus the restored title/body/tags/folder/deletedAt.
+7. `recordVersionAndActivity(ctx, head, 'note.undo', target.id)` — snapshots the restored head and appends the compensating entry with `undoOfId = target.id`.
+8. Return `{ undo, note: serializeNote(head), folderRestored, deletionStateRestored: true }`. The authoritative note is **always** returned, even when it is now a tombstone — **never `null`**. `deletionStateRestored` is always literally `true` on success (an unknown prior lifecycle would have thrown `incomplete_history` at step 5).
 
 ## Playbook — verify undo of an agent edit end-to-end
 
@@ -68,17 +68,19 @@ expect(again.status).toBe(400);
 expect(again.json.error.code).toBe('already_undone');
 ```
 
-Undo of a create (`test/agent-undo.test.ts:79`): `undo.json.note` is `null` and the note disappears from `GET /v1/notes` — the create had `resultingVersion === 1`, so step 5 soft-deletes.
+Undo of a create (`test/agent-undo.test.ts`): `undo.json.note` is the **tombstone** — its `deletedAt` is set, it is **not** `null` — and the note disappears from `GET /v1/notes`; the create had `resultingVersion === 1`, so step 5 tombstones it.
 
 ## Adding a new reversible action
 
 1. Add the action string to `ActivityAction` in `@iris/shared` (extensionless relative imports; TS 5.9.3).
 2. In your service, mutate the note head (bump `version`, set `updatedAt`), then call `recordVersionAndActivity(ctx, head, 'note.yourAction')`. Do NOT insert into `activity_log`/`note_versions` by hand — the choke point keeps snapshot + entry + attribution consistent.
-3. The current title/body/deleted-state undo works automatically **iff** the row has a
-   real `noteId` and `resultingVersion`, and `priorVersion = resultingVersion - 1`
-   points at a valid snapshot. New mutable fields still require explicit snapshot,
-   restore, and focused undo coverage; do not infer field-complete reversibility from
-   the choke point alone.
+3. Whole-snapshot undo works automatically **iff** the row has a real `noteId` and
+   `resultingVersion`, and `priorVersion = resultingVersion - 1` points at a valid snapshot
+   whose lifecycle is known. Because `recordVersionAndActivity` snapshots title, body, tags,
+   folder (+ `folder_snapshot_known`) and lifecycle (`is_deleted`), undo restores all of them
+   for free — but a **new** mutable field you add needs its own snapshot column, restore
+   wiring, and focused undo coverage; do not assume the choke point captures a field you just
+   added.
 
 ## Invariants & gotchas
 
@@ -89,8 +91,17 @@ Undo of a create (`test/agent-undo.test.ts:79`): `undo.json.note` is `null` and 
   Undo is safe/idempotent-ish for the latest action; be careful reasoning about
   mid-history undo.
 - **`resultingVersion` and the snapshot's `version` both equal `note.version` at record time** (`note-write.ts:29-52`). If you bump `version` _after_ calling the helper, the snapshot is wrong. Bump first, record second (see `notes.ts:67` then `:73`).
-- **Undoing a create soft-deletes** (`deletedAt = now`, `activity.ts:87`) and the endpoint returns `note: null`. Undoing anything else sets `deletedAt = null`, reviving a deleted note (`activity.ts:83`).
-- **Three guards, all `badRequest(msg, code)` → HTTP 400** `{error:{code,...}}`: `cannot_undo_undo` (target is a `note.undo`), `not_undoable` (null `noteId`/`resultingVersion`), `already_undone` (a row already references it). `already_undone` is what prevents double-undo; it is a query, not a flag.
+- **Undo restores the prior snapshot's captured lifecycle — not always a revival.** Undoing a
+  create tombstones the note (`deletedAt = now`); undoing anything else restores
+  `prior.isDeleted ? now : null`, so it revives a deleted note _or_ re-creates a tombstone. The
+  endpoint **always returns the authoritative note** — even a tombstone — **never `null`**, plus
+  `folderRestored` and `deletionStateRestored: true`. A client must not branch on `note == null`.
+- **Four guards, all `badRequest(msg, code)` → HTTP 400** `{error:{code,...}}`: `cannot_undo_undo`
+  (target is a `note.undo`), `not_undoable` (null `noteId`/`resultingVersion`), `already_undone`
+  (a row already references it — a query, not a flag, and what prevents double-undo), and
+  `incomplete_history` (the prior snapshot is missing or its live/deleted state was never
+  captured — undo then writes nothing). Undo has **no** "preserve current state" opt-out, unlike
+  direct restore's `incomplete_version_snapshot` + `preserve*` flags.
 - **Undo is operator-only.** `app.ts:236` calls `requireUser(ctx.principal)` — an agent token gets rejected before `undoActivity` runs. The feed itself only needs `notes:read`.
 - **Everything is workspace-scoped.** Every query in `activity.ts` filters `workspaceId` (tenant rule, ADR-003). A new query that forgets `eq(..., ctx.workspaceId)` is a tenant-isolation bug even inside RLS.
 - **`note_versions` is unique on `(workspace_id, note_id, version)`.** Two writes at

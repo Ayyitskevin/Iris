@@ -28,7 +28,8 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 - `app/_layout.tsx` — hydrates before routing, retries rejected-session tombstones, and runs the 8-second sync loop.
 - `app/index.tsx` — the root gate: `useObs(() => store$.session.get() !== null)` → `<Redirect href={signedIn ? '/notes' : '/sign-in'} />`.
 - `app/(auth)/_layout.tsx` — `<Stack>` for `sign-in` / `sign-up`. `(auth)` group is not in the URL.
-- `app/(app)/_layout.tsx` — `<Tabs>` for the signed-in app. Second gate: `if (!signedIn) return <Redirect href="/sign-in" />`. Declares the three tabs via `<Tabs.Screen name="notes|activity|settings" .../>`.
+- `app/(app)/_layout.tsx` — `<Tabs>` for the signed-in app. Second gate: `if (!signedIn) return <Redirect href="/sign-in" />`. Declares **four** tabs via `<Tabs.Screen>`: `notes` (Notes), `conflicts` (title **Review**, with a `tabBarBadge` of the live `conflictCount`), `activity` (Activity), and `settings` (Settings). The tabs are keyed by `ownerKey` so they reset across an account switch.
+- `app/(app)/conflicts.tsx` — the **Review** inbox (`ConflictInbox`). Reads `store$.conflicts` and resolves each retained sync conflict via `keepLocalConflict` / `useServerConflict` from `sync/manager`.
 - `app/(app)/notes/_layout.tsx` — nested `<Stack>` registering `index` and `[id]`.
 - `app/(app)/notes/index.tsx` — list screen. Reactive reads via `useObs(selectVisibleNotes)`, `store$.status`, `store$.syncGated`, `store$.syncIssue`, `store$.outbox.length`. It owns the visible terminal-sync banner and manual recovery action. New note: `createNoteLocal(...)` then `router.push('/notes/'+id)`.
 - `app/(app)/notes/[id].tsx` — editor. `useLocalSearchParams<{id}>()`, `useObs(() => store$.notes[id].get())`, edits call `updateNoteLocal`/`deleteNoteLocal`. History/restore hit `api` directly.
