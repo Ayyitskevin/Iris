@@ -175,4 +175,49 @@ describe('PromotingOwnerReplicaRepository', () => {
     expect(await primary.read('owner-b')).toBe(serialized('owner-b', 'direct'));
     expect(await legacy.read('owner-b')).toBeNull();
   });
+
+  it('retries promotion after a transient commit failure instead of stranding the legacy replica', async () => {
+    const durable = sqliteRepo();
+    let failNextCommit = true;
+    // A durable store whose first commit fails transiently, then recovers.
+    const flaky: OwnerReplicaRepository = {
+      read: (ownerKey) => durable.read(ownerKey),
+      commit: async (ownerKey, bytes) => {
+        if (failNextCommit) {
+          failNextCommit = false;
+          throw new Error('transient store failure');
+        }
+        return durable.commit(ownerKey, bytes);
+      },
+    };
+    const legacy = new MemoryRepo({ 'owner-a': serialized('owner-a', 'legacy') });
+    const promoting = new PromotingOwnerReplicaRepository(flaky, legacy);
+
+    // First read: the promotion commit fails and the error propagates.
+    await expect(promoting.read('owner-a')).rejects.toThrow('transient store failure');
+    // The owner was NOT marked attempted, so the next read retries and promotes for real.
+    expect(await promoting.read('owner-a')).toBe(serialized('owner-a', 'legacy'));
+    expect(await durable.read('owner-a')).toBe(serialized('owner-a', 'legacy'));
+  });
+
+  it('retries promotion after a transient legacy-read failure', async () => {
+    const primary = sqliteRepo();
+    let failNextRead = true;
+    const legacy: OwnerReplicaRepository = {
+      read: async () => {
+        if (failNextRead) {
+          failNextRead = false;
+          throw new Error('legacy read failure');
+        }
+        return serialized('owner-a', 'legacy');
+      },
+      commit: async () => undefined,
+    };
+    const promoting = new PromotingOwnerReplicaRepository(primary, legacy);
+
+    await expect(promoting.read('owner-a')).rejects.toThrow('legacy read failure');
+    // Not stranded: the second read reaches the legacy bytes and promotes them.
+    expect(await promoting.read('owner-a')).toBe(serialized('owner-a', 'legacy'));
+    expect(await primary.read('owner-a')).toBe(serialized('owner-a', 'legacy'));
+  });
 });
