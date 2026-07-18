@@ -20,6 +20,8 @@ import type {
   BillingStatus,
   CreateCheckoutResponse,
   CreateNoteRequest,
+  DeleteAccountRequest,
+  DeleteAccountResponse,
   IssueAgentTokenRequest,
   IssueAgentTokenResponse,
   Note,
@@ -235,6 +237,8 @@ export function createApiClient(options: ApiClientOptions) {
       request<{ activeDevices: number }>('DELETE', `/v1/devices/${id}`),
     billingStatus: () => request<BillingStatus>('GET', '/v1/billing/status'),
     createCheckout: () => request<CreateCheckoutResponse>('POST', '/v1/billing/checkout'),
+    deleteAccount: (b: DeleteAccountRequest) =>
+      request<DeleteAccountResponse>('DELETE', '/v1/account', b),
 
     // --- Export ---
     exportUrl: () => `${base}/v1/export`,

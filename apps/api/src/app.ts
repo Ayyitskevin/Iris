@@ -11,6 +11,7 @@ import { eq } from 'drizzle-orm';
 import { ZodError } from 'zod';
 import {
   CreateNoteRequest,
+  DeleteAccountRequest,
   IssueAgentTokenRequest,
   RegisterDeviceRequest,
   RestoreVersionRequest,
@@ -44,6 +45,7 @@ import * as syncService from './services/sync';
 import * as syncV2Service from './services/sync-v2';
 import * as deviceService from './services/devices';
 import * as billingService from './services/billing';
+import * as accountService from './services/account';
 import { collectExport } from './services/export';
 import { billingGateway } from './services/stripe';
 
@@ -427,6 +429,15 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
     if (event) await billingService.applySubscriptionEvent(app.db, event);
     return reply.send({ received: true });
   });
+
+  // ── Account ────────────────────────────────────────────────────────────
+  // Irreversible, operator-only account deletion (App Store 5.1.1(v) / GDPR erasure).
+  app.delete('/v1/account', guarded, (req) =>
+    tenant(req, async (ctx) => {
+      requireUser(ctx.principal);
+      return accountService.deleteAccount(ctx, DeleteAccountRequest.parse(req.body));
+    }),
+  );
 
   // ── Export ─────────────────────────────────────────────────────────────
   app.get('/v1/export', guarded, async (req, reply) => {

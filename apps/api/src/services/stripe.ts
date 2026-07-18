@@ -33,6 +33,8 @@ export interface BillingGateway {
   createCheckout(params: CheckoutParams): Promise<CheckoutResult>;
   /** Parse a raw webhook body into a normalized event, or null to ignore it. */
   handleWebhook(rawBody: string, signature: string | undefined): Promise<SubscriptionEvent | null>;
+  /** Cancel a subscription so a deleted account is not billed again. */
+  cancelSubscription(subscriptionId: string): Promise<void>;
 }
 
 function mapStatus(stripeStatus: string): SubscriptionStatus {
@@ -91,7 +93,8 @@ class LiveStripeGateway implements BillingGateway {
     const sub = event.data.object as Stripe.Subscription;
     const workspaceId = sub.metadata?.workspaceId;
     if (!workspaceId) return null;
-    const status = event.type === 'customer.subscription.deleted' ? 'canceled' : mapStatus(sub.status);
+    const status =
+      event.type === 'customer.subscription.deleted' ? 'canceled' : mapStatus(sub.status);
     const periodEnd = (sub as unknown as { current_period_end?: number }).current_period_end;
     return {
       workspaceId,
@@ -101,6 +104,10 @@ class LiveStripeGateway implements BillingGateway {
       stripeSubscriptionId: sub.id,
       currentPeriodEnd: periodEnd ? new Date(periodEnd * 1000) : null,
     };
+  }
+
+  async cancelSubscription(subscriptionId: string): Promise<void> {
+    await this.stripe.subscriptions.cancel(subscriptionId);
   }
 }
 
@@ -130,6 +137,10 @@ class FakeStripeGateway implements BillingGateway {
       stripeSubscriptionId: body.stripeSubscriptionId,
       currentPeriodEnd: body.currentPeriodEnd ? new Date(body.currentPeriodEnd) : null,
     };
+  }
+
+  async cancelSubscription(): Promise<void> {
+    // No external provider to call; local subscription state is erased with the workspace.
   }
 }
 
