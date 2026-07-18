@@ -8,7 +8,7 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
 import archiver from 'archiver';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { ZodError } from 'zod';
 import {
   AUTH_RATE_LIMIT_MAX,
@@ -193,8 +193,21 @@ export async function buildApp(
 
   const guarded = { preHandler: authGuard };
 
-  // ── Health ───────────────────────────────────────────────────────────────
+  // ── Health / readiness ─────────────────────────────────────────────────────
+  // Liveness: cheap, no dependencies — is the process up? (never touch the DB here.)
   app.get('/health', async () => ({ ok: true, db: app.dbKind }));
+
+  // Readiness: is the pod able to serve real traffic? Ping the DB so an orchestrator drains
+  // a pod whose database is unreachable (a 200 /health would otherwise keep routing to it).
+  app.get('/ready', async (_req, reply) => {
+    try {
+      await app.db.execute(sql`select 1`);
+      return { ready: true, db: app.dbKind };
+    } catch (err) {
+      app.log.error(err);
+      return reply.status(503).send({ ready: false });
+    }
+  });
 
   // ── Auth ────────────────────────────────────────────────────────────────
   // Tightly throttled: each attempt runs an expensive scrypt hash, so an unthrottled
