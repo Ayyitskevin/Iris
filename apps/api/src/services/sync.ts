@@ -5,7 +5,7 @@
  * transaction as its result, so a lost response can be replayed without double-apply.
  */
 import { createHash } from 'node:crypto';
-import { and, asc, eq, gt, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, lt, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import {
   PostgresUuid,
@@ -26,6 +26,14 @@ import { normalizeTags } from './notes';
 
 const CURRENT_RECEIPT_VERSION = 1;
 const PULL_ENVELOPE_OVERHEAD_BYTES = 512;
+
+// How long an operation receipt is retained before garbage collection (audit #15). Receipts
+// exist to make a lost-response retry replay its exact outcome; real clients retry within
+// seconds to minutes, so 30 days is far past any legitimate retry window. Past it, a "replay"
+// is not a retry — the note version has long since moved on, so re-applying yields a normal
+// version conflict (or an idempotent no-op for deletes), never a double-apply. Bounding the
+// row age keeps sync_idempotency from growing without limit for the life of a workspace.
+export const SYNC_RECEIPT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 // Receipt V1 is intentionally frozen instead of importing mutable current wire schemas.
 const StoredNoteV1 = z.object({
@@ -414,6 +422,25 @@ async function applyDelete(ctx: Ctx, m: SyncMutation): Promise<ApplyResult> {
   return { kind: 'applied', item: { opId: m.opId, note: serializeNote(note) } };
 }
 
+/**
+ * Delete this workspace's operation receipts older than the retention window. Scoped to the
+ * current workspace, so it runs inside the push transaction that already holds the workspace
+ * sync lock — no cross-workspace scan and no separate GC scheduler. Returns the count deleted.
+ */
+export async function gcExpiredReceipts(
+  ctx: Ctx,
+  retentionMs: number = SYNC_RECEIPT_RETENTION_MS,
+): Promise<number> {
+  const cutoff = new Date(Date.now() - retentionMs);
+  const deleted = await ctx.db
+    .delete(syncIdempotency)
+    .where(
+      and(eq(syncIdempotency.workspaceId, ctx.workspaceId), lt(syncIdempotency.createdAt, cutoff)),
+    )
+    .returning({ opId: syncIdempotency.opId });
+  return deleted.length;
+}
+
 export async function syncPush(
   ctx: Ctx,
   deviceId: string,
@@ -444,6 +471,11 @@ export async function syncPush(
     if (result.kind === 'applied') applied.push(result.item);
     else conflicts.push(result.item);
   }
+
+  // Best moment to prune: we already hold this workspace's sync lock, so the delete is
+  // naturally serialized against every other push for the same tenant. Only runs on a
+  // non-empty batch, so it costs at most one extra statement per push that did work.
+  if (mutations.length > 0) await gcExpiredReceipts(ctx);
 
   return { applied, conflicts };
 }

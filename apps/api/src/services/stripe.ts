@@ -57,11 +57,16 @@ function mapStatus(stripeStatus: string): SubscriptionStatus {
 const planForStatus = (status: SubscriptionStatus): Plan =>
   status === 'active' || status === 'trialing' ? 'sync' : 'free';
 
-class LiveStripeGateway implements BillingGateway {
+export class LiveStripeGateway implements BillingGateway {
   readonly mode = 'live' as const;
   private stripe: Stripe;
 
-  constructor(secretKey: string) {
+  constructor(
+    secretKey: string,
+    // Defaults to the configured secret so production wiring is unchanged; tests can
+    // inject one because the vitest env never sets STRIPE_WEBHOOK_SECRET.
+    private readonly webhookSecret: string | undefined = env.stripe.webhookSecret,
+  ) {
     this.stripe = new Stripe(secretKey);
   }
 
@@ -87,15 +92,20 @@ class LiveStripeGateway implements BillingGateway {
     rawBody: string,
     signature: string | undefined,
   ): Promise<SubscriptionEvent | null> {
-    if (!env.stripe.webhookSecret || !signature) return null;
-    const event = this.stripe.webhooks.constructEvent(rawBody, signature, env.stripe.webhookSecret);
+    if (!this.webhookSecret || !signature) return null;
+    const event = this.stripe.webhooks.constructEvent(rawBody, signature, this.webhookSecret);
     if (!event.type.startsWith('customer.subscription.')) return null;
     const sub = event.data.object as Stripe.Subscription;
     const workspaceId = sub.metadata?.workspaceId;
     if (!workspaceId) return null;
     const status =
       event.type === 'customer.subscription.deleted' ? 'canceled' : mapStatus(sub.status);
-    const periodEnd = (sub as unknown as { current_period_end?: number }).current_period_end;
+    // Stripe 22.x (basil) moved current_period_end onto the subscription items; fall back to
+    // the legacy top-level field for older event shapes. Reading only the top level dropped
+    // every paying customer's renewal date to null (audit #9).
+    const periodEnd =
+      (sub.items?.data?.[0] as { current_period_end?: number } | undefined)?.current_period_end ??
+      (sub as unknown as { current_period_end?: number }).current_period_end;
     return {
       workspaceId,
       status,
