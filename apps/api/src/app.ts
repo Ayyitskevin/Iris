@@ -4,6 +4,11 @@
  * run it for real. Auth = user session JWT or agent token; both resolve to a Principal
  * bound to exactly one workspace.
  */
+import { randomUUID } from 'node:crypto';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
@@ -53,7 +58,7 @@ import * as syncV2Service from './services/sync-v2';
 import * as deviceService from './services/devices';
 import * as billingService from './services/billing';
 import * as accountService from './services/account';
-import { collectExport } from './services/export';
+import { exportFiles } from './services/export';
 import { billingGateway } from './services/stripe';
 
 declare module 'fastify' {
@@ -506,20 +511,48 @@ export async function buildApp(
   );
 
   // ── Export ─────────────────────────────────────────────────────────────
+  // Spool the zip to a temp file inside a short read transaction, then stream that file to
+  // the client. Notes are read in keyset-paged batches, so peak memory stays at ~one page
+  // (the per-page `await` lets the zip writer drain to disk) rather than the whole workspace.
+  // Streaming straight to the client would instead force a choice between buffering it all in
+  // memory or holding the DB transaction open for the client's entire (slow) download — the
+  // temp file avoids both (audit #6).
   app.get(
     '/v1/export',
     { ...guarded, config: routeRateLimit(EXPORT_RATE_LIMIT_MAX) },
     async (req, reply) => {
-      const files = await tenant(req, async (ctx) => {
-        requireScope(ctx, 'notes:read');
-        return collectExport(ctx);
-      });
+      const tmpPath = join(tmpdir(), `iris-export-${randomUUID()}.zip`);
       const archive = archiver('zip', { zlib: { level: 9 } });
+      const out = createWriteStream(tmpPath);
+      const spooled = new Promise<void>((resolve, reject) => {
+        out.on('close', resolve);
+        out.on('error', reject);
+        archive.on('error', reject);
+      });
+      archive.pipe(out);
+      try {
+        await tenant(req, async (ctx) => {
+          requireScope(ctx, 'notes:read');
+          for await (const file of exportFiles(ctx)) {
+            archive.append(file.content, { name: file.name });
+          }
+        });
+        await archive.finalize();
+        await spooled;
+      } catch (err) {
+        archive.destroy();
+        await unlink(tmpPath).catch(() => undefined);
+        throw err;
+      }
       reply.header('content-type', 'application/zip');
       reply.header('content-disposition', 'attachment; filename="iris-export.zip"');
-      for (const f of files) archive.append(f.content, { name: f.name });
-      void archive.finalize();
-      return reply.send(archive);
+      const body = createReadStream(tmpPath);
+      // The temp file has served its purpose once the response is drained (or the client
+      // hangs up) — remove it either way so exports never accumulate on disk.
+      const cleanup = (): void => void unlink(tmpPath).catch(() => undefined);
+      body.on('close', cleanup);
+      body.on('error', cleanup);
+      return reply.send(body);
     },
   );
 
