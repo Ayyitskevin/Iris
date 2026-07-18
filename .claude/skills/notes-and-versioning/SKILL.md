@@ -13,7 +13,7 @@ description: Open when touching note CRUD, version history, baseVersion/CAS conf
 
 ## Mental model
 
-`notes` holds the **single mutable head** of each note (`version` counter, `deletedAt` for soft delete). `note_versions` is an **append-only, immutable snapshot table**: one row per `(workspaceId, noteId, version)`, capturing the recorded title/body/tags state _after_ each mutation. Every existing-note update path uses CAS — load current, guard, `UPDATE ... WHERE version = current.version` while setting `version = current.version + 1`, then call `recordVersionAndActivity`. That helper is the **single choke point** (`services/note-write.ts`) that makes every change attributable (writes a `note_versions` snapshot + an `activity_log` row). Concurrency is **optimistic**: a pre-check rejects an already-stale base, and the UPDATE compare-and-swap closes the race after that read. Nothing is hard-deleted: delete is a soft flag, restore and undo write **new head versions** rather than rewriting history. Exact organizational-field reversibility remains incomplete because snapshots omit folder and activity undo does not restore tags; ROADMAP tracks that as a separate correctness slice.
+`notes` holds the **single mutable head** of each note (`version` counter, `deletedAt` for soft delete). `note_versions` is an **append-only, immutable snapshot table**: one row per `(workspaceId, noteId, version)`, capturing the recorded title/body/tags state _after_ each mutation. Every existing-note update path uses CAS — load current, guard, `UPDATE ... WHERE version = current.version` while setting `version = current.version + 1`, then call `recordVersionAndActivity`. That helper is the **single choke point** (`services/note-write.ts`) that makes every change attributable (writes a `note_versions` snapshot + an `activity_log` row). Concurrency is **optimistic**: a pre-check rejects an already-stale base, and the UPDATE compare-and-swap closes the race after that read. Nothing is hard-deleted: delete is a soft flag, restore and undo write **new head versions** rather than rewriting history. Snapshots capture the full reversible state — title, body, tags, the exact folder (`folder` + `folder_snapshot_known`, migration 0004), and lifecycle (tri-state `is_deleted`, migration 0005) — so restore and undo reconstruct it faithfully, **re-creating a tombstone when the chosen snapshot was itself deleted** rather than always reviving. Only pre-0004/0005 legacy rows carry unknown folder/lifecycle, which fail closed unless the caller explicitly opts to keep today's value (see below).
 
 ## Key files
 
@@ -101,13 +101,22 @@ Validate `req.body` with a Zod schema from `@iris/shared` rather than raw casts 
   constraint violation.
 - **REST `baseVersion` conflicts are HTTP 409 / `version_conflict`** and carry the
   server note in `error.conflict`. Sync-push returns version mismatches per operation
-  in an HTTP 200 response. Restore and undo accept no caller `baseVersion`, but still
-  use the loaded version as a CAS token and conflict if another writer wins.
-- **Restore & undo are append-only and revive, but not yet field-complete.**
-  `restoreVersion` restores title/body/tags and sets `deletedAt: null`, but keeps the
-  current folder because versions do not snapshot it. Activity undo restores
-  title/body/deleted state but not folder/tags. Undoing the first create re-soft-deletes
-  the note. Keep the ROADMAP correctness slice open until those fields and tests land.
+  in an HTTP 200 response. Restore (`POST /v2/notes/:id/restore`) **requires** a
+  `baseVersion` and returns `428 restore_precondition_required` if it is omitted; undo
+  accepts no caller `baseVersion` and uses the loaded head as its CAS token. Both conflict
+  if another writer wins.
+- **Restore & undo are append-only and restore the captured lifecycle — they do NOT always revive.**
+  `restoreVersion` copies the snapshot's title/body/tags and its **exact known folder**, and
+  restores the captured live/deleted state: restoring a snapshot that was itself a tombstone
+  **re-creates a tombstone** (`deletedAt = now`, a fresh timestamp), not a revival. A legacy
+  snapshot whose folder or lifecycle was never captured (`folder_snapshot_known = false` or
+  `is_deleted = null`) fails closed with `incomplete_version_snapshot` unless the caller passes
+  `preserveCurrentFolderIfUnknown` / `preserveCurrentDeletionStateIfUnknown`; the
+  `RestoreVersionResponse` returns `folderRestored` / `deletionStateRestored` booleans so the
+  client knows whether the exact field was restored or today's value kept. The mutation is
+  `POST /v2/notes/:id/restore` (the `/v1` route is inert — `428 restore_protocol_upgrade_required`).
+  Activity undo has the parallel behavior (stricter — no preserve opt-out); see the
+  activity-and-undo skill.
 - **Soft delete only.** `deleteNote` sets `deletedAt` (+version bump + `note.delete` activity); rows are never hard-deleted. `listNotes`/`getNote`/`updateNote`/`deleteNote` treat `deletedAt` as not-found (double-delete → 404). Any new read must add `isNull(notes.deletedAt)` (see `listNotes`) or it will surface tombstones.
 - **Partial-update null semantics differ per field.** `updateNote` uses `input.title ?? current.title` and `input.bodyMd ?? current.bodyMd` (null/undefined both keep the old value — you cannot null these), but `input.folder === undefined ? current.folder : input.folder` (explicit `null` _does_ clear folder). Match the intended semantics when copying.
 - **Attribution comes from `ctx.principal`**, not request args — `authorType/authorId/authorName` (and `activity_log.actor*`) are stamped from the acting user or agent token. Don't let callers spoof it.

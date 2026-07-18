@@ -28,9 +28,10 @@ FTS, so both are fully tested in-repo.
   `ts_rank`/`@@` over `search_vector`) and `listTags` (in-process count aggregation).
 - `apps/api/src/services/notes.ts` — `normalizeTags` (trim/lowercase/de-dupe) at the
   service boundary; `listNotes(ctx, tag?)` uses the jsonb `?` operator to filter.
-- `apps/api/src/services/note-write.ts` — the version snapshot copies `note.tags`, so
-  direct version restore can carry tags forward. Activity undo does not yet restore
-  tags, and snapshots do not yet carry folders; ROADMAP tracks that correctness slice.
+- `apps/api/src/services/note-write.ts` — the version snapshot copies `note.tags` (alongside
+  the folder + lifecycle), so **both** direct version restore and activity undo carry tags
+  forward. Tags are never gated by a `known` flag (the column is `NOT NULL DEFAULT []`), so tag
+  restore never fails closed — unlike folder/lifecycle, which can be legacy-unknown.
 - `packages/shared/src/schemas.ts` — `tags` on `Note`/`NoteVersion`/`Create`/`Update`/
   `SyncMutation`; `TagSummary`/`TagListResponse`/`SearchHit`/`SearchResponse`.
 - `apps/api/src/app.ts` — routes `GET /v1/notes/search`, `GET /v1/tags`, and `?tag=` on
@@ -64,10 +65,12 @@ GIN-indexed). Aggregate counts either in-process (`listTags`) or via
   Drizzle can't map).
 - **Normalize tags once, at the service boundary.** `normalizeTags` lowercases/de-dupes, so
   the DB only ever holds canonical tags — filters and counts assume that.
-- **Tags are versioned, but reversibility is not yet complete.** Direct restore reads
-  `note_versions.tags`; activity undo currently restores only title/body/deleted state,
-  and `note_versions` has no folder snapshot. Keep the ROADMAP correctness slice open
-  until both restore paths cover folders and tags with tests.
+- **Tags are versioned and fully reversible.** Both direct restore (`POST /v2/notes/:id/restore`)
+  and activity undo (`POST /v2/activity/:id/undo`) read `note_versions.tags` and restore them;
+  `note_versions` also snapshots folder (`folder_snapshot_known`) and lifecycle (`is_deleted`).
+  Tags never fail closed (always present); folder/lifecycle can be legacy-unknown and gate on
+  `incomplete_version_snapshot` (restore) / `incomplete_history` (undo). See the
+  notes-and-versioning and activity-and-undo skills.
 - **Route order:** if you add more `/v1/notes/...` static routes, they must stay ahead of
   `/:id` (Fastify handles static-before-param, but keep them grouped to avoid confusion).
 - **Scale caveats (documented, not bugs):** `listTags` aggregates in memory and search is
