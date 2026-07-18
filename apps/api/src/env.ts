@@ -15,6 +15,17 @@ if (!jwtSecret && process.env.NODE_ENV === 'production') {
   throw new Error('JWT_SECRET must be set in production');
 }
 
+// The fake billing gateway accepts UNSIGNED webhook events, so it must never run in
+// production: without a real Stripe secret, anyone could POST /v1/billing/webhook to mark any
+// workspace premium for free. Require live billing keys in production (mirrors JWT_SECRET),
+// so a misconfigured deploy fails fast instead of silently disabling the billing gate.
+const stripeSecretKey = optional('STRIPE_SECRET_KEY');
+const stripeWebhookSecret = optional('STRIPE_WEBHOOK_SECRET');
+if (process.env.NODE_ENV === 'production') {
+  if (!stripeSecretKey) throw new Error('STRIPE_SECRET_KEY must be set in production');
+  if (!stripeWebhookSecret) throw new Error('STRIPE_WEBHOOK_SECRET must be set in production');
+}
+
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? 'development',
   isProduction: process.env.NODE_ENV === 'production',
@@ -30,8 +41,8 @@ export const env = {
   jwtSecret: jwtSecret ?? `dev-${randomBytes(24).toString('hex')}`,
 
   stripe: {
-    secretKey: optional('STRIPE_SECRET_KEY'),
-    webhookSecret: optional('STRIPE_WEBHOOK_SECRET'),
+    secretKey: stripeSecretKey,
+    webhookSecret: stripeWebhookSecret,
     priceId: optional('STRIPE_PRICE_ID') ?? 'price_dev_sync',
     successUrl: optional('STRIPE_SUCCESS_URL') ?? 'iris://billing/success',
     cancelUrl: optional('STRIPE_CANCEL_URL') ?? 'iris://billing/cancel',
