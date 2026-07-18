@@ -256,6 +256,17 @@ export const AuthResponse = z.object({
 });
 export type AuthResponse = z.infer<typeof AuthResponse>;
 
+/** Irreversible account deletion. `confirmEmail` must echo the caller's own email. */
+export const DeleteAccountRequest = z.object({
+  confirmEmail: z.string(),
+});
+export type DeleteAccountRequest = z.infer<typeof DeleteAccountRequest>;
+
+export const DeleteAccountResponse = z.object({
+  deleted: z.literal(true),
+});
+export type DeleteAccountResponse = z.infer<typeof DeleteAccountResponse>;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Notes
 // ─────────────────────────────────────────────────────────────────────────────
