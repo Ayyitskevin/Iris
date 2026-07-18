@@ -58,6 +58,20 @@ export const SYNC_PUSH_LIMIT = 6;
 export const SYNC_PULL_PAGE_LIMIT = 50;
 export const SYNC_PULL_PAGE_MAX_BYTES = 1 * 1024 * 1024;
 
+/**
+ * Per-IP rate-limit bounds. The auth ceiling is deliberately tight: each sign-in attempt
+ * runs an expensive scrypt derivation, so throttling it blocks both credential brute-force
+ * and a CPU-exhaustion DoS on the shared process. Search and export are the two most
+ * expensive authenticated reads.
+ */
+export const RATE_LIMIT_WINDOW = '1 minute';
+export const GLOBAL_RATE_LIMIT_MAX = 300;
+export const AUTH_RATE_LIMIT_MAX = 10;
+export const SEARCH_RATE_LIMIT_MAX = 30;
+export const EXPORT_RATE_LIMIT_MAX = 10;
+/** Longest accepted full-text query; longer input is rejected before touching the DB. */
+export const SEARCH_QUERY_MAX_LENGTH = 256;
+
 /** UTF-8 byte length without relying on a platform-specific TextEncoder polyfill. */
 export function utf8ByteLength(value: string): number {
   let bytes = 0;

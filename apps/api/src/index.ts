@@ -22,9 +22,11 @@ async function main(): Promise<void> {
     bundle = createDb(client);
   }
 
-  const app = buildApp(bundle);
+  const app = await buildApp(bundle);
   await app.listen({ port: env.port, host: '0.0.0.0' });
-  app.log.info(`Iris API listening on :${env.port} (db: ${bundle.kind}, auth: ${env.authProvider})`);
+  app.log.info(
+    `Iris API listening on :${env.port} (db: ${bundle.kind}, auth: ${env.authProvider})`,
+  );
 }
 
 main().catch((err) => {

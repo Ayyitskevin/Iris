@@ -12,11 +12,11 @@ export interface TestApp {
 }
 
 /** A fresh, isolated in-memory Postgres (PGlite) + a ready Fastify app per test file. */
-export async function makeApp(): Promise<TestApp> {
+export async function makeApp(opts: { rateLimit?: boolean } = {}): Promise<TestApp> {
   const client = new PGlite();
   await applyMigrationsPglite(client);
   const bundle = createDb(client);
-  const app = buildApp(bundle);
+  const app = await buildApp(bundle, opts);
   await app.ready();
   return {
     app,
