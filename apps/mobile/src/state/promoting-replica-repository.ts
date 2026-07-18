@@ -30,20 +30,30 @@ export class PromotingOwnerReplicaRepository implements OwnerReplicaRepository {
     const current = await this.primary.read(ownerKey);
     if (current !== null || this.attempted.has(ownerKey)) return current;
 
-    // The transactional store has nothing for this owner yet. Adopt legacy bytes once.
-    this.attempted.add(ownerKey);
+    // The transactional store has nothing for this owner yet: try to adopt the legacy bytes.
+    // The attempt is recorded ONLY once its outcome is definitive — promoted, nothing to
+    // promote, or a concurrent writer won. A transient failure (the store was briefly
+    // unavailable, the read threw) must NOT be recorded: otherwise the next read would return
+    // the empty primary, and a subsequent fresh edit would permanently supersede the
+    // un-promoted legacy replica — silently losing the user's existing notes.
     const legacyBytes = await this.legacy.read(ownerKey);
-    if (legacyBytes === null) return null;
+    if (legacyBytes === null) {
+      this.attempted.add(ownerKey);
+      return null;
+    }
 
     try {
       await this.primary.commit(ownerKey, legacyBytes);
+      this.attempted.add(ownerKey);
       return legacyBytes;
     } catch (error) {
       if (error instanceof ReplicaRepositoryStaleWriterError) {
         // Another process/tab promoted the same owner first. Its commit is authoritative;
         // re-read clears this repository's fence and returns the winning bytes.
+        this.attempted.add(ownerKey);
         return this.primary.read(ownerKey);
       }
+      // Transient failure: leave the owner un-attempted so the next read retries the promotion.
       throw error;
     }
   }
