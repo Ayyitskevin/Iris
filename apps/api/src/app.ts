@@ -6,15 +6,22 @@
  */
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
+import rateLimit from '@fastify/rate-limit';
 import archiver from 'archiver';
 import { eq } from 'drizzle-orm';
 import { ZodError } from 'zod';
 import {
+  AUTH_RATE_LIMIT_MAX,
   CreateNoteRequest,
   DeleteAccountRequest,
+  EXPORT_RATE_LIMIT_MAX,
+  GLOBAL_RATE_LIMIT_MAX,
   IssueAgentTokenRequest,
+  RATE_LIMIT_WINDOW,
   RegisterDeviceRequest,
   RestoreVersionRequest,
+  SEARCH_QUERY_MAX_LENGTH,
+  SEARCH_RATE_LIMIT_MAX,
   SignInRequest,
   SignUpRequest,
   RESTORE_PROTOCOL_VERSION,
@@ -36,7 +43,7 @@ import { runTenant } from './tenant';
 import { requireScope } from './context';
 import { users, workspaces } from './db/schema';
 import { serializeUser, serializeVersion, serializeWorkspace } from './serialize';
-import { forbidden, HttpError, unauthorized } from './lib/errors';
+import { badRequest, forbidden, HttpError, unauthorized } from './lib/errors';
 import * as notesService from './services/notes';
 import * as searchService from './services/search';
 import * as activityService from './services/activity';
@@ -60,10 +67,25 @@ declare module 'fastify' {
   }
 }
 
-export function buildApp(bundle: DbBundle): FastifyInstance {
+export interface BuildAppOptions {
+  /**
+   * Enable per-IP rate limiting. Defaults on outside NODE_ENV==='test': `app.inject` sends
+   * every request from 127.0.0.1, so a shared bucket would flake unrelated test files; the
+   * dedicated rate-limit test opts in explicitly.
+   */
+  rateLimit?: boolean;
+}
+
+export async function buildApp(
+  bundle: DbBundle,
+  options: BuildAppOptions = {},
+): Promise<FastifyInstance> {
   const app = Fastify({
     logger: { level: process.env.NODE_ENV === 'test' ? 'silent' : 'info' },
     bodyLimit: SYNC_HTTP_BODY_LIMIT_BYTES,
+    // Behind a reverse proxy request.ip is the proxy unless X-Forwarded-For is trusted;
+    // without this a production deploy would rate-limit all users as one client.
+    trustProxy: process.env.TRUST_PROXY === 'true',
   });
 
   app.decorate('db', bundle.db);
@@ -85,7 +107,24 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
     }
   });
 
-  app.register(cors, { origin: true });
+  // Awaited so their hooks (esp. rate-limit's onRoute + global onRequest) are installed
+  // before the routes below are registered — otherwise per-route config is never applied.
+  await app.register(cors, { origin: true });
+
+  const rateLimitEnabled = options.rateLimit ?? process.env.NODE_ENV !== 'test';
+  if (rateLimitEnabled) {
+    // The plugin's 429 error flows through setErrorHandler below, which maps it into the
+    // app's uniform `{ error: { code: 'rate_limited', message } }` envelope.
+    await app.register(rateLimit, {
+      global: true,
+      max: GLOBAL_RATE_LIMIT_MAX,
+      timeWindow: RATE_LIMIT_WINDOW,
+    });
+  }
+  /** Per-route override; inert metadata when the plugin is not registered (tests). */
+  const routeRateLimit = (max: number) => ({
+    rateLimit: { max, timeWindow: RATE_LIMIT_WINDOW },
+  });
 
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof HttpError) {
@@ -112,11 +151,13 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
     ) {
       const status = requestError.statusCode;
       const code =
-        status === 413
-          ? 'payload_too_large'
-          : requestError.code === 'invalid_json'
-            ? 'invalid_json'
-            : 'invalid_request';
+        status === 429
+          ? 'rate_limited'
+          : status === 413
+            ? 'payload_too_large'
+            : requestError.code === 'invalid_json'
+              ? 'invalid_json'
+              : 'invalid_request';
       const message =
         status === 413 ? 'Request body exceeds the Iris transport limit' : requestError.message;
       return reply.status(status).send({ error: { code, message } });
@@ -156,14 +197,20 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
   app.get('/health', async () => ({ ok: true, db: app.dbKind }));
 
   // ── Auth ────────────────────────────────────────────────────────────────
-  app.post('/v1/auth/sign-up', async (req, reply) => {
-    const input = SignUpRequest.parse(req.body);
-    const authed = await getAuthProvider().signUp(app.db, input);
-    const token = await signSession({ sub: authed.userId, wid: authed.workspaceId });
-    return reply.status(201).send(await buildAuthResponse(authed, token));
-  });
+  // Tightly throttled: each attempt runs an expensive scrypt hash, so an unthrottled
+  // endpoint is both a brute-force and a CPU-DoS vector (audit #5).
+  app.post(
+    '/v1/auth/sign-up',
+    { config: routeRateLimit(AUTH_RATE_LIMIT_MAX) },
+    async (req, reply) => {
+      const input = SignUpRequest.parse(req.body);
+      const authed = await getAuthProvider().signUp(app.db, input);
+      const token = await signSession({ sub: authed.userId, wid: authed.workspaceId });
+      return reply.status(201).send(await buildAuthResponse(authed, token));
+    },
+  );
 
-  app.post('/v1/auth/sign-in', async (req) => {
+  app.post('/v1/auth/sign-in', { config: routeRateLimit(AUTH_RATE_LIMIT_MAX) }, async (req) => {
     const input = SignInRequest.parse(req.body);
     const authed = await getAuthProvider().signIn(app.db, input);
     const token = await signSession({ sub: authed.userId, wid: authed.workspaceId });
@@ -187,12 +234,18 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
   );
 
   // Full-text search. Static path — Fastify routes it ahead of /v1/notes/:id.
-  app.get('/v1/notes/search', guarded, (req) =>
-    tenant(req, async (ctx) => {
-      requireScope(ctx, 'notes:read');
-      const q = (req.query as { q?: string }).q ?? '';
-      return { query: q, results: await searchService.searchNotes(ctx, q) };
-    }),
+  app.get(
+    '/v1/notes/search',
+    { ...guarded, config: routeRateLimit(SEARCH_RATE_LIMIT_MAX) },
+    (req) =>
+      tenant(req, async (ctx) => {
+        requireScope(ctx, 'notes:read');
+        const q = (req.query as { q?: string }).q ?? '';
+        if (q.length > SEARCH_QUERY_MAX_LENGTH) {
+          throw badRequest('Search query is too long', 'search_query_too_long');
+        }
+        return { query: q, results: await searchService.searchNotes(ctx, q) };
+      }),
   );
 
   app.get('/v1/tags', guarded, (req) =>
@@ -440,18 +493,22 @@ export function buildApp(bundle: DbBundle): FastifyInstance {
   );
 
   // ── Export ─────────────────────────────────────────────────────────────
-  app.get('/v1/export', guarded, async (req, reply) => {
-    const files = await tenant(req, async (ctx) => {
-      requireScope(ctx, 'notes:read');
-      return collectExport(ctx);
-    });
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    reply.header('content-type', 'application/zip');
-    reply.header('content-disposition', 'attachment; filename="iris-export.zip"');
-    for (const f of files) archive.append(f.content, { name: f.name });
-    void archive.finalize();
-    return reply.send(archive);
-  });
+  app.get(
+    '/v1/export',
+    { ...guarded, config: routeRateLimit(EXPORT_RATE_LIMIT_MAX) },
+    async (req, reply) => {
+      const files = await tenant(req, async (ctx) => {
+        requireScope(ctx, 'notes:read');
+        return collectExport(ctx);
+      });
+      const archive = archiver('zip', { zlib: { level: 9 } });
+      reply.header('content-type', 'application/zip');
+      reply.header('content-disposition', 'attachment; filename="iris-export.zip"');
+      for (const f of files) archive.append(f.content, { name: f.name });
+      void archive.finalize();
+      return reply.send(archive);
+    },
+  );
 
   return app;
 }
