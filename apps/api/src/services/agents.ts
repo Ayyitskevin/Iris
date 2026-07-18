@@ -10,7 +10,7 @@ import type { Database } from '../db/client';
 import type { Ctx } from '../context';
 import { notFound } from '../lib/errors';
 import { hashSecret, verifySecret } from '../lib/hash';
-import { newId, newSecret } from '../lib/ids';
+import { isUuid, newId, newSecret } from '../lib/ids';
 import { serializeAgentToken } from '../serialize';
 
 const TOKEN_PREFIX = 'iris_at_';
@@ -94,6 +94,10 @@ export async function verifyAgentToken(
   if (sep <= 0) return null;
   const tokenId = rest.slice(0, sep);
   const secret = rest.slice(sep + 1);
+  // The id indexes a uuid column; a non-uuid would make Postgres throw an invalid-input
+  // cast error (surfacing as a 500) on the unauthenticated auth path. A malformed id can
+  // never match a real token, so treat it as an unknown token (→ 401), not a crash.
+  if (!isUuid(tokenId)) return null;
 
   const rows = await db
     .select()

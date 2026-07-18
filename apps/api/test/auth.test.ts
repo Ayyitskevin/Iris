@@ -50,6 +50,15 @@ describe('auth + workspace provisioning', () => {
     expect(status).toBe(401);
   });
 
+  it('rejects a malformed agent token with 401, not a 500', async () => {
+    // The token id indexes a uuid column; a non-uuid id previously threw an uncaught
+    // Postgres cast error (HTTP 500) on this unauthenticated path.
+    const { status } = await call(t.app, 'GET', '/v1/notes', {
+      token: 'iris_at_notauuid_whatever',
+    });
+    expect(status).toBe(401);
+  });
+
   it('returns the session identity from /me', async () => {
     const u = await signUp(t.app);
     const { status, json } = await call(t.app, 'GET', '/v1/auth/me', { token: u.token });
