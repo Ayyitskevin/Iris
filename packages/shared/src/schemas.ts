@@ -72,6 +72,16 @@ export const EXPORT_RATE_LIMIT_MAX = 10;
 /** Longest accepted full-text query; longer input is rejected before touching the DB. */
 export const SEARCH_QUERY_MAX_LENGTH = 256;
 
+/**
+ * List-endpoint bounds (audit #13). GET /v1/notes is keyset-paginated: a caller who gives no
+ * limit gets one default page, and no caller can ask for more than the ceiling in a single
+ * request. GET /v1/tags aggregates in the database and returns at most this many distinct
+ * tags, so neither endpoint can be made to return (or buffer) an unbounded result set.
+ */
+export const NOTES_PAGE_DEFAULT_LIMIT = 100;
+export const NOTES_PAGE_MAX_LIMIT = 200;
+export const TAG_LIST_MAX = 500;
+
 /** UTF-8 byte length without relying on a platform-specific TextEncoder polyfill. */
 export function utf8ByteLength(value: string): number {
   let bytes = 0;
@@ -308,8 +318,20 @@ export const UpdateNoteRequest = z.object({
 });
 export type UpdateNoteRequest = z.infer<typeof UpdateNoteRequest>;
 
+/** Query params for GET /v1/notes: optional tag filter plus keyset pagination. */
+export const ListNotesQuery = z.object({
+  tag: z.string().optional(),
+  // Query values arrive as strings; coerce. Bounds are clamped server-side, but a
+  // non-positive or non-numeric limit is a client error, so reject it here.
+  limit: z.coerce.number().int().positive().optional(),
+  cursor: z.string().optional(),
+});
+export type ListNotesQuery = z.infer<typeof ListNotesQuery>;
+
 export const NoteListResponse = z.object({
   notes: z.array(Note),
+  /** Opaque cursor to fetch the next page; absent when this is the last page. */
+  nextCursor: z.string().optional(),
 });
 export type NoteListResponse = z.infer<typeof NoteListResponse>;
 

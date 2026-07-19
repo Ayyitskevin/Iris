@@ -157,11 +157,14 @@ export function createApiClient(options: ApiClientOptions) {
     me: () => request<AuthResponse>('GET', '/v1/auth/me'),
 
     // --- Notes ---
-    listNotes: (tag?: string) =>
-      request<NoteListResponse>(
-        'GET',
-        tag ? `/v1/notes?tag=${encodeURIComponent(tag)}` : '/v1/notes',
-      ),
+    listNotes: (opts: { tag?: string; limit?: number; cursor?: string } = {}) => {
+      const params = new URLSearchParams();
+      if (opts.tag) params.set('tag', opts.tag);
+      if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+      if (opts.cursor) params.set('cursor', opts.cursor);
+      const qs = params.toString();
+      return request<NoteListResponse>('GET', qs ? `/v1/notes?${qs}` : '/v1/notes');
+    },
     searchNotes: (q: string) =>
       request<SearchResponse>('GET', `/v1/notes/search?q=${encodeURIComponent(q)}`),
     listTags: () => request<TagListResponse>('GET', '/v1/tags'),
