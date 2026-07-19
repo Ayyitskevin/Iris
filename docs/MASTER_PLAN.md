@@ -20,8 +20,8 @@ Read order for a new session: [`VISION.md`](VISION.md) → [`DECISIONS.md`](DECI
   CI) and mobile **281 tests pass** after the CAS semantic-correctness slice. Typecheck, lint,
   changed-file formatting, and web export pass. The current CI workflow gates frozen install,
   typecheck, lint, both test suites with Postgres 16, and web export.
-- Last upstream CI run `29671668765` passed all jobs at `4cd32ad`.
-  The 31 additional mobile regressions in the current worktree require a new CI run. Root
+- Recovery implementation commit `1aa95a2` passed exact-head CI run `29694190949`, including
+  all 31 additional mobile regressions plus the PostgreSQL-backed API gates. Root
   `format:check` and `build` remain known repository/CI gaps; do not describe them as green.
 
 **Solid and shipped (server):** multi-tenant auth + workspaces with `workspace_id` on every
