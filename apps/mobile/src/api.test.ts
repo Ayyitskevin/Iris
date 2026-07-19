@@ -75,6 +75,24 @@ describe('fixed-token authenticated API boundary', () => {
     expect(store$.session.get()).toEqual(sessionB);
   });
 
+  it('surfaces a late A 401 without expiring the active B credential', async () => {
+    const response = deferred<Response>();
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(() => response.promise);
+    const request = authenticatedRequest((api) => api.billingStatus());
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    await adoptSession(sessionB);
+    response.resolve(
+      new Response(
+        JSON.stringify({ error: { code: 'unauthorized', message: 'Expired A token' } }),
+        { status: 401 },
+      ),
+    );
+
+    await expect(request).rejects.toMatchObject({ status: 401, code: 'unauthorized' });
+    expect(store$.session.get()).toEqual(sessionB);
+  });
+
   it('rejects a stale lease before dispatching another request', async () => {
     const leaseA = openSessionLease()!;
     const clientA = apiForLease(leaseA);

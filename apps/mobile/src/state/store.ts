@@ -9,6 +9,7 @@ import { observable } from '@legendapp/state';
 import type { Note, SyncMutation } from '@iris/shared';
 import type { SyncConflictDraft } from '../sync/reconcile';
 import { replicaStorageKey } from './replica-repository';
+import { ReplicaRecoveryJournal, type ReplicaRecoveryReason } from './replica-recovery-journal';
 import { ownerReplicaRepository } from './select-owner-replica-repository';
 import { ReplicaRepositoryStaleWriterError } from './transactional-replica-repository';
 import { storage } from './storage';
@@ -21,7 +22,8 @@ export interface Session {
   displayName: string;
 }
 
-export type SyncStatus = 'idle' | 'syncing' | 'offline' | 'error' | 'auth-required';
+export type SyncStatus =
+  'idle' | 'syncing' | 'offline' | 'error' | 'auth-required' | 'recovery-required';
 
 export type SyncIssueRecoveryKind = 'rekey' | 'reset-cursor' | 'restage' | 'retry';
 
@@ -136,6 +138,21 @@ let sessionSaveQueue: Promise<void> = Promise.resolve();
 let sessionTransitionQueue: Promise<void> = Promise.resolve();
 let hydrationPromise: Promise<void> | null = null;
 let pendingRejectedTombstone: string | null = null;
+// A transactional repository read clears its stale-writer fence before the application can
+// validate and publish the returned replica. Keep a second, owner-scoped fence for that whole
+// recovery interval, and retain it when the bytes are absent or unreadable, so neither a
+// re-entrant observer nor another edit can overwrite state this client cannot understand.
+const authoritativeRecoveryFencedOwners = new Set<string>();
+const authoritativeRecoveryPromises = new Map<string, Promise<PersistedReplica>>();
+const replicaRecoveryJournal = new ReplicaRecoveryJournal(ownerReplicaRepository);
+const pendingReplicaRecoveries = new Map<string, Map<string, ReplicaRecoveryReason>>();
+interface AuthoritativeRecoveryBarrier {
+  participants: number;
+  failed: boolean;
+  authoritativeValidated: boolean;
+  authoritative: PersistedReplica | null;
+}
+const authoritativeRecoveryBarriers = new Map<string, AuthoritativeRecoveryBarrier>();
 
 export class StaleSessionError extends Error {
   constructor() {
@@ -148,6 +165,14 @@ export class StatePersistenceError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = 'StatePersistenceError';
+  }
+}
+
+/** The requested reducer did not commit because another writer advanced the owner root. */
+export class ReplicaCommitSupersededError extends StatePersistenceError {
+  constructor(ownerKey: string) {
+    super(`Owner replica commit for ${ownerKey} was superseded by an authoritative writer`);
+    this.name = 'ReplicaCommitSupersededError';
   }
 }
 
@@ -347,32 +372,61 @@ function snapshotActiveReplica(): PersistedReplica | null {
   return replica;
 }
 
+function setOwnerPersistenceFailureStatus(ownerKey: string): void {
+  if (store$.activeOwnerKey.get() !== ownerKey) return;
+  store$.status.set(
+    authoritativeRecoveryFencedOwners.has(ownerKey) ? 'recovery-required' : 'error',
+  );
+}
+
+function assertAuthoritativeReplicaWritable(ownerKey: string): void {
+  if (!authoritativeRecoveryFencedOwners.has(ownerKey)) return;
+  throw new StatePersistenceError(
+    'Could not persist the owner replica while authoritative recovery is fenced',
+  );
+}
+
 async function enqueueReplicaSave(replica: PersistedReplica): Promise<void> {
   assertReplicaIntegrity(replica);
   const snapshot = cloneReplica(replica);
+  assertAuthoritativeReplicaWritable(snapshot.ownerKey);
   const raw = JSON.stringify(snapshot);
   try {
     await ownerReplicaRepository.commit(snapshot.ownerKey, raw);
   } catch (cause) {
-    // A stale-writer fence is not a persistence failure: another tab/process advanced the
-    // durable replica (ADR-017). It must reach the caller intact so the projection is
-    // rehydrated from the authoritative bytes rather than rolled back to the losing root.
+    // Preserve the storage-level signal: the caller must validate and rehydrate the winner,
+    // then report that this exact reducer was superseded rather than wrapping the conflict as
+    // a generic backend failure.
     if (cause instanceof ReplicaRepositoryStaleWriterError) throw cause;
     throw new StatePersistenceError('Could not persist the owner replica', { cause });
   }
 }
 
 /**
- * Resolve a stale-writer fence for the active owner (ADR-017).
+ * Read and validate the winner after a stale compare-and-swap (ADR-017).
  *
- * The fenced commit has already failed; an explicit authoritative read clears the fence and
- * returns the winning bytes. While that owner is still the active projection, it is fully
- * rehydrated from those bytes — the losing optimistic delta is intentionally discarded, not
- * rolled back, because it was computed from a superseded revision. Selecting a fencing
- * repository (plan A3 step 3) pairs this with cross-tab leadership so an active edit is not
- * the losing writer; until then production uses a non-fencing repository and this is dormant.
+ * Recovery is single-flight per owner. The application fence spans the queued repository read,
+ * validation, and synchronous publication, and is retained on null, corrupt, foreign, or
+ * future-version bytes. A valid winner may replace the active projection, but it never makes the
+ * losing reducer successful: callers must still report supersession.
  */
-async function adoptAuthoritativeReplica(ownerKey: string): Promise<void> {
+function rehydrateAuthoritativeReplica(session: Session): Promise<PersistedReplica> {
+  const ownerKey = ownerKeyFor(session);
+  const recoveryInFlight = authoritativeRecoveryPromises.get(ownerKey);
+  if (recoveryInFlight) return recoveryInFlight;
+
+  fenceOwnerForAuthoritativeRecovery(ownerKey);
+  const recovery = performAuthoritativeReplicaRehydration(session, ownerKey);
+  // Keep the single-flight visible until every recovery participant has preserved its exact
+  // candidate. Session departure must wait for that whole interval, not merely the owner read.
+  authoritativeRecoveryPromises.set(ownerKey, recovery);
+  return recovery;
+}
+
+async function performAuthoritativeReplicaRehydration(
+  session: Session,
+  ownerKey: string,
+): Promise<PersistedReplica> {
   let authoritative: string | null;
   try {
     authoritative = await ownerReplicaRepository.read(ownerKey);
@@ -382,22 +436,76 @@ async function adoptAuthoritativeReplica(ownerKey: string): Promise<void> {
       { cause },
     );
   }
-  const session = store$.session.get();
-  // Only rehydrate while the fenced owner is still active; an account switch that happened
-  // during the read must not be clobbered by the old owner's bytes.
-  if (!session || store$.activeOwnerKey.get() !== ownerKey || ownerKeyFor(session) !== ownerKey) {
-    return;
+  if (authoritative === null) {
+    throw new StatePersistenceError(
+      'The authoritative owner replica disappeared after a stale-writer fence',
+    );
   }
-  if (authoritative === null) return;
+
   let replica: PersistedReplica;
   try {
     replica = parseReplica(authoritative, session);
-  } catch {
-    // Corrupt or foreign authoritative bytes: leave the projection in place. The fence is
-    // already cleared, so a later genuine save can still surface a real failure.
-    return;
+  } catch (cause) {
+    throw new StatePersistenceError(
+      'The authoritative owner replica is unreadable after a stale-writer fence',
+      { cause },
+    );
   }
-  publishReplicaProjection(replica);
+
+  // Publication is deliberately deferred until the recovery barrier verifies that every
+  // distinct losing candidate reached the append-only journal.
+  return replica;
+}
+
+async function departureResultAfterAuthoritativeRecovery(
+  fallback: PersistedReplica,
+  recovery: Promise<PersistedReplica>,
+): Promise<{ replica: PersistedReplica; superseded: boolean }> {
+  try {
+    const replica = await recovery;
+    await flushPendingReplicaRecoveries(fallback.ownerKey);
+    return { replica, superseded: true };
+  } catch (recoveryError) {
+    if (authoritativeRecoveryFencedOwners.has(fallback.ownerKey)) {
+      await preserveReplicaRecovery(fallback, 'session-departure');
+      return { replica: fallback, superseded: false };
+    }
+    throw recoveryError;
+  }
+}
+
+/**
+ * Persist an owner's final projection before leaving its session.
+ *
+ * A valid concurrent winner still aborts the transition so the user can see and retry from that
+ * winner. If the winner is absent or unreadable, however, the application fence deliberately
+ * prevents another write. Departure is allowed only after the exact token-free fallback is
+ * verified in the append-only recovery journal, so neither the unreadable authority nor the last
+ * readable local projection is overwritten or trapped behind an unwanted credential.
+ */
+async function persistReplicaBeforeSessionDeparture(
+  session: Session,
+  replica: PersistedReplica,
+): Promise<{ replica: PersistedReplica; superseded: boolean }> {
+  const recoveryInFlight = authoritativeRecoveryPromises.get(replica.ownerKey);
+  if (recoveryInFlight) {
+    return departureResultAfterAuthoritativeRecovery(replica, recoveryInFlight);
+  }
+  if (authoritativeRecoveryFencedOwners.has(replica.ownerKey)) {
+    await preserveReplicaRecovery(replica, 'session-departure');
+    return { replica, superseded: false };
+  }
+
+  try {
+    await enqueueReplicaSave(replica);
+    return { replica, superseded: false };
+  } catch (error) {
+    if (!(error instanceof ReplicaRepositoryStaleWriterError)) throw error;
+    return departureResultAfterAuthoritativeRecovery(
+      replica,
+      recoverFromStaleWriter(session, replica, 'session-departure'),
+    );
+  }
 }
 
 function enqueueSessionWrite(task: () => Promise<void>): Promise<void> {
@@ -491,6 +599,7 @@ function invalidateLeases(): number {
 
 function activate(session: Session, replica: PersistedReplica): void {
   assertReplicaIntegrity(replica);
+  const recoveryRequired = authoritativeRecoveryFencedOwners.has(replica.ownerKey);
   store$.set({
     session,
     activeOwnerKey: replica.ownerKey,
@@ -503,24 +612,90 @@ function activate(session: Session, replica: PersistedReplica): void {
       ? { ...replica.syncIssue, affectedOpIds: [...replica.syncIssue.affectedOpIds] }
       : null,
     conflicts: { ...replica.conflicts },
-    status: 'idle',
+    status: recoveryRequired ? 'recovery-required' : 'idle',
     syncGated: false,
   });
 }
 
-async function loadReplica(session: Session): Promise<PersistedReplica> {
+async function compatibleRecoveryReplica(session: Session): Promise<PersistedReplica | null> {
   const ownerKey = ownerKeyFor(session);
-  const raw = await ownerReplicaRepository.read(ownerKey);
-  if (raw) return parseReplica(raw, session);
+  let recovery;
+  try {
+    recovery = await replicaRecoveryJournal.read(ownerKey);
+  } catch (cause) {
+    throw new StatePersistenceError('Could not read the owner recovery journal', { cause });
+  }
+  if (!recovery) return null;
+
+  for (let index = recovery.snapshots.length - 1; index >= 0; index -= 1) {
+    try {
+      const replica = parseReplica(recovery.snapshots[index]!.serializedReplica, session);
+      fenceOwnerForAuthoritativeRecovery(ownerKey);
+      return replica;
+    } catch {
+      // Older compatible candidates remain eligible; every exact candidate stays in the journal.
+    }
+  }
+  throw new StatePersistenceError('Owner recovery is required, but no compatible snapshot exists');
+}
+
+async function loadReplica(session: Session, allowCreate: boolean): Promise<PersistedReplica> {
+  const ownerKey = ownerKeyFor(session);
+  const hadPendingRecovery = Boolean(pendingReplicaRecoveries.get(ownerKey)?.size);
+  if (hadPendingRecovery) {
+    fenceOwnerForAuthoritativeRecovery(ownerKey);
+    await flushPendingReplicaRecoveries(ownerKey);
+  }
+
+  let raw: string | null;
+  try {
+    raw = await ownerReplicaRepository.read(ownerKey);
+  } catch (primaryCause) {
+    // Transactional adapters validate the record envelope before returning its serialized root.
+    // A corrupt or misrouted primary therefore rejects at the repository boundary; recovery must
+    // still inspect the separately keyed journal instead of stopping before the fallback.
+    try {
+      const recovered = await compatibleRecoveryReplica(session);
+      if (recovered) return recovered;
+    } catch (recoveryCause) {
+      throw new StatePersistenceError(
+        'Could not read the owner replica or a compatible recovery snapshot',
+        { cause: recoveryCause },
+      );
+    }
+    throw new StatePersistenceError('Could not read the owner replica', { cause: primaryCause });
+  }
+  if (raw) {
+    try {
+      if (hadPendingRecovery) {
+        const recovered = await compatibleRecoveryReplica(session);
+        if (recovered) return recovered;
+      }
+      const replica = parseReplica(raw, session);
+      authoritativeRecoveryFencedOwners.delete(ownerKey);
+      return replica;
+    } catch (cause) {
+      const recovered = await compatibleRecoveryReplica(session);
+      if (recovered) return recovered;
+      throw cause;
+    }
+  }
+
+  const recovered = await compatibleRecoveryReplica(session);
+  if (recovered) return recovered;
+  if (!allowCreate) {
+    throw new StatePersistenceError(
+      'Persisted session has no owner replica; refusing to create an empty replacement',
+    );
+  }
+
+  authoritativeRecoveryFencedOwners.delete(ownerKey);
   const replica = emptyReplica(session);
   try {
     await enqueueReplicaSave(replica);
   } catch (error) {
-    // Another writer created this owner's replica between our read and our write. Adopt the
-    // winner rather than the fresh empty one; the read that surfaces it also cleared the fence.
     if (error instanceof ReplicaRepositoryStaleWriterError) {
-      const authoritative = await ownerReplicaRepository.read(ownerKey);
-      if (authoritative) return parseReplica(authoritative, session);
+      return recoverFromStaleWriter(session, replica, 'stale-writer');
     }
     throw error;
   }
@@ -669,9 +844,11 @@ async function hydrateState(): Promise<void> {
       storage.get(SESSION_KEY),
     ]);
     let sessionRaw = storedSessionRaw;
+    let migratedLegacy = false;
     const migrationComplete = isMigrationComplete(markerRaw);
     if (legacyRaw && !migrationComplete) {
       sessionRaw = await migrateLegacy(legacyRaw, storedSessionRaw);
+      migratedLegacy = true;
     } else if (legacyRaw && migrationComplete) {
       void storage.remove(LEGACY_STATE_KEY).catch(() => undefined);
     }
@@ -684,7 +861,10 @@ async function hydrateState(): Promise<void> {
       return;
     }
     if (!isSession(session)) throw new ReplicaIntegrityError('Persisted session is invalid');
-    const replica = await loadReplica(session);
+    // A verified v1 migration may intentionally retain an already-active v2 session whose
+    // owner root did not exist yet. That explicit conversion may materialize an empty root;
+    // ordinary hydration stays fail-closed so missing authority cannot erase recovery.
+    const replica = await loadReplica(session, migratedLegacy);
     activate(session, replica);
   } catch {
     store$.set(blankState('error'));
@@ -712,29 +892,29 @@ export function loadState(): Promise<void> {
 /** Persist the current owner projection without ever writing the credential into it. */
 export async function saveState(): Promise<boolean> {
   let replica: PersistedReplica | null;
+  const session = store$.session.get();
   try {
     replica = snapshotActiveReplica();
   } catch {
     store$.status.set('error');
     return false;
   }
-  if (!replica) return true;
+  if (!replica || !session) return true;
   try {
     await enqueueReplicaSave(replica);
     return true;
   } catch (error) {
     if (error instanceof ReplicaRepositoryStaleWriterError) {
-      // The durable replica was advanced by another writer. Adopt it rather than reporting a
-      // persistence error; local editing continues from the authoritative bytes (ADR-017).
       try {
-        await adoptAuthoritativeReplica(replica.ownerKey);
-        return true;
+        await recoverFromStaleWriter(session, replica, 'stale-writer');
       } catch {
-        if (store$.activeOwnerKey.get() === replica.ownerKey) store$.status.set('error');
+        setOwnerPersistenceFailureStatus(replica.ownerKey);
         return false;
       }
+      setOwnerPersistenceFailureStatus(replica.ownerKey);
+      return false;
     }
-    if (store$.activeOwnerKey.get() === replica.ownerKey) store$.status.set('error');
+    setOwnerPersistenceFailureStatus(replica.ownerKey);
     return false;
   }
 }
@@ -744,7 +924,15 @@ export function openSessionLease(): SessionLease | null {
   const session = store$.session.get();
   const ownerKey = store$.activeOwnerKey.get();
   const deviceId = store$.deviceId.get();
-  if (!session || !ownerKey || !deviceId || ownerKey !== ownerKeyFor(session)) return null;
+  if (
+    !session ||
+    !ownerKey ||
+    !deviceId ||
+    ownerKey !== ownerKeyFor(session) ||
+    authoritativeRecoveryFencedOwners.has(ownerKey)
+  ) {
+    return null;
+  }
   return Object.freeze({
     ...session,
     generation,
@@ -760,10 +948,23 @@ export function isCurrentSession(lease: SessionLease): boolean {
     !lease.signal.aborted &&
     lease.generation === generation &&
     store$.activeOwnerKey.get() === lease.ownerKey &&
+    !authoritativeRecoveryFencedOwners.has(lease.ownerKey) &&
     store$.deviceId.get() === lease.deviceId &&
     session?.token === lease.token &&
     session.userId === lease.userId &&
     session.workspaceId === lease.workspaceId
+  );
+}
+
+function isActiveSessionCredential(lease: SessionLease): boolean {
+  const session = store$.session.get();
+  return Boolean(
+    session &&
+    store$.activeOwnerKey.get() === lease.ownerKey &&
+    ownerKeyFor(session) === lease.ownerKey &&
+    session.token === lease.token &&
+    session.userId === lease.userId &&
+    session.workspaceId === lease.workspaceId,
   );
 }
 
@@ -856,6 +1057,8 @@ function applyReplicaChange<Result>(
   lease: SessionLease,
   update: (current: ReplicaState) => ReplicaChange<Result>,
 ): InternalReplicaApplication<Result> {
+  assertCurrentSession(lease);
+  assertAuthoritativeReplicaWritable(lease.ownerKey);
   const current = readReplicaForLease(lease);
   const change = update(current);
   const previous = persistedReplicaForLease(lease, current);
@@ -867,12 +1070,12 @@ function applyReplicaChange<Result>(
   // snapshot must queue after this one rather than be overwritten by it after restart.
   const durable = enqueueReplicaSave(next).then(
     () => assertCurrentSession(lease),
-    (error) => {
-      // A stale-writer fence is resolved by adopting authoritative bytes, not by failing the
-      // save; the optimistic projection is replaced in place (ADR-017). Any other error
-      // propagates so callers roll back the losing change exactly as before.
+    async (error) => {
+      // Rehydrate from the winner, then reject this exact reducer. A resolved durability
+      // promise is reserved for a commit that actually reached the owner root.
       if (error instanceof ReplicaRepositoryStaleWriterError) {
-        return adoptAuthoritativeReplica(lease.ownerKey);
+        await recoverFromStaleWriter(lease, next, 'stale-writer');
+        throw new ReplicaCommitSupersededError(lease.ownerKey);
       }
       throw error;
     },
@@ -931,21 +1134,17 @@ export function setSyncGatedForLease(lease: SessionLease, gated: boolean): void 
 export function adoptSession(next: Session): Promise<void> {
   return enqueueSessionTransition(async () => {
     const priorSession = store$.session.get();
-    const priorReplica = snapshotActiveReplica();
+    let priorReplica = snapshotActiveReplica();
     const priorSessionRaw = priorSession ? JSON.stringify(priorSession) : null;
     beginSessionTransition();
 
     try {
-      if (priorReplica) {
-        try {
-          await enqueueReplicaSave(priorReplica);
-        } catch (error) {
-          // The prior owner's durable replica was advanced elsewhere and is already newer
-          // than our snapshot; we are switching away, so a fence must not abort the change.
-          if (!(error instanceof ReplicaRepositoryStaleWriterError)) throw error;
-        }
+      if (priorReplica && priorSession) {
+        const departure = await persistReplicaBeforeSessionDeparture(priorSession, priorReplica);
+        priorReplica = departure.replica;
+        if (departure.superseded) throw new ReplicaCommitSupersededError(priorReplica.ownerKey);
       }
-      const replica = await loadReplica(next);
+      const replica = await loadReplica(next, true);
       const raw = JSON.stringify(next);
       await persistSessionValue(raw);
       activate(next, replica);
@@ -962,7 +1161,8 @@ export function adoptSession(next: Session): Promise<void> {
       if (rollbackVerified && priorSession && priorReplica) activate(priorSession, priorReplica);
       else store$.set(blankState('error'));
       if (!rollbackVerified) sessionRejected = true;
-      store$.status.set('error');
+      if (priorReplica) setOwnerPersistenceFailureStatus(priorReplica.ownerKey);
+      else store$.status.set('error');
       throw error;
     } finally {
       finishSessionTransition();
@@ -974,18 +1174,14 @@ export function adoptSession(next: Session): Promise<void> {
 export function signOutSession(): Promise<void> {
   return enqueueSessionTransition(async () => {
     const priorSession = store$.session.get();
-    const replica = snapshotActiveReplica();
+    let replica = snapshotActiveReplica();
     const priorSessionRaw = priorSession ? JSON.stringify(priorSession) : null;
     beginSessionTransition();
     try {
-      if (replica) {
-        try {
-          await enqueueReplicaSave(replica);
-        } catch (error) {
-          // A newer durable replica already exists; sign-out retains that authoritative copy,
-          // so a fence must not block the transition.
-          if (!(error instanceof ReplicaRepositoryStaleWriterError)) throw error;
-        }
+      if (replica && priorSession) {
+        const departure = await persistReplicaBeforeSessionDeparture(priorSession, replica);
+        replica = departure.replica;
+        if (departure.superseded) throw new ReplicaCommitSupersededError(replica.ownerKey);
       }
       await persistSessionValue(
         sessionTombstone('sign-out', priorSession ? ownerKeyFor(priorSession) : null),
@@ -1006,7 +1202,8 @@ export function signOutSession(): Promise<void> {
         sessionRejected = true;
         store$.set(blankState('error'));
       }
-      store$.status.set('error');
+      if (replica) setOwnerPersistenceFailureStatus(replica.ownerKey);
+      else store$.status.set('error');
       throw error;
     } finally {
       finishSessionTransition();
@@ -1014,10 +1211,12 @@ export function signOutSession(): Promise<void> {
   });
 }
 
-/** Expire only the exact current lease; a late A 401 can never sign B out. */
+/** Expire only the exact active bearer; a recovery-stale lease may expire A, never B. */
 export function expireSessionIfCurrent(lease: SessionLease): Promise<boolean> {
   return enqueueSessionTransition(async () => {
-    if (!isCurrentSession(lease)) return false;
+    // Recovery deliberately invalidates operation leases, but a 401 for the still-active exact
+    // bearer must remain authoritative. Identity matching keeps a late A response from expiring B.
+    if (!isCurrentSession(lease) && !isActiveSessionCredential(lease)) return false;
     sessionRejected = true;
     beginSessionTransition();
     let replica: PersistedReplica | null = null;
@@ -1026,18 +1225,27 @@ export function expireSessionIfCurrent(lease: SessionLease): Promise<boolean> {
     } catch {
       // Integrity failure must not keep a server-rejected credential active.
     }
+    let recoveryPreservationFailed = false;
+    if (replica) {
+      try {
+        const departure = await persistReplicaBeforeSessionDeparture(lease, replica);
+        replica = departure.replica;
+      } catch {
+        try {
+          await preserveReplicaRecovery(replica, 'session-rejected');
+        } catch {
+          // Credential safety still wins for a server-rejected token. The transition throws
+          // after tombstoning so callers can observe that local recovery was not also verified.
+          recoveryPreservationFailed = true;
+        }
+      }
+    }
+
     const rejectionTombstone = sessionTombstone('rejected', lease.ownerKey);
     store$.set(blankState('auth-required'));
 
     try {
       const credentialCleared = await persistRejectedCredential(rejectionTombstone);
-
-      try {
-        if (replica) await enqueueReplicaSave(replica);
-      } catch {
-        // A rejected credential must still be cleared; the last committed replica remains.
-      }
-
       if (!credentialCleared) {
         pendingRejectedTombstone = rejectionTombstone;
         throw new StatePersistenceError(
@@ -1045,6 +1253,11 @@ export function expireSessionIfCurrent(lease: SessionLease): Promise<boolean> {
         );
       }
       pendingRejectedTombstone = null;
+      if (recoveryPreservationFailed) {
+        throw new StatePersistenceError(
+          'Rejected credential was cleared, but the local recovery snapshot could not be verified',
+        );
+      }
       return true;
     } finally {
       finishSessionTransition();
@@ -1081,4 +1294,133 @@ export function selectTags(): { tag: string; count: number }[] {
   return [...counts.entries()]
     .map(([tag, count]) => ({ tag, count }))
     .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+}
+
+function serializedReplicaForRecovery(replica: PersistedReplica): string {
+  const snapshot = cloneReplica(replica);
+  assertReplicaIntegrity(snapshot);
+  return JSON.stringify(snapshot);
+}
+
+function stageReplicaRecovery(replica: PersistedReplica, reason: ReplicaRecoveryReason): void {
+  const raw = serializedReplicaForRecovery(replica);
+  let pending = pendingReplicaRecoveries.get(replica.ownerKey);
+  if (!pending) {
+    pending = new Map<string, ReplicaRecoveryReason>();
+    pendingReplicaRecoveries.set(replica.ownerKey, pending);
+  }
+  if (!pending.has(raw)) pending.set(raw, reason);
+}
+
+async function flushPendingReplicaRecoveries(ownerKey: string): Promise<void> {
+  try {
+    while (true) {
+      const pending = pendingReplicaRecoveries.get(ownerKey);
+      const candidate = pending?.entries().next();
+      if (!pending || !candidate || candidate.done) {
+        pendingReplicaRecoveries.delete(ownerKey);
+        return;
+      }
+
+      const [raw, reason] = candidate.value;
+      await replicaRecoveryJournal.append(ownerKey, raw, reason);
+      if (pendingReplicaRecoveries.get(ownerKey)?.get(raw) === reason) {
+        pending.delete(raw);
+      }
+    }
+  } catch (cause) {
+    throw new StatePersistenceError('Could not preserve the owner recovery journal', { cause });
+  }
+}
+
+async function preserveReplicaRecovery(
+  replica: PersistedReplica,
+  reason: ReplicaRecoveryReason,
+): Promise<void> {
+  stageReplicaRecovery(replica, reason);
+  await flushPendingReplicaRecoveries(replica.ownerKey);
+}
+
+function fenceOwnerForAuthoritativeRecovery(ownerKey: string): void {
+  if (authoritativeRecoveryFencedOwners.has(ownerKey)) return;
+  authoritativeRecoveryFencedOwners.add(ownerKey);
+  if (store$.activeOwnerKey.get() === ownerKey && !sessionTransitioning) {
+    invalidateLeases();
+  }
+}
+
+function acquireAuthoritativeRecovery(ownerKey: string): AuthoritativeRecoveryBarrier {
+  fenceOwnerForAuthoritativeRecovery(ownerKey);
+  let barrier = authoritativeRecoveryBarriers.get(ownerKey);
+  if (!barrier) {
+    barrier = {
+      participants: 0,
+      failed: false,
+      authoritativeValidated: false,
+      authoritative: null,
+    };
+    authoritativeRecoveryBarriers.set(ownerKey, barrier);
+  }
+  barrier.participants += 1;
+  return barrier;
+}
+
+function releaseAuthoritativeRecovery(
+  ownerKey: string,
+  barrier: AuthoritativeRecoveryBarrier,
+  succeeded: boolean,
+): void {
+  if (!succeeded) barrier.failed = true;
+  barrier.participants -= 1;
+  if (barrier.participants > 0) return;
+
+  if (!barrier.failed && barrier.authoritativeValidated && barrier.authoritative) {
+    const activeSession = store$.session.get();
+    // Publish while the application fence is still held so synchronous observers cannot
+    // re-enter with an old lease between the winner projection and the fence release.
+    if (
+      activeSession &&
+      store$.activeOwnerKey.get() === ownerKey &&
+      ownerKeyFor(activeSession) === ownerKey
+    ) {
+      publishReplicaProjection(barrier.authoritative);
+      store$.status.set('error');
+    }
+    authoritativeRecoveryFencedOwners.delete(ownerKey);
+  } else {
+    setOwnerPersistenceFailureStatus(ownerKey);
+  }
+  if (authoritativeRecoveryBarriers.get(ownerKey) === barrier) {
+    authoritativeRecoveryBarriers.delete(ownerKey);
+  }
+  authoritativeRecoveryPromises.delete(ownerKey);
+}
+
+/**
+ * Preserve the exact losing token-free root and validate the winner under one app fence.
+ *
+ * Several queued optimistic commits may lose the same repository revision. They share the
+ * authoritative read, while the recovery journal serializes every distinct losing snapshot.
+ * The fence clears only after all participants have durably preserved their candidate.
+ */
+async function recoverFromStaleWriter(
+  session: Session,
+  losingReplica: PersistedReplica,
+  reason: ReplicaRecoveryReason,
+): Promise<PersistedReplica> {
+  const ownerKey = losingReplica.ownerKey;
+  stageReplicaRecovery(losingReplica, reason);
+  const barrier = acquireAuthoritativeRecovery(ownerKey);
+  const authoritative = rehydrateAuthoritativeReplica(session);
+
+  try {
+    const [, winner] = await Promise.all([flushPendingReplicaRecoveries(ownerKey), authoritative]);
+    barrier.authoritativeValidated = true;
+    barrier.authoritative = winner;
+    releaseAuthoritativeRecovery(ownerKey, barrier, true);
+    return winner;
+  } catch (error) {
+    releaseAuthoritativeRecovery(ownerKey, barrier, false);
+    throw error;
+  }
 }

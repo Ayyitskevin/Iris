@@ -128,42 +128,70 @@ These were named as out of scope and are staying out until the foundation is pro
   of a conflict. No production storage selection, network dispatch, or `/v2` pull
   changed.
 
-## Near-term follow-ups (next things)
+- **Phase 2.10 — durability cutover staging** (ADR-020 + A3): native SQLite now
+  satisfies the transactional CAS contract; a platform selector can choose IndexedDB or
+  lazy SQLite behind `EXPO_PUBLIC_DURABLE_STORAGE`; and a promoter can copy legacy bytes
+  into the transactional store. The flag defaults off. Promotion is not cutover-safe yet
+  because old tabs/versions can keep writing the untouched legacy key while new clients
+  read only the primary.
+- **Phase 2.11 — stale-CAS semantic correction + local recovery journal**: recovery is
+  single-flight per owner and synchronously fenced before another reducer can run. Every exact
+  losing root (including its outbox) is staged before the authoritative read and appended to a
+  strict credential-free recovery journal. The final barrier publishes a valid winner only after
+  every participant is preserved; a failed append retains the loser for same-process retry but is
+  not crash-durable while the selected repository is failing. Missing, corrupt, foreign, or future
+  authority remains untouched—including corrupt records rejected at the transactional adapter
+  boundary—and the newest compatible candidate reopens read-only as `recovery-required` rather
+  than creating an empty root. Session departure verifies
+  pending candidates; rejected credentials are still tombstoned and surface any recovery failure.
+  Pull pagination stops on a lost commit. Tests cover overlapping losers, append failure, delayed
+  reads, observer re-entry, gated departure, 401, sign-out/login recovery, rejected primary reads,
+  and invalid authority. Force-quit recovery remains an explicit browser/device acceptance gate.
+- **Phase 2.12 — server launch hardening, partial**: user-only device deregistration and
+  account deletion endpoints, runtime non-superuser RLS tests, production Stripe-key
+  guards, and a coarse per-IP rate limiter are shipped. Client device/deletion UX,
+  durable Stripe-cancellation reconciliation, production database/JWT/price validation,
+  proxy/principal abuse budgets, privacy, and local-replica erasure remain open.
 
-1. **Complete Sync v2's platform repository/runtime cutover and release gates**:
-   owner-specific localStorage-to-IndexedDB promotion plus mixed-version and cross-tab
-   session leadership on web; SQLite plus an explicit at-rest protection policy on
-   native; transactional resource+outbox writes; durable `/v2` envelope/set/cursor
-   staging; lease/device-bound dispatch; runtime correlator invocation; atomic all-or-none
-   result application and pending clear; and a user-facing recovery/import path for
-   quarantined legacy `iris:state:v1` data, followed by real-browser and native
-   iOS/Android device or simulator acceptance.
-   The owner-bound repository/root reducer and additive generic resource transport are
-   integrated. The IndexedDB compare-and-swap primitive, push correlator, and strict
-   owner-root staging/application kernel now exist, but none is runtime-selected. The
-   current adapter still stores one size-limited per-owner SecureStore/localStorage value
-   and the production coordinator still dispatches the frozen `/v1` payload. Selecting
-   the transactional root, lease-bound `/v2` dispatch, durable CAS application, and `/v2`
-   pull remain part of the runtime cutover. Missing promotion and web leadership, native
-   storage and protection decisions, recovery import, and browser/native acceptance are
-   explicit blockers before the work queue.
-2. **Agent-delegated work queue**: projects and tasks with status, priority, due date, one
-   accountable human-or-agent assignee, reversible writes, and the same sync resource
-   envelope. Keep activity, check-in, delegation, and durable claim/run semantics
-   distinct.
-3. **Managed auth provider** wired for real (Clerk or Supabase) + password reset + OAuth +
-   email verification — these are the managed provider's job, not `LocalAuthProvider`'s.
-4. **Attachment storage** to object storage (S3/R2) with the same export guarantee;
-   foundation stores attachment metadata and includes files in export, but a production
-   blob store + upload flow is a follow-up.
-5. **Implement rate limiting** for agent tokens (per-scope budgets, a documented window,
-   and 429 semantics). No coarse limiter is currently shipped.
-6. **Stripe hardening**: proration, plan changes, dunning, customer portal, tax.
-7. **EAS Build + store submission** pipeline and OTA update channels.
-8. **Editor upgrades**: live Markdown preview, slash-menu, image paste — still emitting
-   plain Markdown.
-9. **Search/tags upgrades**: tag rename/merge, search snippets & highlighting, filter by
-   tag _and_ query together, per-field ranking weights.
+## Near-term follow-ups (ordered)
+
+1. **Mixed-version divergence journal + cross-tab leadership + compatibility gate.** A
+   digest-only promotion journal detects legacy/primary drift and preserves both roots; one Web
+   Lock leader may write/sync,
+   followers are read-only, and BroadcastChannel carries metadata only. Prove leader transfer,
+   crash recovery, and frozen old-writer divergence with no later request. Client-only code
+   cannot prevent the old write, so production also requires an approved server storage epoch,
+   upgrade-required response, or explicit old-client invalidation.
+2. **Controlled transactional-authority acceptance + recovery resolution UX.** Keep `/v1`
+   networking while extending the shipped read-only warning with local export, choose-winner,
+   import, and discard controls for stale-CAS, diverged, and quarantined roots, then test
+   IndexedDB reload, native SQLite force-quit/reopen, A→B switching, unsupported-platform
+   fallback, and the explicit at-rest policy. Flip the default only after the compatibility
+   contract and these gates pass.
+3. **Sync v2 runtime cutover.** Build the missing pull applier and bind the v3 owner root,
+   exact durable envelope, lease/device dispatch, correlator, restart boundaries, and v1
+   retirement through the production `SyncPort`.
+4. **Launch operations.** Add staging deploy, migrations-on-deploy, `/ready`, secret
+   documentation, production DB/JWT/Stripe-price validation, PII-scrubbed observability, and
+   browser/native/security CI gates.
+5. **Safe account erasure + privacy (human-gated).** Make Stripe cancellation confirmed or
+   durably reconcilable before deleting identifiers; prove old-token 401; add export-first
+   mobile confirmation, privacy policy/link, and legacy/IndexedDB/SQLite replica erasure.
+6. **Store commerce decision (human/legal-gated).** Choose StoreKit/Play Billing, an enrolled
+   regional alternative path, or a consumption-only model before exposing paid sync in native
+   builds; then prove purchase/restore and entitlement mapping for every supported channel.
+7. **Managed auth provider.** Wire Clerk or Supabase, password reset, OAuth, and email
+   verification behind the existing seam.
+8. **Mass-market hardening.** Replace fixed polling with lifecycle-aware debounce/backoff;
+   add principal/sync/agent abuse budgets and proxy proof; then finish Stripe portal,
+   proration/dunning/tax.
+9. **EAS + store submission.** Add build profiles, OTA channels, assets, permission copy, and
+   a preview build after the owner supplies Apple/Google account access and approves item 6.
+10. **Attachments.** Add object storage, upload/signed-URL flows, export inclusion, and native
+    sharing. Current export contains Markdown notes and a manifest only.
+
+The agent-delegated work graph and other product-horizon features wait until the release
+acceptance path is coherent and observable.
 
 ## Tempted-but-parked ideas (write here, don't build)
 

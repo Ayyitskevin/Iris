@@ -15,7 +15,9 @@ export function apiForLease(lease: SessionLease): ApiClient {
   const guardedFetch: typeof fetch = async (input, init) => {
     assertCurrentSession(lease);
     const response = await globalThis.fetch(input, { ...init, signal: lease.signal });
-    assertCurrentSession(lease);
+    // Preserve an exact bearer rejection even if recovery invalidated the operation lease while
+    // the request was in flight. The expiry boundary still compares the active credential.
+    if (response.status !== 401) assertCurrentSession(lease);
     return response;
   };
   return createApiClient({

@@ -144,12 +144,12 @@ service, single Postgres, one-command deploy._
 
 ### Candidates evaluated
 
-| Engine           | Offline-first                          | RN + Web                                        | Extra infra required                                         | Verdict                 |
-| ---------------- | -------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------ | ----------------------- |
-| **Legend-State** | yes (observable + persistence plugins) | yes (MMKV/AsyncStorage on RN, IndexedDB on web) | **none** — sync transport is ours                            | **Chosen**              |
-| WatermelonDB     | yes (SQLite)                           | RN strong; web via LokiJS is weaker             | none (custom sync endpoints)                                 | Runner-up               |
-| PowerSync        | yes                                    | yes                                             | **yes** — hosted/sidecar sync service + Postgres replication | Rejected for foundation |
-| ElectricSQL      | yes                                    | yes                                             | **yes** — Electric sync service in front of Postgres         | Rejected for foundation |
+| Engine           | Offline-first                           | RN + Web                                   | Extra infra required                                         | Verdict                 |
+| ---------------- | --------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ | ----------------------- |
+| **Legend-State** | yes (observable; Iris-owned repository) | yes (Iris-owned SQLite/IndexedDB adapters) | **none** — sync transport is ours                            | **Chosen**              |
+| WatermelonDB     | yes (SQLite)                            | RN strong; web via LokiJS is weaker        | none (custom sync endpoints)                                 | Runner-up               |
+| PowerSync        | yes                                     | yes                                        | **yes** — hosted/sidecar sync service + Postgres replication | Rejected for foundation |
+| ElectricSQL      | yes                                     | yes                                        | **yes** — Electric sync service in front of Postgres         | Rejected for foundation |
 
 ### Decision & rationale
 
@@ -804,6 +804,62 @@ true multi-connection concurrency are **device-acceptance gates** (as the Indexe
 primitive's real-browser behavior is), and the fenced storage cutover — selecting this
 store for native, promoting existing replicas, and porting the coordinator to `/v2` — is
 the runtime work tracked as plan item A3.
+
+---
+
+## ADR-021 — Append-only stale-CAS recovery journal and read-only recovery mode
+
+**Accepted for the v2 owner-replica runtime; transactional authority remains default-off.**
+
+ADR-017 deliberately fences a repository instance after a different-byte revision conflict.
+Clearing that storage fence requires an authoritative read, but the application must not publish
+the winner and discard its optimistic loser before proving that the losing branch is recoverable.
+The v2 store therefore stages every exact losing serialized owner root in an owner-scoped pending
+set before starting the authoritative read. A final per-owner recovery barrier shares that read
+across overlapping losers and publishes a valid winner only after every pending candidate is
+verified in the recovery journal. Any failed append retains the exact candidate and application
+fence for same-process retry; no losing durability promise is reported as successful. That pending
+set is memory-only: if the selected repository is failing and the process dies before a retry, this
+slice cannot claim that candidate is crash-durable.
+
+The journal uses the same owner-repository boundary under a domain-separated synthetic key. Its
+versioned envelope has exact keys, immutable source ownership, monotonically contiguous sequence
+numbers, ISO capture times, a bounded reason vocabulary, and deduplication by exact serialized
+bytes. Embedded snapshots must have the exact current v2 owner-root key set and owner identity;
+credential-like fields at any nesting level fail closed. The bearer session remains only in
+session storage. Journal writes serialize in process, and independent transactional repository
+instances merge after stale CAS rather than replacing another candidate. The legacy
+`SerializedKvReplicaRepository` has no cross-process compare-and-swap, so its concurrent journal
+writers retain last-write-wins limitations; transactional authority remains required for that claim.
+
+Missing, corrupt, foreign, or future-version primary authority is never normalized or overwritten.
+When a transactional adapter rejects corrupt primary metadata before returning serialized bytes,
+the loader still checks the separately keyed recovery journal.
+If a compatible journal snapshot exists, a later session load projects the newest compatible
+candidate with status `recovery-required`; leases, editing, sync, conflict resolution, history
+mutations, billing/token actions, and remote export remain disabled. The app shows a shared
+read-only recovery notice while keeping local inspection and the sign-out action available;
+sign-out retries preservation and refuses the transition when it cannot verify the journal.
+Ordinary persisted-session hydration cannot create an empty replacement; the sole exception is
+the explicit verified v1 migration path. Session departure flushes every pending exact candidate
+before writing a tombstone or changing owners. A server-rejected credential still gets
+tombstoned even if recovery storage fails, but that partial outcome throws so callers can observe
+it. A 401 for the exact still-active bearer remains authoritative when recovery has invalidated
+the operation lease; matching the active token and owner still prevents a late A response from
+expiring B.
+
+Recovery records are append-only in this slice. There is intentionally no automatic deletion,
+winner selection, merge, export, import, or discard, and a valid authoritative winner may remain
+the live projection after its losers are journaled. Recovery data duplicates private note content
+inside the selected local repository, so the native at-rest policy and eventual local-account
+erasure must cover both primary and synthetic keys.
+
+This is **not** the mixed-version promotion divergence protocol: it cannot stop an already-loaded
+old client from writing the legacy key, elect a browser leader, gate old server clients, or prove
+real browser/native lifecycle behavior. `EXPO_PUBLIC_DURABLE_STORAGE` therefore stays off by
+default. The legacy/primary divergence journal, Web Lock leadership, enforceable compatibility
+contract, recovery resolution/export controls, storage-erasure path, and acceptance evidence
+remain explicit A3 release gates.
 
 ---
 

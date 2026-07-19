@@ -7,16 +7,17 @@
  * existing replica, the first read of an owner whose transactional record is absent
  * adopts the legacy key/value bytes into the transactional store.
  *
- * This is a self-contained, unwired primitive — like the stores themselves. Selecting it
- * as the production `ownerReplicaRepository` also requires making `store.ts` fence-aware
- * (a `ReplicaRepositoryStaleWriterError` must trigger a re-read + rehydrate, not a plain
- * rollback) — that is step 2. The platform store selection + the actual flip are step 3.
+ * This is a staging primitive, not a complete cutover protocol. Fence-aware store semantics
+ * are required but insufficient: this class does not mark the legacy record as promoted, so an
+ * old tab/binary can keep writing bytes the new runtime no longer reads. Production selection
+ * therefore also requires divergence detection, one web leader, recovery UX, and an enforceable
+ * old-client compatibility contract tracked in A3 step 3b.
  */
 import { type OwnerReplicaRepository } from './replica-repository';
 import { ReplicaRepositoryStaleWriterError } from './transactional-replica-repository';
 
 export class PromotingOwnerReplicaRepository implements OwnerReplicaRepository {
-  // One promotion attempt per owner per process; after it, `primary` is authoritative.
+  // One attempt per owner per process; only this repository instance then treats primary as authority.
   private readonly attempted = new Set<string>();
 
   constructor(
@@ -59,8 +60,8 @@ export class PromotingOwnerReplicaRepository implements OwnerReplicaRepository {
   }
 
   commit(ownerKey: string, serializedReplica: string): Promise<void> {
-    // All writes go straight to the durable store; the legacy copy is never written again
-    // (it remains only as an inert backup until an explicit later cleanup).
+    // This instance writes only the primary. The legacy copy is NOT globally inert: a journal
+    // can detect but cannot stop older runtimes mutating it until they are explicitly fenced.
     return this.primary.commit(ownerKey, serializedReplica);
   }
 }

@@ -1,7 +1,7 @@
 import { FlatList, StyleSheet, Text, View } from 'react-native';
 import { router } from 'expo-router';
 import type { SyncMutation } from '@iris/shared';
-import { Button, Card, Muted, Screen, Title } from '../../src/components/ui';
+import { Button, Card, Muted, RecoveryNotice, Screen, Title } from '../../src/components/ui';
 import { useObs } from '../../src/state/hooks';
 import { store$ } from '../../src/state/store';
 import { keepLocalConflict, useServerConflict } from '../../src/sync/manager';
@@ -16,6 +16,7 @@ function draftPreview(mutation: SyncMutation): string {
 export default function ConflictInbox() {
   const conflictMap = useObs(() => store$.conflicts.get());
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
+  const recoveryRequired = useObs(() => store$.status.get() === 'recovery-required');
   const conflicts = Object.values(conflictMap).sort((a, b) =>
     a.detectedAt < b.detectedAt ? 1 : -1,
   );
@@ -23,6 +24,7 @@ export default function ConflictInbox() {
   return (
     <Screen>
       <Title>Conflict Inbox</Title>
+      {recoveryRequired ? <RecoveryNotice /> : null}
       <Muted>
         {conflicts.length === 0
           ? 'All clear. Iris has no drafts waiting for review.'
@@ -85,18 +87,20 @@ export default function ConflictInbox() {
 
               <Button
                 label={labels.keepLocal}
+                disabled={recoveryRequired}
                 onPress={() => {
-                  if (ownerKey) {
-                    keepLocalConflict(ownerKey, item.noteId, item.localMutation.opId);
+                  if (ownerKey && !recoveryRequired) {
+                    void keepLocalConflict(ownerKey, item.noteId, item.localMutation.opId);
                   }
                 }}
               />
               <Button
                 label={labels.useServer}
                 variant="ghost"
+                disabled={recoveryRequired}
                 onPress={() => {
-                  if (ownerKey) {
-                    useServerConflict(ownerKey, item.noteId, item.localMutation.opId);
+                  if (ownerKey && !recoveryRequired) {
+                    void useServerConflict(ownerKey, item.noteId, item.localMutation.opId);
                   }
                 }}
               />

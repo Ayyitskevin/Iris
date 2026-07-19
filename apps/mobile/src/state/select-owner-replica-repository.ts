@@ -6,11 +6,12 @@
  * (ADR-017), SQLite on native (ADR-020) — through the lazy `PromotingOwnerReplicaRepository`
  * so an existing replica is migrated on first read.
  *
- * The flip is gated behind an explicit opt-in flag (`EXPO_PUBLIC_DURABLE_STORAGE`) that
- * defaults OFF, so production and every test keep using the non-fencing
- * `SerializedKvReplicaRepository` unchanged. `store.ts` is already fence-aware (step 2), so
- * turning the flag on for real-device/browser testing cannot strand the client. Flipping the
- * default on is a later slice, gated on cross-tab web leadership and device acceptance.
+ * The selector is gated behind `EXPO_PUBLIC_DURABLE_STORAGE`, which defaults OFF. Correct
+ * stale-CAS recovery in `store.ts` prevents false commit acknowledgements, but it does not make
+ * legacy promotion cutover-safe: old tabs/binaries can still write the legacy key after a new
+ * runtime adopts the primary. Use this flag only in controlled tests until the mixed-version
+ * divergence journal, web leadership, enforceable old-client compatibility, recovery UX, and
+ * browser/device acceptance gates are complete.
  *
  * Deliberately a leaf module (nothing here imports it back) and free of any static
  * `react-native`/`expo-sqlite` import, so it loads cleanly under Node/vitest.

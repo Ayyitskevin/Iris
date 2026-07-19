@@ -145,6 +145,9 @@ class MemoryPort implements SyncPort {
     this.current = null;
   }
 
+  invalidateCurrentLease(): void {
+    this.controller.abort();
+  }
   captureLease = (): SessionLease | null => this.current;
 
   isCurrent = (lease: SessionLease): boolean =>
@@ -195,7 +198,13 @@ class MemoryPort implements SyncPort {
   };
 
   expireSession = async (lease: SessionLease): Promise<boolean> => {
-    if (!this.isCurrent(lease)) return false;
+    if (
+      !this.current ||
+      this.current.ownerKey !== lease.ownerKey ||
+      this.current.token !== lease.token
+    ) {
+      return false;
+    }
     this.expired.push(lease.token);
     this.statuses.set(lease.ownerKey, 'auth-required');
     this.signOut();
@@ -900,6 +909,42 @@ describe('session-bound sync coordinator', () => {
     expect(replica.outbox).toEqual([pending]);
   });
 
+  it('does not fetch the next pull page when the current page commit is superseded', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    port.replicas.set(lease.ownerKey, { ...emptyReplica('c0'), deviceId: lease.deviceId });
+    const superseded = new Error('authoritative owner root advanced');
+    superseded.name = 'ReplicaCommitSupersededError';
+    port.nextAppliedUpdateError = superseded;
+    port.afterNextApply = () => {
+      port.replicas.set(lease.ownerKey, {
+        ...emptyReplica('c0'),
+        deviceId: lease.deviceId,
+      });
+    };
+    const h = harness(port, {
+      changes: (_lease, cursor) =>
+        Promise.resolve(
+          cursor === 'c0'
+            ? {
+                changes: [note(workspaceA, 'page one')],
+                cursor: 'c1',
+                hasMore: true,
+              }
+            : { changes: [], cursor: 'c2', hasMore: false },
+        ),
+    });
+
+    await h.sync();
+
+    expect(h.calls.filter((call) => call.method === 'changes').map((call) => call.cursor)).toEqual([
+      'c0',
+    ]);
+    expect(port.replicas.get(lease.ownerKey)?.syncCursor).toBe('c0');
+    expect(port.replicas.get(lease.ownerKey)?.notes).toEqual({});
+    expect(port.statuses.get(lease.ownerKey)).toBe('error');
+  });
+
   it('cannot apply an A pagination response after B becomes active', async () => {
     const port = new MemoryPort();
     const leaseA = port.adopt('A');
@@ -977,6 +1022,29 @@ describe('session-bound sync coordinator', () => {
       }
     },
   );
+
+  it('expires the same active credential when recovery invalidates its operation lease', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const op = mutation('op-a', 'A');
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes: { [noteId]: note(workspaceA, 'A') },
+      outbox: [op],
+    });
+    const push = deferred<SyncPushResponse>();
+    const h = harness(port, { push: () => push.promise });
+    const running = h.sync();
+    await vi.waitFor(() => expect(h.calls.some((call) => call.method === 'push')).toBe(true));
+
+    port.invalidateCurrentLease();
+    push.reject(new ApiRequestError(401, 'unauthorized', 'Expired active token'));
+    await running;
+
+    expect(port.current).toBeNull();
+    expect(port.expired).toEqual(['token-A']);
+  });
 
   it('ignores a late A 401 instead of signing B out', async () => {
     const port = new MemoryPort();

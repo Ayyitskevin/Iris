@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Linking, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router, useFocusEffect } from 'expo-router';
 import { ApiRequestError, type AgentToken, type BillingStatus } from '@iris/shared';
-import { Button, Card, Field, Muted, Screen, Title } from '../../src/components/ui';
+import { Button, Card, Field, Muted, RecoveryNotice, Screen, Title } from '../../src/components/ui';
 import { authenticatedRequest } from '../../src/api';
 import { signOut } from '../../src/auth/session';
 import { assertCurrentSession, store$ } from '../../src/state/store';
@@ -12,6 +12,7 @@ import { theme } from '../../src/theme';
 export default function Settings() {
   const email = useObs(() => store$.session.get()?.email ?? '');
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
+  const recoveryRequired = useObs(() => store$.status.get() === 'recovery-required');
   const [billing, setBilling] = useState<BillingStatus | null>(null);
   const [tokens, setTokens] = useState<AgentToken[]>([]);
   const [newAgentName, setNewAgentName] = useState('');
@@ -29,6 +30,11 @@ export default function Settings() {
   }, [ownerKey]);
 
   const load = useCallback(async () => {
+    if (recoveryRequired) {
+      setBilling(null);
+      setTokens([]);
+      return;
+    }
     try {
       const { lease, value } = await authenticatedRequest((api) =>
         Promise.all([api.billingStatus(), api.listAgentTokens()]),
@@ -40,7 +46,7 @@ export default function Settings() {
     } catch {
       // offline
     }
-  }, [ownerKey]);
+  }, [ownerKey, recoveryRequired]);
 
   useFocusEffect(
     useCallback(() => {
@@ -49,6 +55,7 @@ export default function Settings() {
   );
 
   async function subscribe() {
+    if (recoveryRequired) return;
     try {
       const { lease, value } = await authenticatedRequest((api) => api.createCheckout());
       assertCurrentSession(lease);
@@ -60,6 +67,7 @@ export default function Settings() {
   }
 
   async function issueToken() {
+    if (recoveryRequired) return;
     try {
       const { lease, value } = await authenticatedRequest((api) =>
         api.issueAgentToken({
@@ -77,6 +85,7 @@ export default function Settings() {
   }
 
   async function revoke(id: string) {
+    if (recoveryRequired) return;
     try {
       const { lease } = await authenticatedRequest((api) => api.revokeAgentToken(id));
       assertCurrentSession(lease);
@@ -87,6 +96,7 @@ export default function Settings() {
   }
 
   async function exportData() {
+    if (recoveryRequired) return;
     try {
       const { lease, value: res } = await authenticatedRequest((api, currentLease) =>
         fetch(api.exportUrl(), {
@@ -127,10 +137,13 @@ export default function Settings() {
       <ScrollView contentContainerStyle={{ paddingBottom: theme.space(10) }}>
         <Title>Settings</Title>
         <Muted>{email}</Muted>
+        {recoveryRequired ? <RecoveryNotice /> : null}
 
         <Card style={{ marginTop: theme.space(4) }}>
           <Text style={styles.cardTitle}>Sync plan</Text>
-          {billing ? (
+          {recoveryRequired ? (
+            <Muted>Billing and device sync are unavailable while local recovery is active.</Muted>
+          ) : billing ? (
             <>
               <Text style={styles.line}>
                 Plan: <Text style={styles.strong}>{billing.plan}</Text> ({billing.status})
@@ -144,7 +157,11 @@ export default function Settings() {
                     Local use is free. Sync across more than one device with Iris Sync (~$5/mo).
                   </Muted>
                   <View style={{ height: theme.space(2) }} />
-                  <Button label="Subscribe to Iris Sync" onPress={subscribe} />
+                  <Button
+                    label="Subscribe to Iris Sync"
+                    onPress={subscribe}
+                    disabled={recoveryRequired}
+                  />
                 </>
               ) : (
                 <Muted>You&apos;re on Iris Sync. Sync everywhere.</Muted>
@@ -163,8 +180,14 @@ export default function Settings() {
             placeholder="Agent name (e.g. Researcher)"
             value={newAgentName}
             onChangeText={setNewAgentName}
+            editable={!recoveryRequired}
           />
-          <Button label="Issue agent token" variant="ghost" onPress={issueToken} />
+          <Button
+            label="Issue agent token"
+            variant="ghost"
+            onPress={issueToken}
+            disabled={recoveryRequired}
+          />
           {issuedToken ? (
             <View style={styles.tokenBox}>
               <Text style={styles.tokenWarn}>Copy now — shown once:</Text>
@@ -174,27 +197,43 @@ export default function Settings() {
             </View>
           ) : null}
           <View style={{ height: theme.space(2) }} />
-          {tokens.length === 0 ? <Muted>No agents yet.</Muted> : null}
-          {tokens.map((t) => (
-            <View key={t.id} style={styles.tokenRow}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.line}>{t.agentName}</Text>
-                <Text style={styles.tokenMeta}>
-                  {t.scopes.join(', ')} {t.revokedAt ? '· revoked' : ''}
-                </Text>
-              </View>
-              {!t.revokedAt ? (
-                <Button label="Revoke" variant="danger" onPress={() => revoke(t.id)} />
-              ) : null}
-            </View>
-          ))}
+          {recoveryRequired ? (
+            <Muted>Agent status and controls are paused during local recovery.</Muted>
+          ) : tokens.length === 0 ? (
+            <Muted>No agents yet.</Muted>
+          ) : null}
+          {!recoveryRequired
+            ? tokens.map((t) => (
+                <View key={t.id} style={styles.tokenRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.line}>{t.agentName}</Text>
+                    <Text style={styles.tokenMeta}>
+                      {t.scopes.join(', ')} {t.revokedAt ? '· revoked' : ''}
+                    </Text>
+                  </View>
+                  {!t.revokedAt ? (
+                    <Button
+                      label="Revoke"
+                      variant="danger"
+                      onPress={() => revoke(t.id)}
+                      disabled={recoveryRequired}
+                    />
+                  ) : null}
+                </View>
+              ))
+            : null}
         </Card>
 
         <Card>
           <Text style={styles.cardTitle}>Your data</Text>
           <Muted>Export the whole workspace as plain Markdown. No lock-in.</Muted>
           <View style={{ height: theme.space(2) }} />
-          <Button label="Export as Markdown (.zip)" variant="ghost" onPress={exportData} />
+          <Button
+            label="Export server workspace (.zip)"
+            variant="ghost"
+            onPress={exportData}
+            disabled={recoveryRequired}
+          />
           {Platform.OS !== 'web' ? (
             <Muted>On device, export opens a share sheet in a full build (follow-up).</Muted>
           ) : null}

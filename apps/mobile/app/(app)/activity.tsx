@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { FlatList, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { ApiRequestError, UNDO_PROTOCOL_VERSION, type ActivityEntry } from '@iris/shared';
-import { Button, Muted, Screen, Title } from '../../src/components/ui';
+import { Button, Muted, RecoveryNotice, Screen, Title } from '../../src/components/ui';
 import { authenticatedRequest } from '../../src/api';
 import {
   classifyMutationFailure,
@@ -27,6 +27,7 @@ const ACTION_LABEL: Record<string, string> = {
 
 export default function Activity() {
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
+  const recoveryRequired = useObs(() => store$.status.get() === 'recovery-required');
   const outbox = useObs(() => store$.outbox.get());
   const pendingPush = useObs(() => store$.pendingPush.get());
   const conflictMap = useObs(() => store$.conflicts.get());
@@ -50,7 +51,20 @@ export default function Activity() {
     setUndoingId(null);
   }, [ownerKey]);
 
+  useEffect(() => {
+    if (!recoveryRequired) return;
+    loadRequestRef.current += 1;
+    undoRequestRef.current += 1;
+    setLoading(false);
+    setUndoProtocolVersion(null);
+    setUndoingId(null);
+  }, [recoveryRequired]);
+
   const load = useCallback(async () => {
+    if (recoveryRequired) {
+      setLoading(false);
+      return;
+    }
     const ownerAtStart = ownerKey;
     const pendingRequest = {
       identity: ownerKey ?? '',
@@ -98,7 +112,7 @@ export default function Activity() {
         setLoading(false);
       }
     }
-  }, [ownerKey]);
+  }, [ownerKey, recoveryRequired]);
 
   useFocusEffect(
     useCallback(() => {
@@ -107,7 +121,13 @@ export default function Activity() {
   );
 
   async function undo(entry: ActivityEntry) {
-    if (undoProtocolVersion !== UNDO_PROTOCOL_VERSION || loading || undoingId || !entry.noteId) {
+    if (
+      recoveryRequired ||
+      undoProtocolVersion !== UNDO_PROTOCOL_VERSION ||
+      loading ||
+      undoingId ||
+      !entry.noteId
+    ) {
       return;
     }
     if (
@@ -205,6 +225,7 @@ export default function Activity() {
   return (
     <Screen>
       <Title>Activity</Title>
+      {recoveryRequired ? <RecoveryNotice /> : null}
       <Muted>Everything your agents and you have done. Undo a note's latest safe action.</Muted>
       {loadError ? (
         <Text style={styles.notice} accessibilityRole="alert" accessibilityLiveRegion="polite">
@@ -227,16 +248,23 @@ export default function Activity() {
         data={items}
         keyExtractor={(a) => a.id}
         refreshControl={
-          <RefreshControl refreshing={loading} onRefresh={load} tintColor={theme.colors.accent} />
+          <RefreshControl
+            refreshing={loading}
+            onRefresh={load}
+            tintColor={theme.colors.accent}
+            enabled={!recoveryRequired}
+          />
         }
         ItemSeparatorComponent={() => <View style={{ height: theme.space(2) }} />}
         ListEmptyComponent={
           <Muted>
-            {loading
-              ? 'Loading activity…'
-              : loadError
-                ? 'Activity unavailable.'
-                : 'No activity yet.'}
+            {recoveryRequired
+              ? 'Activity refresh is paused during local recovery.'
+              : loading
+                ? 'Loading activity…'
+                : loadError
+                  ? 'Activity unavailable.'
+                  : 'No activity yet.'}
           </Muted>
         }
         renderItem={({ item }) => {
@@ -270,6 +298,7 @@ export default function Activity() {
                   variant="ghost"
                   loading={undoingId === item.id}
                   disabled={
+                    recoveryRequired ||
                     loading ||
                     pendingForNote ||
                     undoProtocolVersion !== UNDO_PROTOCOL_VERSION ||

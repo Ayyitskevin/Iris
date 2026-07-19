@@ -221,9 +221,14 @@ To add a synced field: add it to `SyncMutation.note` and `Note` in `schemas.ts`,
   performs the explicit registration step and treats its 402 as `syncGated`; local
   edits still work.
 - **Everything runs inside `runTenant`'s single transaction**, workspace-scoped via the RLS GUC. A push batch is atomic per request; `loadNote`/writes already filter by `ctx.workspaceId`. Never reach around `ctx.db`.
-- **Local repository durability is not wired yet.** The production owner JSON value is
-  still SecureStore/localStorage. The revision-fenced transactional primitives now exist
-  for BOTH platforms — `IndexedDbTransactionalReplicaStore` (web, ADR-017) and
-  `ExpoSqliteTransactionalReplicaStore` (native, ADR-020) — but neither is runtime-selected.
-  The remaining blockers are the CUTOVER (selecting them, promoting existing replicas,
-  cross-tab web leadership) and device/browser acceptance, not a missing store.
+- **Transactional repository selection is wired but default-off.** Production authority is
+  still SecureStore/localStorage because `EXPO_PUBLIC_DURABLE_STORAGE` defaults off. When
+  explicitly enabled, `select-owner-replica-repository.ts` chooses revision-fenced IndexedDB
+  (web, ADR-017) or SQLite (native, ADR-020) and lazily copies the legacy owner root. This is for
+  controlled tests only: copy-on-first-read leaves legacy writable to old clients. Stale-CAS
+  losers already use a strict local recovery journal and read-only warning. Append union across
+  processes requires the transactional CAS repository; failed writes remain only for same-process
+  retry. Remaining
+  CUTOVER gates are mixed-version divergence detection, single web leadership/read-only
+  followers, enforceable old-client compatibility, recovery resolution/export controls, and real
+  browser/device acceptance—not a missing store.

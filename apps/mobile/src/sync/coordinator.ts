@@ -219,7 +219,9 @@ export function createSyncCoordinator(deps: SyncCoordinatorDependencies): {
       ensureCurrent(lease);
       return value;
     } catch (error) {
-      ensureCurrent(lease);
+      // A 401 belongs to the exact bearer used for this request. Let the expiry boundary compare
+      // that credential even when recovery invalidated the operation lease in the meantime.
+      if (!(error instanceof ApiRequestError && error.status === 401)) ensureCurrent(lease);
       throw error;
     }
   }
@@ -356,7 +358,6 @@ export function createSyncCoordinator(deps: SyncCoordinatorDependencies): {
       ensureCurrent(lease);
       deps.port.setStatus(lease, 'idle');
     } catch (error) {
-      if (!deps.port.isCurrent(lease) || error instanceof StaleSyncCycleError) return;
       if (error instanceof ApiRequestError && error.status === 401) {
         try {
           await deps.port.expireSession(lease);
@@ -365,6 +366,7 @@ export function createSyncCoordinator(deps: SyncCoordinatorDependencies): {
         }
         return;
       }
+      if (!deps.port.isCurrent(lease) || error instanceof StaleSyncCycleError) return;
       if (error instanceof ApiRequestError && error.isPaymentRequired) {
         deps.port.setSyncGated(lease, true);
         deps.port.setStatus(lease, 'idle');
@@ -392,7 +394,9 @@ export function createSyncCoordinator(deps: SyncCoordinatorDependencies): {
       }
       if (
         error instanceof Error &&
-        ['ReplicaIntegrityError', 'StatePersistenceError'].includes(error.name)
+        ['ReplicaCommitSupersededError', 'ReplicaIntegrityError', 'StatePersistenceError'].includes(
+          error.name,
+        )
       ) {
         deps.port.setStatus(lease, 'error');
         return;

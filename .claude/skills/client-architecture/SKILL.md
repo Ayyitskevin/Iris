@@ -34,8 +34,8 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 - `app/(app)/notes/index.tsx` — list screen. Reactive reads via `useObs(selectVisibleNotes)`, `store$.status`, `store$.syncGated`, `store$.syncIssue`, `store$.outbox.length`. It owns the visible terminal-sync banner and manual recovery action. New note: `createNoteLocal(...)` then `router.push('/notes/'+id)`.
 - `app/(app)/notes/[id].tsx` — editor. `useLocalSearchParams<{id}>()`, `useObs(() => store$.notes[id].get())`, edits call `updateNoteLocal`/`deleteNoteLocal`. History/restore hit `api` directly.
 - `src/state/store.ts` — owner-keyed replicas, separate session/tombstone storage,
-  legacy `iris:state:v1` recovery quarantine, generation leases, verified writes, and
-  selectors.
+  legacy `iris:state:v1` recovery quarantine, generation leases, verified writes, an
+  append-only stale-CAS recovery journal, read-only recovery mode, and selectors.
 - `src/state/hooks.ts` — `useObs<T>(selector)`. The only sanctioned way to read `store$` in a component.
 - `src/state/storage.ts` — `storage: KVStore`. Web `localStorage`; native `expo-secure-store` (~2KB/key cap).
 - `src/sync/manager.ts` — optimistic mutations/conflict choices and deliberate
@@ -106,7 +106,9 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
    deleteNoteLocal(note.id); // tombstone (deletedAt), enqueues delete
    ```
 
-   Each call mutates `store$` synchronously, coalesces into `store$.outbox`, `saveState()`s, and triggers `sync()`. The list re-renders because it reads `store$.notes` via `useObs`.
+   Each call uses `applyReplicaForLease`: it coalesces `store$.outbox`, registers the exact
+   durability promise before synchronously publishing `store$`, reports persistence failure,
+   and triggers `sync()`. The list re-renders because it reads `store$.notes` via `useObs`.
 
 5. **Authenticated component requests** use `authenticatedRequest`. It captures one
    immutable lease and returns it with the value; assert that lease immediately before
@@ -120,7 +122,9 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
    setVersions(value.versions);
    ```
 
-6. Verify: `pnpm --filter @iris/mobile start` (or `dev`), open the app, confirm the tab renders, a new note persists across a reload (proves `saveState`/`loadState`), and the sync status pill flips `syncing…` → `synced`.
+6. Verify: `pnpm --filter @iris/mobile start` (or `dev`), open the app, confirm the tab renders,
+   a new note persists across a reload (proves the owner repository + `loadState`), and the sync
+   status pill flips `syncing…` → `synced`.
 
 ## Invariants & gotchas
 
@@ -163,25 +167,34 @@ null`; route keys include the owner so component state cannot survive an account
   value (a small per-value ceiling). The transactional stores for real capacity exist for both
   platforms — `IndexedDbTransactionalReplicaStore` (web, ADR-017) and
   `ExpoSqliteTransactionalReplicaStore` (native, ADR-020, `node:sqlite`-tested) — plus a
-  `PromotingOwnerReplicaRepository` that lazily migrates an existing key/value replica into a
-  transactional store on first read. `store.ts` is **fence-aware**: a
-  `ReplicaRepositoryStaleWriterError` from any save triggers _read + rehydrate authoritative
-  bytes_ (adopt the winner, ADR-017), never a rollback.
+  `PromotingOwnerReplicaRepository` that lazily copies an existing key/value replica into a
+  transactional store on first read. `store.ts` is **fence-aware**: stale recovery is
+  single-flight per owner, stages every exact losing root, and synchronously blocks reducers.
+  The final barrier publishes a valid winner only after all participants reach the strict
+  credential-free append-only journal. Failed appends remain only for same-process retry while
+  storage is unavailable; cross-process append union is guaranteed only by a transactional CAS
+  repository, not the default legacy last-write-wins adapter. Missing/corrupt/future authority
+  stays untouched; a
+  compatible recovery candidate reopens read-only as `recovery-required`, and session departure
+  is permitted only after pending candidates are verified.
   - **The singleton lives in `select-owner-replica-repository.ts`** (not `replica-repository.ts`,
     which is now pure building blocks). `store.ts` imports `ownerReplicaRepository` from there.
     It picks the platform store by capability detection (IndexedDB present → web; a
     `navigator.product === 'ReactNative'` runtime → native SQLite; else Node/SSR → none) with
     **no static `react-native` import**, so it loads under vitest/tsc.
   - **The flip is gated by `EXPO_PUBLIC_DURABLE_STORAGE` (default off).** Off — or a platform
-    with no transactional store — returns the legacy `SerializedKvReplicaRepository` unchanged,
-    so production + every test are byte-identical. Set it to `1`/`true` for real-device/browser
-    testing; it's safe because the store is fence-aware.
+    with no transactional store — returns the legacy `SerializedKvReplicaRepository` unchanged.
+    Set it to `1`/`true` only in controlled device/browser tests. It is **not cutover-safe**:
+    the promoter leaves legacy writable, and an already-loaded old client cannot honor a new
+    marker or Web Lock even though the current store handles stale CAS correctly.
   - **`expo-sqlite` is native-only in the bundle:** the opener is platform-split
     (`open-expo-sqlite-store.native.ts` real vs `open-expo-sqlite-store.ts` stub) so Metro never
     pulls `expo-sqlite` into the **web** bundle. If you add another native-only dependency to the
     replica path, split it the same way and re-run `pnpm --filter @iris/mobile run export:web`.
-  - Remaining CUTOVER: add cross-tab web leadership (so an actively-edited tab is not the fence
-    loser), flip the flag default on after device acceptance, and port the coordinator to `/v2`.
+  - Remaining CUTOVER: add a mixed-version legacy/primary divergence journal, one Web Lock
+    leader with read-only followers, metadata-only refresh, an enforceable old-client
+    compatibility gate, recovery export/resolve/discard controls, and browser/native acceptance.
+    Only then flip the default and port the coordinator to `/v2`.
     Writes are verified and non-fence failures set `error`; staging failure prevents dispatch.
 - **Everything is workspace-scoped by a fixed-token lease.** The client never sends a
   `workspaceId`; the server derives it. Do not replace `apiForLease` with a mutable

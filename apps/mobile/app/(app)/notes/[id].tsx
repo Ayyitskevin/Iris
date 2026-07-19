@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import { RESTORE_PROTOCOL_VERSION, type NoteVersion } from '@iris/shared';
-import { Button, Muted } from '../../../src/components/ui';
+import { Button, Muted, RecoveryNotice } from '../../../src/components/ui';
 import { useObs } from '../../../src/state/hooks';
 import {
   assertCurrentSession,
@@ -50,6 +50,7 @@ export default function NoteEditor() {
   const note = useObs(() => (id ? store$.notes[id].get() : undefined));
   const conflict = useObs(() => (id ? store$.conflicts.get()[id] : undefined));
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
+  const recoveryRequired = useObs(() => store$.status.get() === 'recovery-required');
   const outbox = useObs(() => store$.outbox.get());
   const pendingPush = useObs(() => store$.pendingPush.get());
   const [versions, setVersions] = useState<NoteVersion[] | null>(null);
@@ -66,11 +67,12 @@ export default function NoteEditor() {
   const routeIdentityRef = useRef(routeIdentity);
   routeIdentityRef.current = routeIdentity;
   const parsedTags = normalizeTags(tagsText);
+  const persistedTagsText = note?.tags.join(', ') ?? '';
 
   useEffect(() => {
     // Best-effort: pull the latest server state for this note when opening.
-    void sync();
-  }, [id]);
+    if (!recoveryRequired) void sync();
+  }, [id, recoveryRequired]);
 
   // Seed the tags input once the note is available (keyed on note id, not tags, so
   // the field doesn't fight the user's typing).
@@ -88,8 +90,14 @@ export default function NoteEditor() {
     setRestoringVersionId(null);
   }, [note?.id, ownerKey]);
 
+  useEffect(() => {
+    if (!recoveryRequired) return;
+    setTagsText(persistedTagsText);
+    setTagsEdited(false);
+  }, [persistedTagsText, recoveryRequired]);
+
   function commitTags() {
-    if (!id || !tagsEdited || note?.deletedAt || restoringVersionId) return;
+    if (recoveryRequired || !id || !tagsEdited || note?.deletedAt || restoringVersionId) return;
     if (updateNoteLocal(id, { tags: parsedTags })) setTagsEdited(false);
   }
 
@@ -103,6 +111,7 @@ export default function NoteEditor() {
 
   async function loadHistory() {
     if (
+      recoveryRequired ||
       tagsEdited ||
       noteHasPendingWork(
         id,
@@ -158,11 +167,12 @@ export default function NoteEditor() {
     protocolVersion: restoreProtocolVersion,
     historyHeadVersion: historyBaseVersion,
     localHeadVersion: note.version,
-    blocked: Boolean(historyBlocked || restoringVersionId),
+    blocked: Boolean(recoveryRequired || historyBlocked || restoringVersionId),
   });
 
   async function restore(version: NoteVersion) {
     if (
+      recoveryRequired ||
       !restoreAllowed ||
       historyBaseVersion === null ||
       tagsEdited ||
@@ -255,7 +265,7 @@ export default function NoteEditor() {
   }
 
   function onDelete() {
-    if (restoringVersionId) return;
+    if (recoveryRequired || restoringVersionId) return;
     if (deleteNoteLocal(id)) router.back();
   }
 
@@ -268,6 +278,8 @@ export default function NoteEditor() {
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={{ padding: theme.space(4) }}>
+      {recoveryRequired ? <RecoveryNotice /> : null}
+
       {conflict ? (
         <View style={styles.conflict}>
           <Text style={styles.conflictTitle}>This note changed elsewhere</Text>
@@ -286,18 +298,20 @@ export default function NoteEditor() {
           <View style={styles.conflictActions}>
             <Button
               label={conflictLabels.keepLocal}
+              disabled={recoveryRequired}
               onPress={() => {
-                if (ownerKey) {
-                  keepLocalConflict(ownerKey, id, conflict.localMutation.opId);
+                if (ownerKey && !recoveryRequired) {
+                  void keepLocalConflict(ownerKey, id, conflict.localMutation.opId);
                 }
               }}
             />
             <Button
               label={conflictLabels.useServer}
               variant="ghost"
+              disabled={recoveryRequired}
               onPress={() => {
-                if (ownerKey) {
-                  useServerConflict(ownerKey, id, conflict.localMutation.opId);
+                if (ownerKey && !recoveryRequired) {
+                  void useServerConflict(ownerKey, id, conflict.localMutation.opId);
                 }
               }}
             />
@@ -317,7 +331,7 @@ export default function NoteEditor() {
             <Button
               label={versions ? 'Hide history' : 'View history'}
               variant="ghost"
-              disabled={!versions && historyBlocked}
+              disabled={!versions && (historyBlocked || recoveryRequired)}
               onPress={() => (versions ? closeHistory() : loadHistory())}
             />
           </View>
@@ -330,7 +344,7 @@ export default function NoteEditor() {
             placeholderTextColor={theme.colors.textDim}
             value={note.title}
             onChangeText={(t) => updateNoteLocal(id, { title: t })}
-            editable={!conflict && !restoringVersionId}
+            editable={!recoveryRequired && !conflict && !restoringVersionId}
           />
           <Text style={styles.meta}>
             v{note.version}
@@ -341,7 +355,7 @@ export default function NoteEditor() {
             style={styles.tags}
             placeholder="tags, comma, separated"
             placeholderTextColor={theme.colors.textDim}
-            value={tagsText}
+            value={recoveryRequired ? persistedTagsText : tagsText}
             onChangeText={(value) => {
               setTagsText(value);
               setTagsEdited(true);
@@ -349,7 +363,7 @@ export default function NoteEditor() {
             onBlur={commitTags}
             onSubmitEditing={commitTags}
             autoCapitalize="none"
-            editable={!conflict && !restoringVersionId}
+            editable={!recoveryRequired && !conflict && !restoringVersionId}
           />
 
           {/* The editor is a plain view over Markdown — no proprietary block tree (pillar #1). */}
@@ -361,20 +375,20 @@ export default function NoteEditor() {
             onChangeText={(t) => updateNoteLocal(id, { bodyMd: t })}
             multiline
             textAlignVertical="top"
-            editable={!conflict && !restoringVersionId}
+            editable={!recoveryRequired && !conflict && !restoringVersionId}
           />
 
           <View style={styles.actions}>
             <Button
               label={versions ? 'Hide history' : 'View history'}
               variant="ghost"
-              disabled={!versions && historyBlocked}
+              disabled={!versions && (historyBlocked || recoveryRequired)}
               onPress={() => (versions ? closeHistory() : loadHistory())}
             />
             <Button
               label="Delete note"
               variant="danger"
-              disabled={Boolean(conflict || restoringVersionId)}
+              disabled={Boolean(recoveryRequired || conflict || restoringVersionId)}
               onPress={onDelete}
             />
           </View>

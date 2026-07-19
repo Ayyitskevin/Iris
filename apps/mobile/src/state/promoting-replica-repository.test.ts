@@ -129,7 +129,7 @@ describe('PromotingOwnerReplicaRepository', () => {
     expect(await promoting.read('owner-a')).toBe(serialized('owner-a', 'primary-wins'));
   });
 
-  it('promotes at most once per owner (a later legacy mutation is ignored)', async () => {
+  it('shows why client-only promotion cannot cut over: later legacy writes are ignored', async () => {
     const primary = sqliteRepo();
     const legacy = new MemoryRepo({ 'owner-a': serialized('owner-a', 'legacy') });
     const promoting = new PromotingOwnerReplicaRepository(primary, legacy);

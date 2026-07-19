@@ -30,6 +30,19 @@ export function Muted({ children }: { children: ReactNode }) {
   return <Text style={styles.muted}>{children}</Text>;
 }
 
+export function RecoveryNotice() {
+  return (
+    <View style={styles.recoveryNotice} accessibilityRole="alert">
+      <Text style={styles.recoveryTitle}>Local recovery mode</Text>
+      <Text style={styles.recoveryText}>
+        Iris paused edits, sync, and account actions to avoid overwriting a local copy. Notes are
+        read-only in this build. Keep the app open if storage failed; sign-out remains available but
+        may need to retry preservation.
+      </Text>
+    </View>
+  );
+}
+
 export function Field(props: TextInputProps) {
   return <TextInput placeholderTextColor={theme.colors.textDim} style={styles.field} {...props} />;
 }
@@ -49,6 +62,7 @@ export function Button({
   disabled?: boolean;
   accessibilityLabel?: string;
 }) {
+  const unavailable = Boolean(disabled || loading);
   const bg =
     variant === 'primary'
       ? theme.colors.accent
@@ -59,12 +73,13 @@ export function Button({
   return (
     <Pressable
       onPress={onPress}
-      disabled={disabled || loading}
+      disabled={unavailable}
       accessibilityRole="button"
       accessibilityLabel={accessibilityLabel ?? label}
+      accessibilityState={{ disabled: unavailable }}
       style={({ pressed }) => [
         styles.button,
-        { backgroundColor: bg, opacity: disabled ? 0.5 : pressed ? 0.85 : 1 },
+        { backgroundColor: bg, opacity: unavailable ? 0.5 : pressed ? 0.85 : 1 },
         variant === 'ghost' && styles.buttonGhost,
       ]}
     >
@@ -91,6 +106,21 @@ const styles = StyleSheet.create({
     marginBottom: theme.space(2),
   },
   muted: { color: theme.colors.textDim, fontSize: 14 },
+  recoveryNotice: {
+    backgroundColor: theme.colors.surfaceAlt,
+    borderColor: theme.colors.danger,
+    borderWidth: 1,
+    borderRadius: theme.radius,
+    padding: theme.space(3),
+    marginVertical: theme.space(3),
+  },
+  recoveryTitle: {
+    color: theme.colors.danger,
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: theme.space(1),
+  },
+  recoveryText: { color: theme.colors.text, fontSize: 13, lineHeight: 19 },
   field: {
     backgroundColor: theme.colors.surface,
     borderColor: theme.colors.border,

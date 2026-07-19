@@ -34,7 +34,8 @@ A thin, end-to-end vertical slice that proves the architecture:
   changes.
 - **Billing gate** — Stripe subscription; local use free, multi-device **sync is the paid
   line** (~$5/mo).
-- **Full Markdown export** — one action → a zip of `.md` files + attachments.
+- **Portable Markdown note export** — the API/web flow produces a zip of `.md` files plus
+  a manifest. Attachment storage/export and native share-sheet UX are not built yet.
 
 ## Repository layout
 
@@ -70,8 +71,9 @@ pnpm test
 pnpm dev:mobile
 ```
 
-Copy `.env.example` → `apps/api/.env` and fill values to move toward production
-(real Postgres via `DATABASE_URL`, managed auth via `AUTH_PROVIDER`, live Stripe keys).
+Copy `.env.example` → `apps/api/.env` for server values and → `apps/mobile/.env` for
+`EXPO_PUBLIC_*` client values. Fill only the runtime you are exercising (real Postgres via
+`DATABASE_URL`, managed auth via `AUTH_PROVIDER`, live Stripe keys, or durability test flags).
 
 ## Try the agent flow by hand
 
@@ -136,13 +138,22 @@ strict `notes-v1` resource envelope now coexists on `/v2/sync/*`: its immutable
 resource-set cursor cannot cross routes or workspaces, and exact note operations replay
 the frozen receipt-v1 outcome across `/v1` and `/v2` without another resource mutation,
 receipt, or logical cursor advance (ADR-016).
-The production mobile coordinator intentionally remains on `/v1`. An unwired IndexedDB
-primitive now preserves one exact owner root behind atomic revision checks and fences a
-stale writer, but production still selects the size-limited SecureStore/localStorage
-adapter. Owner-specific localStorage promotion, cross-tab session leadership, native
-SQLite and its at-rest protection policy, durable `/v2` envelope/cursor staging,
-lease/device-bound dispatch, runtime correlator invocation, atomic result application,
-recovery import, and browser/native acceptance remain explicit release blockers.
+The production mobile coordinator intentionally remains on `/v1`. Revision-fenced
+IndexedDB and SQLite stores, lazy legacy promotion, and the platform selector now exist,
+but `EXPO_PUBLIC_DURABLE_STORAGE` defaults off, so the size-limited
+SecureStore/localStorage adapter remains authority. A stale CAS now stages every exact losing
+owner root in a strict credential-free, append-only recovery journal before the final recovery
+barrier may publish a valid winner. Missing, corrupt, or future-version authority stays untouched;
+on a later login Iris can reopen the newest compatible recovery snapshot in a visible read-only
+`recovery-required` mode instead of creating an empty root. Sign-out and account switching
+proceed only after pending recovery candidates are verified. A failed append retains its exact
+candidate only for same-process retry; it cannot be crash-durable while the selected repository is
+failing. Cross-process journal union requires the transactional CAS repository; the default legacy
+adapter remains last-write-wins. The flag is still not cutover-safe:
+client-only code cannot stop an already-loaded old tab/version from writing the legacy copy.
+Mixed-version divergence detection, one web leader, an enforceable server compatibility gate,
+recovery export/resolve/discard controls, the v2 pull applier, at-rest policy, and browser/native
+acceptance remain open. See `docs/MASTER_PLAN.md` for the ordered release gates.
 GitHub Actions run `29506816638` passed the PostgreSQL 16
 independent-connection commit-order and concurrent device-gate gate for commit
 `8a8785114623d3e601f26ddf7b6eed21b23415cf`.
