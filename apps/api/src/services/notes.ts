@@ -6,12 +6,14 @@
  * Services never open their own transactions or set the GUC — they run inside the
  * per-request tenant transaction from runTenant(), and use ctx.db throughout.
  */
-import { and, desc, eq, isNull, sql } from 'drizzle-orm';
-import type {
-  CreateNoteRequest,
-  Note,
-  RestoreVersionResponse,
-  UpdateNoteRequest,
+import { and, desc, eq, isNull, lt, sql } from 'drizzle-orm';
+import {
+  NOTES_PAGE_DEFAULT_LIMIT,
+  NOTES_PAGE_MAX_LIMIT,
+  type CreateNoteRequest,
+  type Note,
+  type RestoreVersionResponse,
+  type UpdateNoteRequest,
 } from '@iris/shared';
 import { noteVersions, notes } from '../db/schema';
 import type { Ctx } from '../context';
@@ -35,16 +37,54 @@ export function normalizeTags(tags: string[] | undefined): string[] {
   return out;
 }
 
-export async function listNotes(ctx: Ctx, tag?: string): Promise<Note[]> {
+export interface ListNotesOptions {
+  tag?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface ListNotesResult {
+  notes: Note[];
+  /** Present only when more notes remain past this page. */
+  nextCursor?: string;
+}
+
+/**
+ * The pagination key is `syncSeq`, not `updatedAt`: it is a per-workspace monotonic integer
+ * with a unique index (notes_sync_idx), bumped on every note mutation. That makes it a stable,
+ * precise, index-backed keyset — "most recently changed first" — with none of the tie or
+ * millisecond-truncation hazards a timestamp cursor carries.
+ */
+function encodeNotesCursor(syncSeq: bigint): string {
+  return Buffer.from(String(syncSeq), 'utf8').toString('base64url');
+}
+
+function decodeNotesCursor(cursor: string): bigint {
+  const raw = Buffer.from(cursor, 'base64url').toString('utf8');
+  if (!/^\d+$/.test(raw)) throw badRequest('Notes cursor is malformed', 'invalid_cursor');
+  return BigInt(raw);
+}
+
+export async function listNotes(ctx: Ctx, opts: ListNotesOptions = {}): Promise<ListNotesResult> {
+  const limit = Math.min(opts.limit ?? NOTES_PAGE_DEFAULT_LIMIT, NOTES_PAGE_MAX_LIMIT);
   const filters = [eq(notes.workspaceId, ctx.workspaceId), isNull(notes.deletedAt)];
   // jsonb `?` tests membership of a string in the tags array (see migration 0002).
-  if (tag) filters.push(sql`${notes.tags} ? ${tag}`);
+  if (opts.tag) filters.push(sql`${notes.tags} ? ${opts.tag}`);
+  // Keyset: rows strictly before the cursor in syncSeq-descending order.
+  if (opts.cursor) filters.push(lt(notes.syncSeq, decodeNotesCursor(opts.cursor)));
+
   const rows = await ctx.db
     .select()
     .from(notes)
     .where(and(...filters))
-    .orderBy(desc(notes.updatedAt));
-  return rows.map(serializeNote);
+    .orderBy(desc(notes.syncSeq))
+    // One extra row past the page tells us whether a next page exists.
+    .limit(limit + 1);
+
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+  const nextCursor = hasMore ? encodeNotesCursor(page[page.length - 1]!.syncSeq) : undefined;
+  return { notes: page.map(serializeNote), nextCursor };
 }
 
 export async function getNote(ctx: Ctx, id: string): Promise<Note> {

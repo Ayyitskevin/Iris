@@ -22,6 +22,7 @@ import {
   EXPORT_RATE_LIMIT_MAX,
   GLOBAL_RATE_LIMIT_MAX,
   IssueAgentTokenRequest,
+  ListNotesQuery,
   RATE_LIMIT_WINDOW,
   RegisterDeviceRequest,
   RestoreVersionRequest,
@@ -246,8 +247,7 @@ export async function buildApp(
   app.get('/v1/notes', guarded, (req) =>
     tenant(req, async (ctx) => {
       requireScope(ctx, 'notes:read');
-      const tag = (req.query as { tag?: string }).tag;
-      return { notes: await notesService.listNotes(ctx, tag) };
+      return notesService.listNotes(ctx, ListNotesQuery.parse(req.query));
     }),
   );
 
