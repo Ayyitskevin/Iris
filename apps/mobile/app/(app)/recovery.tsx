@@ -11,6 +11,7 @@ import type {
   ReplicaRecoveryCatalog,
   ReplicaRecoveryCatalogCopy,
 } from '../../src/state/replica-recovery-catalog';
+import type { ReplicaRecoveryReason } from '../../src/state/replica-recovery-journal';
 import {
   createReplicaRecoveryExportForLease,
   isCurrentRecoveryInspectionLease,
@@ -29,7 +30,10 @@ const reasonLabels = {
   'stale-writer': 'A save was superseded by another local writer.',
   'session-departure': 'Preserved while leaving this account.',
   'session-rejected': 'Preserved after this session was rejected.',
-} as const;
+  'promotion-baseline': 'Baseline preserved before transactional promotion.',
+  'legacy-divergence': 'Changed legacy branch detected.',
+  'primary-divergence': 'Transactional primary branch preserved after divergence.',
+} as const satisfies Readonly<Record<ReplicaRecoveryReason, string>>;
 
 function copyTitle(copy: ReplicaRecoveryCatalogCopy): string {
   if (copy.persistence === 'journal-verified') return `Preserved copy #${copy.sequence}`;

@@ -72,6 +72,22 @@ describe('replica recovery export', () => {
     expect(serialized).not.toContain('bearer-secret');
   });
 
+  it('retains every provenance sequence for one exact displayed root', () => {
+    const root = replica('same-exact-root');
+    const serialized = createReplicaRecoveryExport({
+      envelope: envelope([root, root]),
+      displayedSerializedReplica: root,
+      exportedAt,
+    });
+    const parsed = parseReplicaRecoveryExport(serialized, ownerKey);
+
+    expect(parsed.snapshots.map((snapshot) => snapshot.reason)).toEqual([
+      'stale-writer',
+      'session-departure',
+    ]);
+    expect(parsed.displayed).toEqual({ kind: 'journal-match', sequences: [1, 2] });
+  });
+
   it('embeds byte-distinct displayed JSON even when journal roots are structurally equal', () => {
     const first = replica('same');
     const reordered = replica('same', true);
@@ -172,7 +188,7 @@ describe('replica recovery export', () => {
         }),
         ownerKey,
       ),
-    ).toThrow('displayed projection is invalid');
+    ).toThrow('displayed sequences are invalid');
   });
 
   it('creates a sanitized owner-free filename from an injected nonce', () => {

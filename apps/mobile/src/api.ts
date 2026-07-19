@@ -5,25 +5,34 @@ import {
   expireSessionIfCurrent,
   openSessionLease,
   type SessionLease,
+  verifyReplicaAuthorityForLease,
 } from './state/store';
 
 /** Authentication endpoints never inherit a previously active bearer credential. */
 export const publicApi = createApiClient({ baseUrl: API_URL });
 
+/** Dispatch one credential-bearing response through the same last-moment authority boundary. */
+export async function authenticatedFetchForLease(
+  lease: SessionLease,
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> {
+  assertCurrentSession(lease);
+  await verifyReplicaAuthorityForLease(lease);
+  assertCurrentSession(lease);
+  const response = await globalThis.fetch(input, { ...init, signal: lease.signal });
+  // Preserve an exact bearer rejection even if recovery invalidated the operation lease while
+  // the request was in flight. The expiry boundary still compares the active credential.
+  if (response.status !== 401) assertCurrentSession(lease);
+  return response;
+}
+
 /** A fixed-token client whose fetches are aborted and rejected when its owner changes. */
 export function apiForLease(lease: SessionLease): ApiClient {
-  const guardedFetch: typeof fetch = async (input, init) => {
-    assertCurrentSession(lease);
-    const response = await globalThis.fetch(input, { ...init, signal: lease.signal });
-    // Preserve an exact bearer rejection even if recovery invalidated the operation lease while
-    // the request was in flight. The expiry boundary still compares the active credential.
-    if (response.status !== 401) assertCurrentSession(lease);
-    return response;
-  };
   return createApiClient({
     baseUrl: API_URL,
     getToken: () => lease.token,
-    fetch: guardedFetch,
+    fetch: (input, init) => authenticatedFetchForLease(lease, input, init),
   });
 }
 

@@ -151,7 +151,7 @@ export function parseReplicaRecoveryExport(
     displayedValue.kind === 'journal-match' &&
     exactKeys(displayedValue, ['kind', 'sequences']) &&
     Array.isArray(displayedValue.sequences) &&
-    displayedValue.sequences.length === 1 &&
+    displayedValue.sequences.length > 0 &&
     displayedValue.sequences.every(
       (sequence) => Number.isSafeInteger(sequence) && (sequence as number) > 0,
     )
@@ -163,7 +163,13 @@ export function parseReplicaRecoveryExport(
     ) {
       throw new ReplicaRecoveryExportError('Recovery export displayed sequences are invalid');
     }
-    if (envelope.snapshots[sequences[0]! - 1]?.serializedReplica === undefined) {
+    const matchedRoots = sequences.map(
+      (sequence) => envelope.snapshots[sequence - 1]?.serializedReplica,
+    );
+    if (
+      matchedRoots.some((root) => root === undefined) ||
+      matchedRoots.some((root) => root !== matchedRoots[0])
+    ) {
       throw new ReplicaRecoveryExportError('Recovery export displayed sequences do not match');
     }
     displayed = { kind: 'journal-match', sequences: [...sequences] };

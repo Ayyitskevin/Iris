@@ -9,9 +9,9 @@
  * The selector is gated behind `EXPO_PUBLIC_DURABLE_STORAGE`, which defaults OFF. Correct
  * stale-CAS recovery in `store.ts` prevents false commit acknowledgements, but it does not make
  * legacy promotion cutover-safe: old tabs/binaries can still write the legacy key after a new
- * runtime adopts the primary. Use this flag only in controlled tests until the mixed-version
- * divergence journal, enforceable old-client compatibility, recovery UX, frozen-old-runtime
- * browser coverage, and native acceptance gates are complete.
+ * runtime adopts the primary. ADR-023 now detects and preserves that split, including a frozen
+ * old-runtime browser gate. Use this flag only in controlled tests until enforceable old-client
+ * compatibility, recovery resolution, and native acceptance gates are complete.
  *
  * Deliberately a leaf module (nothing here imports it back) and free of any static
  * `react-native`/`expo-sqlite` import, so it loads cleanly under Node/vitest.
@@ -86,10 +86,16 @@ export type OwnerReplicaRuntimeMode = 'legacy' | 'transactional-web' | 'transact
 
 export interface OwnerReplicaRuntime {
   readonly repository: OwnerReplicaRepository;
+  /** Raw backend for control/recovery records; never route it back through promotion. */
+  readonly recoveryRepository: OwnerReplicaRepository;
   readonly authority: OwnerAuthorityDriver;
   readonly mode: OwnerReplicaRuntimeMode;
   /** Read the durable/legacy winner without promoting or committing from a follower. */
   readFollower(ownerKey: string): Promise<string | null>;
+  /** Resolve or verify the mixed-version journal before publishing write authority. */
+  prepareOwner(ownerKey: string): Promise<void>;
+  /** Recheck the exact legacy baseline immediately before an authenticated request. */
+  verifyBeforeNetwork(ownerKey: string): Promise<void>;
 }
 
 /** Read the environment without importing `react-native` — capability detection only. */
@@ -114,9 +120,12 @@ export function detectReplicaEnvironment(): ReplicaEnvironment {
 function legacyRuntime(legacy: OwnerReplicaRepository): OwnerReplicaRuntime {
   return {
     repository: legacy,
+    recoveryRepository: legacy,
     authority: new AlwaysWritableOwnerAuthorityDriver(),
     mode: 'legacy',
     readFollower: (ownerKey) => legacy.read(ownerKey),
+    prepareOwner: async () => undefined,
+    verifyBeforeNetwork: async () => undefined,
   };
 }
 
@@ -147,14 +156,18 @@ export function selectOwnerReplicaRuntime(
     const primary = new TransactionalOwnerReplicaRepository(
       new IndexedDbTransactionalReplicaStore(env.indexedDB),
     );
+    const repository = new PromotingOwnerReplicaRepository(primary, legacy);
     return {
-      repository: new PromotingOwnerReplicaRepository(primary, legacy),
+      repository,
+      recoveryRepository: primary,
       authority: new WebOwnerAuthorityDriver({
         locks: env.webLocks,
         createChannel: env.createBroadcastChannel,
       }),
       mode: 'transactional-web',
       readFollower: async (ownerKey) => (await primary.read(ownerKey)) ?? legacy.read(ownerKey),
+      prepareOwner: (ownerKey) => repository.prepareOwner(ownerKey),
+      verifyBeforeNetwork: (ownerKey) => repository.verifyBeforeNetwork(ownerKey),
     };
   }
 
@@ -162,11 +175,15 @@ export function selectOwnerReplicaRuntime(
     const primary = new TransactionalOwnerReplicaRepository(
       new LazyTransactionalReplicaStore(() => openExpoSqliteReplicaStore()),
     );
+    const repository = new PromotingOwnerReplicaRepository(primary, legacy);
     return {
-      repository: new PromotingOwnerReplicaRepository(primary, legacy),
+      repository,
+      recoveryRepository: primary,
       authority: new AlwaysWritableOwnerAuthorityDriver(),
       mode: 'transactional-native',
       readFollower: (ownerKey) => primary.read(ownerKey),
+      prepareOwner: (ownerKey) => repository.prepareOwner(ownerKey),
+      verifyBeforeNetwork: (ownerKey) => repository.verifyBeforeNetwork(ownerKey),
     };
   }
 

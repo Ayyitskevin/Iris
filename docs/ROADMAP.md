@@ -161,8 +161,24 @@ These were named as out of scope and are staying out until the foundation is pro
   before authority is published; owner switches release A before acquiring B. Missing IndexedDB,
   Web Locks, or BroadcastChannel selects the exact legacy adapter. A production-bundle two-tab
   Chromium test covers leader/follower behavior, transfer with pending work, channel privacy, and
-  reacquisition. This does not detect or stop an already-loaded old legacy writer, so the flag
-  remains off pending the mixed-version divergence and compatibility contract.
+  reacquisition. ADR-023 now supplies detection and exact preservation for an already-loaded old
+  legacy writer; the flag remains off pending enforceable compatibility and recovery acceptance.
+- **Phase 2.12a — mixed-version divergence containment, default-off** (ADR-023): the promoter now
+  writes a strict digest-only preparing/transactional/diverged journal directly to the raw
+  transactional backend. It captures the immutable valid legacy baseline, rechecks both exact
+  roots before/after primary commits and before each authenticated fetch, preserves diverged
+  branches and optimistic candidates in the token-free recovery journal, then fences writes,
+  leases, and network; active projections enter visible recovery mode. Illegal/corrupt/future
+  control state stays untouched. Unit tests cover semantic journal parsing, crash boundaries,
+  shared-repository recovery append races, crash-durable reason provenance, later legacy writes,
+  real-SQLite promotion, and
+  zero-request fencing. Completed transactional history is bounded by a 64-entry threshold and a
+  CAS-safe checkpoint; preparing/diverged evidence is never compacted. Production-bundle Chromium adds a frozen
+  same-origin old writer with no current authority code and proves exact branch preservation,
+  digest-only control metadata, disabled UI, and no post-drift request. This contains ambiguity;
+  it cannot exclude old code. The flag remains off pending a human-approved enforceable server
+  compatibility contract, recovery resolution, and browser/native lifecycle acceptance. Initial
+  native reload recovery presentation is explicitly part of that remaining acceptance gate.
 - **Phase 2.13 — server launch hardening, partial**: user-only device deregistration and
   account deletion endpoints, runtime non-superuser RLS tests, production Stripe-key
   guards, and a coarse per-IP rate limiter are shipped. Client device/deletion UX,
@@ -171,12 +187,10 @@ These were named as out of scope and are staying out until the foundation is pro
 
 ## Near-term follow-ups (ordered)
 
-1. **Mixed-version divergence journal + compatibility gate.** Current-runtime web leadership is
-   shipped default-off. Add a digest-only promotion journal that detects legacy/primary drift and
-   preserves both roots. Prove every promotion crash boundary and frozen-old-writer divergence
-   with no later request. Client-only code
-   cannot prevent the old write, so production also requires an approved server storage epoch,
-   upgrade-required response, or explicit old-client invalidation.
+1. **Enforceable old-client compatibility gate (human-gated).** ADR-023's default-off client
+   journal and frozen-old-writer browser gate detect, preserve, and stop local work before another
+   request, but client-only code cannot prevent the old write. Approve and implement a server
+   storage epoch, upgrade-required response, or explicit old-client invalidation before cutover.
 2. **Controlled transactional-authority acceptance + recovery resolution UX.** Keep `/v1`
    networking while integrating diverged and quarantined roots into the shipped local Recovery
    Center and adding choose-winner, restore/import, and discard controls, then test

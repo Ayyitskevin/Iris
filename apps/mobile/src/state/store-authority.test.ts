@@ -12,6 +12,10 @@ const replica = vi.hoisted(() => ({
   durable: new Map<string, string>(),
   reads: [] as string[],
   commits: [] as string[],
+  prepares: [] as string[],
+  verifies: [] as string[],
+  prepareError: null as Error | null,
+  verifyError: null as Error | null,
   commitGate: null as Promise<void> | null,
 }));
 const authority = vi.hoisted(() => ({
@@ -59,8 +63,17 @@ vi.mock('./select-owner-replica-repository', () => {
     ownerReplicaRepository: repository,
     ownerReplicaRuntime: {
       repository,
+      recoveryRepository: repository,
       mode: 'transactional-web',
       readFollower: (ownerKey: string) => repository.read(ownerKey),
+      prepareOwner: async (ownerKey: string) => {
+        replica.prepares.push(ownerKey);
+        if (replica.prepareError) throw replica.prepareError;
+      },
+      verifyBeforeNetwork: async (ownerKey: string) => {
+        replica.verifies.push(ownerKey);
+        if (replica.verifyError) throw replica.verifyError;
+      },
       authority: {
         async start(ownerKey: string, hooks: OwnerAuthorityHooks): Promise<OwnerAuthorityHandle> {
           let epoch = 0;
@@ -83,8 +96,12 @@ vi.mock('./select-owner-replica-repository', () => {
             hooks,
             async becomeLeader() {
               const acquiring = setRole('acquiring');
-              await hooks.prepareLeader(acquiring);
-              if (!control.closed) setRole('leader');
+              try {
+                await hooks.prepareLeader(acquiring);
+                if (!control.closed) setRole('leader');
+              } catch {
+                if (!control.closed) setRole('unavailable');
+              }
             },
             refresh() {
               hooks.onRefresh(control.snapshot);
@@ -94,8 +111,12 @@ vi.mock('./select-owner-replica-repository', () => {
           setRole('acquiring');
           const initialRole = authority.nextRoles.shift() ?? 'leader';
           if (initialRole === 'leader') {
-            await hooks.prepareLeader(control.snapshot);
-            setRole('leader');
+            try {
+              await hooks.prepareLeader(control.snapshot);
+              setRole('leader');
+            } catch {
+              setRole('unavailable');
+            }
           } else {
             setRole('follower');
           }
@@ -119,7 +140,7 @@ vi.mock('./select-owner-replica-repository', () => {
   };
 });
 
-import { authenticatedRequest } from '../api';
+import { apiForLease, authenticatedRequest } from '../api';
 import { createNoteLocal } from '../sync/manager';
 import {
   adoptSession,
@@ -203,6 +224,10 @@ beforeEach(async () => {
   replica.durable.clear();
   replica.reads = [];
   replica.commits = [];
+  replica.prepares = [];
+  replica.verifies = [];
+  replica.prepareError = null;
+  replica.verifyError = null;
   replica.commitGate = null;
   authority.nextRoles = [];
   authority.handles = [];
@@ -290,6 +315,42 @@ describe('owner store web authority', () => {
     expect(replica.reads.filter((key) => key === ownerKeyFor(sessionA)).length).toBeGreaterThan(
       readsBeforeTakeover,
     );
+    expect(replica.prepares.filter((key) => key === ownerKeyFor(sessionA))).toHaveLength(1);
+  });
+
+  it('fences the owner and dispatches no request when last-moment authority verification fails', async () => {
+    replica.durable.set(ownerKeyFor(sessionA), serialized(sessionA, []));
+    authority.nextRoles.push('leader');
+    await adoptSession(sessionA);
+    const lease = openSessionLease()!;
+    const verificationError = new Error('injected legacy divergence');
+    replica.verifyError = verificationError;
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+    await expect(apiForLease(lease).billingStatus()).rejects.toBe(verificationError);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(replica.verifies).toEqual([ownerKeyFor(sessionA)]);
+    expect(lease.signal.aborted).toBe(true);
+    expect(openSessionLease()).toBeNull();
+    expect(store$.status.get()).toBe('recovery-required');
+    fetchMock.mockRestore();
+  });
+
+  it('retains the recovery fence when leader preparation fails before initial publication', async () => {
+    const root = serialized(sessionA, []);
+    replica.durable.set(ownerKeyFor(sessionA), root);
+    replica.prepareError = new Error('injected unreadable divergence journal');
+    authority.nextRoles.push('leader');
+
+    await adoptSession(sessionA);
+
+    expect(replicaAuthority$.get()).toBe('unavailable');
+    expect(replica.prepares).toEqual([ownerKeyFor(sessionA)]);
+    expect(replica.durable.get(ownerKeyFor(sessionA))).toBe(root);
+    expect(store$.session.get()).toEqual(sessionA);
+    expect(store$.status.get()).toBe('recovery-required');
+    expect(openSessionLease()).toBeNull();
   });
 
   it('publishes only after a verified commit and ignores late A refreshes after switching to B', async () => {

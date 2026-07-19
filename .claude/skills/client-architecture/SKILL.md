@@ -40,7 +40,13 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 - `src/state/store.ts` — owner-keyed replicas, separate session/tombstone storage,
   legacy `iris:state:v1` recovery quarantine, generation leases, verified writes, an
   append-only stale-CAS recovery journal, read-only recovery mode, credential-free recovery
-  inspection/export leases, and selectors.
+  inspection/export leases, mixed-version authority fencing, and selectors.
+- `src/state/replica-divergence-journal.ts` +
+  `promoting-replica-repository.ts` — strict digest-only
+  preparing/transactional/diverged control state, immutable legacy-baseline verification,
+  crash resumption, and exact branch preservation through the raw recovery repository.
+- `src/state/select-owner-replica-repository.ts` — default-off platform selection plus the
+  separate raw journal backend and pre-leadership/pre-network authority hooks.
 - `src/state/replica-recovery-catalog.ts` + `src/recovery/export.ts` — bounded,
   non-preferential branch summaries and the strict token-free exact-byte bundle.
 - `src/recovery/export-sink.ts` / `.native.ts` — web Blob download vs native
@@ -52,7 +58,8 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 - `src/sync/coordinator.ts` + `reconcile.ts` — lease-bound staged push, pure
   reconciliation, validation, and complete paged pull.
 - `src/api.ts` — unauthenticated `publicApi` plus fixed-token, abortable
-  `apiForLease`; authenticated component requests return the checked lease.
+  `apiForLease`; every authenticated fetch revalidates mixed-version authority before dispatch,
+  and authenticated component requests return the checked lease.
 - `src/auth/session.ts` — serialized owner adoption and durable sign-out tombstones.
 - `src/config.ts` — `API_URL` from `EXPO_PUBLIC_API_URL` env → expo `extra.apiUrl` → `http://localhost:4000`.
 - `packages/shared/src/api-client.ts` — typed methods plus distinct `ApiRequestError`
@@ -177,8 +184,12 @@ null`; route keys include the owner so component state cannot survive an account
   platforms — `IndexedDbTransactionalReplicaStore` (web, ADR-017) and
   `ExpoSqliteTransactionalReplicaStore` (native, ADR-020, `node:sqlite`-tested) — plus a
   `PromotingOwnerReplicaRepository` that lazily copies an existing key/value replica into a
-  transactional store on first read. `store.ts` is **fence-aware**: stale recovery is
-  single-flight per owner, stages every exact losing root, and synchronously blocks reducers.
+  transactional store on first read. ADR-023 wraps that copy and every later primary commit in a
+  strict digest-only write-ahead journal. It verifies the exact legacy baseline before/after
+  commits and immediately before authenticated fetches; drift preserves exact valid branches and
+  fences an active projection into visible read-only recovery before another request. Initial
+  native reload presentation remains an acceptance gate. `store.ts` is **fence-aware**: stale
+  recovery is single-flight per owner, stages every exact losing root, and synchronously blocks reducers.
   The final barrier publishes a valid winner only after all participants reach the strict
   credential-free append-only journal. Failed appends remain only for same-process retry while
   storage is unavailable; cross-process append union is guaranteed only by a transactional CAS
@@ -210,17 +221,27 @@ null`; route keys include the owner so component state cannot survive an account
     Set it to `1`/`true` only in controlled device/browser tests. On capable web runtimes the
     selector also installs one owner-scoped Web Lock authority: followers are read-only, receive
     exact metadata-only refresh notices, and reread before takeover. It is **not cutover-safe**:
-    the promoter leaves legacy writable, and an already-loaded old client cannot honor the lock
-    even though current-runtime tabs and stale CAS are fenced correctly.
+    the promoter can detect and preserve a legacy write, but an already-loaded old client cannot
+    honor the lock or be excluded by client code.
+  - **The mixed-version journal is control evidence, not a secret store.** It hashes
+    `domain + NUL + exact UTF-8 serialized root` with Expo Crypto SHA-256 and contains no replica
+    bytes. Exact valid branches live only in their source store or ADR-021's token-free recovery
+    journal. Recovery identity is exact bytes + reason, so later divergence provenance survives
+    even when those bytes were already captured generically; the UI collapses repeated exact roots
+    while the local export retains every evidence sequence. Control/recovery keys use the raw transactional repository, never the promoter.
+    `preparing` resolves to the prior or exact target root after a crash; `diverged` is
+    absorbing but retains later old-runtime evidence. Completed non-diverged history above 64
+    entries CAS-compacts to one `transactional/checkpoint` anchor only after both roots and orphan
+    evidence are reverified; preparing/diverged evidence is never compacted. Malformed/future
+    control state fails closed.
   - **`expo-sqlite` is native-only in the bundle:** the opener is platform-split
     (`open-expo-sqlite-store.native.ts` real vs `open-expo-sqlite-store.ts` stub) so Metro never
     pulls `expo-sqlite` into the **web** bundle. If you add another native-only dependency to the
     replica path, split it the same way and re-run `pnpm --filter @iris/mobile run export:web`.
     The recovery sink follows the same split so `expo-file-system` and `expo-sharing` stay on
     native while the base file remains the browser implementation.
-  - Remaining CUTOVER: add a mixed-version legacy/primary divergence journal and an enforceable
-    old-client compatibility gate, integrate divergence roots into Recovery Center, add
-    choose/restore/import/discard controls, and complete browser/native acceptance.
+  - Remaining CUTOVER: approve and implement an enforceable old-client compatibility gate, add
+    choose/restore/import/discard controls, and complete browser/native lifecycle acceptance.
     Only then flip the default and port the coordinator to `/v2`.
     Writes are verified and non-fence failures set `error`; staging failure prevents dispatch.
 - **Everything is workspace-scoped by a fixed-token lease.** The client never sends a

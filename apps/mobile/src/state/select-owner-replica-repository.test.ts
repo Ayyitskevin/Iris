@@ -54,6 +54,21 @@ describe('selectOwnerReplicaRepository', () => {
     expect(selectOwnerReplicaRepository(env({ isReactNative: true }), legacy)).toBe(legacy);
   });
 
+  it('keeps control and recovery records on the raw selected backend', async () => {
+    const legacySelected = selectOwnerReplicaRuntime(env({}), legacy);
+    expect(legacySelected.recoveryRepository).toBe(legacy);
+    await expect(legacySelected.prepareOwner('owner-a')).resolves.toBeUndefined();
+    await expect(legacySelected.verifyBeforeNetwork('owner-a')).resolves.toBeUndefined();
+
+    const transactional = selectOwnerReplicaRuntime(
+      env({ durableEnabled: true, isReactNative: true }),
+      legacy,
+    );
+    expect(transactional.repository).toBeInstanceOf(PromotingOwnerReplicaRepository);
+    expect(transactional.recoveryRepository).not.toBe(transactional.repository);
+    expect(transactional.recoveryRepository).not.toBe(legacy);
+  });
+
   it('promotes onto the IndexedDB store on web when enabled', () => {
     const repo = selectOwnerReplicaRepository(
       env({

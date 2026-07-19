@@ -198,6 +198,31 @@ describe('replica recovery catalog', () => {
     expect(catalog!.copies.map((copy) => copy.sequence)).toEqual([1, 2]);
   });
 
+  it('shows one exact root card with its latest durable provenance', () => {
+    const root = replica('same-exact-root');
+    const catalog = buildReplicaRecoveryCatalog({
+      sourceOwnerKey: ownerKey,
+      envelope: envelope(
+        [root, root, root],
+        ['stale-writer', 'legacy-divergence', 'session-departure'],
+      ),
+      pending: [],
+      displayedSerializedReplica: root,
+    });
+
+    expect(catalog).toMatchObject({
+      preservedCount: 1,
+      journalVerifiedCount: 1,
+      copies: [
+        expect.objectContaining({
+          sequence: 2,
+          reason: 'legacy-divergence',
+          matchesDisplayedProjection: true,
+        }),
+      ],
+    });
+  });
+
   it('shows a byte-distinct displayed root even when a preserved root is structurally equal', () => {
     const displayed = replica('same');
     const preserved = replica('same', { reverseRootKeys: true });

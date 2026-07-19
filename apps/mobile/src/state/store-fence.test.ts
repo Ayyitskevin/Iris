@@ -37,12 +37,15 @@ const repo = vi.hoisted(() => ({
   failReadKey: null as string | null,
   /** Force one generic (non-fence) commit failure to prove that path is unchanged. */
   failCommitKey: null as string | null,
+  /** Force mixed-version ambiguity before one source-root commit. */
+  authorityNextCommit: new Set<string>(),
   /**
    * Builds the real `ReplicaRepositoryStaleWriterError`. Populated at module top level after
    * the imports resolve — the mock factory must not import the transactional module itself,
    * because that module imports the very `./replica-repository` being mocked (a load deadlock).
    */
   makeStaleError: null as ((ownerKey: string) => Error) | null,
+  makeAuthorityError: null as ((ownerKey: string) => Error) | null,
   reads: [] as string[],
   commits: [] as string[],
 }));
@@ -79,6 +82,10 @@ vi.mock('./select-owner-replica-repository', () => {
     },
     async commit(ownerKey: string, raw: string): Promise<void> {
       repo.commits.push(ownerKey);
+      if (repo.authorityNextCommit.has(ownerKey)) {
+        repo.authorityNextCommit.delete(ownerKey);
+        throw repo.makeAuthorityError!(ownerKey);
+      }
       if (repo.failCommitKey === ownerKey) {
         repo.failCommitKey = null;
         throw new Error('injected non-fence commit failure');
@@ -102,8 +109,11 @@ vi.mock('./select-owner-replica-repository', () => {
     ownerReplicaRepository: repository,
     ownerReplicaRuntime: {
       repository,
+      recoveryRepository: repository,
       mode: 'transactional-native',
       readFollower: (ownerKey: string) => repository.read(ownerKey),
+      prepareOwner: async () => undefined,
+      verifyBeforeNetwork: async () => undefined,
       authority: {
         async start(ownerKey: string, hooks: OwnerAuthorityHooks) {
           const acquiring = { ownerKey, epoch: 1, role: 'acquiring' as const };
@@ -126,6 +136,7 @@ import {
   parseReplicaRecoveryEnvelope,
   replicaRecoveryJournalOwnerKey,
 } from './replica-recovery-journal';
+import { ReplicaRepositoryAuthorityError } from './promoting-replica-repository';
 import { parseReplicaRecoveryExport } from '../recovery/export';
 import { ReplicaRepositoryStaleWriterError } from './transactional-replica-repository';
 import {
@@ -157,6 +168,8 @@ import {
 // wired here (after imports resolve) to avoid importing the transactional module inside the
 // factory, which would deadlock on the mocked `./replica-repository`.
 repo.makeStaleError = (ownerKey: string) => new ReplicaRepositoryStaleWriterError(ownerKey);
+repo.makeAuthorityError = (ownerKey: string) =>
+  new ReplicaRepositoryAuthorityError(ownerKey, 'injected mixed-version ambiguity');
 
 const workspaceA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const userA = '11111111-1111-4111-8111-111111111111';
@@ -300,12 +313,40 @@ beforeEach(async () => {
   repo.readGates.clear();
   repo.failReadKey = null;
   repo.failCommitKey = null;
+  repo.authorityNextCommit.clear();
   repo.reads = [];
   repo.commits = [];
   await loadState();
 });
 
 describe('owner store fence-awareness', () => {
+  it('journals an optimistic candidate when mixed-version ambiguity blocks its primary commit', async () => {
+    const lease = await signIn();
+    const ownerKey = ownerKeyFor(sessionA);
+    const primaryBefore = repo.durable.get(ownerKey);
+    const localNote = note(noteAId, 'candidate blocked by old runtime');
+    repo.authorityNextCommit.add(ownerKey);
+
+    const applied = applyReplicaForLease(lease, (current) => ({
+      next: { ...current, notes: { [localNote.id]: localNote } },
+      result: undefined,
+    }));
+
+    await expect(applied.durable).rejects.toBeInstanceOf(ReplicaRepositoryAuthorityError);
+    expect(repo.durable.get(ownerKey)).toBe(primaryBefore);
+    expect(store$.status.get()).toBe('recovery-required');
+    expect(lease.signal.aborted).toBe(true);
+    const recovery = recoveryEnvelope(ownerKey);
+    expect(recovery.envelope.snapshots).toHaveLength(1);
+    expect(recovery.envelope.snapshots[0]).toMatchObject({
+      reason: 'stale-writer',
+    });
+    const preserved = JSON.parse(recovery.envelope.snapshots[0]!.serializedReplica) as {
+      notes: Record<string, Note>;
+    };
+    expect(preserved.notes).toEqual({ [localNote.id]: localNote });
+  });
+
   it('saveState adopts authoritative bytes but reports that its snapshot was superseded', async () => {
     const lease = await signIn();
     await updateReplicaForLease(lease, (current) => ({

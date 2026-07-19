@@ -89,7 +89,7 @@ class BarrierTransactionalStore implements TransactionalReplicaStore {
 }
 
 describe('ReplicaRecoveryJournal', () => {
-  it('appends exact token-free roots with monotonic sequence and deduplicates exact bytes', async () => {
+  it('deduplicates exact root provenance while retaining a later distinct reason', async () => {
     const repository = new MemoryOwnerRepository();
     let tick = 0;
     const journal = new ReplicaRecoveryJournal(
@@ -101,15 +101,22 @@ describe('ReplicaRecoveryJournal', () => {
 
     await journal.append(sourceOwner, first, 'stale-writer');
     await journal.append(sourceOwner, second, 'session-departure');
+    await journal.append(sourceOwner, first, 'stale-writer');
     await journal.append(sourceOwner, first, 'session-rejected');
 
     const envelope = await journal.read(sourceOwner);
-    expect(envelope?.snapshots.map((snapshot) => snapshot.sequence)).toEqual([1, 2]);
+    expect(envelope?.snapshots.map((snapshot) => snapshot.sequence)).toEqual([1, 2, 3]);
     expect(envelope?.snapshots.map((snapshot) => snapshot.serializedReplica)).toEqual([
       first,
       second,
+      first,
     ]);
-    expect(repository.commits).toBe(2);
+    expect(envelope?.snapshots.map((snapshot) => snapshot.reason)).toEqual([
+      'stale-writer',
+      'session-departure',
+      'session-rejected',
+    ]);
+    expect(repository.commits).toBe(3);
     const raw = repository.values.get(replicaRecoveryJournalOwnerKey(sourceOwner))!;
     expect(raw).not.toContain('bearer-secret');
     expect(() => parseReplicaRecoveryEnvelope(raw, sourceOwner)).not.toThrow();
@@ -169,6 +176,26 @@ describe('ReplicaRecoveryJournal', () => {
     const envelope = await journal.read(sourceOwner);
     expect(envelope?.snapshots.map((snapshot) => snapshot.serializedReplica)).toEqual(roots);
     expect(envelope?.snapshots.map((snapshot) => snapshot.sequence)).toEqual([1, 2, 3]);
+  });
+
+  it('serializes separate journal clients that share one repository instance', async () => {
+    const repository = new MemoryOwnerRepository();
+    const firstJournal = new ReplicaRecoveryJournal(repository, () => '2026-07-19T10:01:01.000Z');
+    const secondJournal = new ReplicaRecoveryJournal(repository, () => '2026-07-19T10:01:02.000Z');
+    const first = replica('shared-repository-one');
+    const second = replica('shared-repository-two');
+
+    await Promise.all([
+      firstJournal.append(sourceOwner, first, 'promotion-baseline'),
+      secondJournal.append(sourceOwner, second, 'stale-writer'),
+    ]);
+
+    const envelope = await firstJournal.read(sourceOwner);
+    expect(envelope?.snapshots.map((snapshot) => snapshot.serializedReplica)).toEqual([
+      first,
+      second,
+    ]);
+    expect(envelope?.snapshots.map((snapshot) => snapshot.sequence)).toEqual([1, 2]);
   });
 
   it('merges a forced cross-instance CAS race instead of dropping a distinct root', async () => {
@@ -395,6 +422,53 @@ describe('ReplicaRecoveryJournal', () => {
     expect(Object.isFrozen(first!.snapshots)).toBe(true);
     expect(Object.isFrozen(first!.snapshots[0])).toBe(true);
   });
+
+  it('accepts only the exact recovery reason vocabulary', () => {
+    const recoveryOwner = replicaRecoveryJournalOwnerKey(sourceOwner);
+    const acceptedReasons = [
+      'stale-writer',
+      'session-departure',
+      'session-rejected',
+      'promotion-baseline',
+      'legacy-divergence',
+      'primary-divergence',
+    ] as const;
+    const validEnvelope = {
+      version: 1,
+      ownerKey: recoveryOwner,
+      sourceOwnerKey: sourceOwner,
+      snapshots: acceptedReasons.map((reason, index) => ({
+        sequence: index + 1,
+        capturedAt: `2026-07-19T10:04:0${index}.000Z`,
+        reason,
+        serializedReplica: replica(`reason-${index}`),
+      })),
+    };
+
+    expect(
+      parseReplicaRecoveryEnvelope(JSON.stringify(validEnvelope), sourceOwner).snapshots.map(
+        (snapshot) => snapshot.reason,
+      ),
+    ).toEqual(acceptedReasons);
+
+    for (const rejectedReason of [
+      'promotion',
+      'legacy-diverged',
+      'primary-diverged',
+      '',
+      null,
+      1,
+    ]) {
+      const invalidEnvelope = structuredClone(validEnvelope) as {
+        snapshots: Array<{ reason: unknown }>;
+      };
+      invalidEnvelope.snapshots[0]!.reason = rejectedReason;
+      expect(() =>
+        parseReplicaRecoveryEnvelope(JSON.stringify(invalidEnvelope), sourceOwner),
+      ).toThrow(ReplicaRecoveryJournalError);
+    }
+  });
+
   it('rejects invalid capture metadata before writing a journal record', async () => {
     const repository = new MemoryOwnerRepository();
     const journal = new ReplicaRecoveryJournal(repository, () => 'not-an-iso-timestamp');

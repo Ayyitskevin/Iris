@@ -3,7 +3,7 @@ import { Linking, Platform, ScrollView, StyleSheet, Text, View } from 'react-nat
 import { router, useFocusEffect } from 'expo-router';
 import { ApiRequestError, type AgentToken, type BillingStatus } from '@iris/shared';
 import { Button, Card, Field, Muted, RecoveryNotice, Screen, Title } from '../../src/components/ui';
-import { authenticatedRequest } from '../../src/api';
+import { authenticatedFetchForLease, authenticatedRequest } from '../../src/api';
 import { signOut } from '../../src/auth/session';
 import {
   assertCurrentSession,
@@ -155,9 +155,8 @@ export default function Settings() {
     if (actionsBlocked) return;
     try {
       const { lease, value: res } = await authenticatedRequest((api, currentLease) =>
-        fetch(api.exportUrl(), {
+        authenticatedFetchForLease(currentLease, api.exportUrl(), {
           headers: { authorization: 'Bearer ' + currentLease.token },
-          signal: currentLease.signal,
         }).then((response) => {
           if (!response.ok) {
             throw new ApiRequestError(

@@ -73,6 +73,10 @@ function bodyPreview(value: string): string {
   return bounded(value.replace(/\s+/g, ' ').trim(), BODY_PREVIEW_LIMIT);
 }
 
+function provenancePriority(reason: ReplicaRecoveryReason): number {
+  return reason === 'legacy-divergence' || reason === 'primary-divergence' ? 1 : 0;
+}
+
 function canonicalValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalValue);
   if (!value || typeof value !== 'object') return value;
@@ -127,9 +131,11 @@ function summarizeCopy(
  * Compose an owner-local, read-only inventory without assigning semantic recency.
  *
  * Journal sequence describes capture order only. Memory-only candidates have no invented
- * timestamp or sequence. Structurally identical roots may all match the displayed projection,
- * while a byte-distinct displayed root still gets its own card; neither fact means newer,
- * preferred, or more complete.
+ * timestamp or sequence. Distinct reason records for the same exact bytes collapse to one card,
+ * retaining divergence provenance over generic capture reasons and otherwise the latest capture
+ * metadata. That does not treat the root itself as semantically newer. Structurally identical but
+ * byte-distinct roots may all match the displayed projection; neither fact means preferred or
+ * more complete.
  */
 export function buildReplicaRecoveryCatalog(input: {
   sourceOwnerKey: string;
@@ -148,8 +154,17 @@ export function buildReplicaRecoveryCatalog(input: {
   const displayedCanonical = canonicalReplica(displayedSerializedReplica);
   const exactRoots = new Set<string>();
   const copies: ReplicaRecoveryCatalogCopy[] = [];
+  const latestSnapshotByRoot = new Map<string, ReplicaRecoveryEnvelope['snapshots'][number]>();
 
   for (const snapshot of envelope?.snapshots ?? []) {
+    const selected = latestSnapshotByRoot.get(snapshot.serializedReplica);
+    if (!selected || provenancePriority(snapshot.reason) >= provenancePriority(selected.reason)) {
+      latestSnapshotByRoot.set(snapshot.serializedReplica, snapshot);
+    }
+  }
+
+  for (const snapshot of envelope?.snapshots ?? []) {
+    if (latestSnapshotByRoot.get(snapshot.serializedReplica) !== snapshot) continue;
     exactRoots.add(snapshot.serializedReplica);
     copies.push(
       summarizeCopy(
@@ -166,6 +181,8 @@ export function buildReplicaRecoveryCatalog(input: {
       ),
     );
   }
+
+  const journalVerifiedCount = exactRoots.size;
 
   let memoryOnlyCount = 0;
   for (const candidate of pending) {
@@ -206,7 +223,6 @@ export function buildReplicaRecoveryCatalog(input: {
     );
   }
 
-  const journalVerifiedCount = envelope?.snapshots.length ?? 0;
   return Object.freeze({
     sourceOwnerKey,
     inventoryComplete: input.inventoryComplete ?? true,

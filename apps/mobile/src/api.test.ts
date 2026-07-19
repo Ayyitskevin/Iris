@@ -15,7 +15,8 @@ vi.mock('./state/storage', () => ({
   },
 }));
 
-import { apiForLease, authenticatedRequest } from './api';
+import { apiForLease, authenticatedFetchForLease, authenticatedRequest } from './api';
+import * as stateStore from './state/store';
 import { adoptSession, loadState, openSessionLease, store$, type Session } from './state/store';
 
 const sessionA: Session = {
@@ -100,6 +101,28 @@ describe('fixed-token authenticated API boundary', () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch');
 
     await expect(clientA.billingStatus()).rejects.toThrow('Session changed');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves an authority verification failure without dispatching the request', async () => {
+    const verificationError = new Error('Replica authority changed');
+    vi.spyOn(stateStore, 'verifyReplicaAuthorityForLease').mockRejectedValueOnce(verificationError);
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+    await expect(apiForLease(openSessionLease()!).billingStatus()).rejects.toBe(verificationError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('guards a direct authenticated response before dispatching it', async () => {
+    const verificationError = new Error('Replica authority changed before export');
+    vi.spyOn(stateStore, 'verifyReplicaAuthorityForLease').mockRejectedValueOnce(verificationError);
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+    await expect(
+      authenticatedFetchForLease(openSessionLease()!, 'http://localhost:3000/v1/export', {
+        headers: { authorization: 'Bearer fixed-token-A' },
+      }),
+    ).rejects.toBe(verificationError);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

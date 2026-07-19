@@ -825,7 +825,8 @@ slice cannot claim that candidate is crash-durable.
 The journal uses the same owner-repository boundary under a domain-separated synthetic key. Its
 versioned envelope has exact keys, immutable source ownership, monotonically contiguous sequence
 numbers, ISO capture times, a bounded reason vocabulary, and deduplication by exact serialized
-bytes. Embedded snapshots must have the exact current v2 owner-root key set and owner identity;
+bytes plus reason. The same bytes may recur under a distinct reason so a crash cannot erase later
+divergence provenance. Embedded snapshots must have the exact current v2 owner-root key set and owner identity;
 credential-like fields at any nesting level fail closed. The bearer session remains only in
 session storage. Journal writes serialize in process, and independent transactional repository
 instances merge after stale CAS rather than replacing another candidate. The legacy
@@ -853,8 +854,9 @@ ordinary token/device leases are fenced, but it is bound to the exact owner and 
 Catalog reads fence both projection publication and recovery-candidate lifecycle epochs. A
 pending-to-journal transition triggers a bounded coherent-snapshot retry; an owner or displayed
 projection change fails stale. The catalog distinguishes journal-verified, memory-only, and
-displayed-only branches, assigns no semantic recency to capture sequence, and returns bounded note
-previews rather than retaining full serialized roots in UI state. If durable journal reading fails
+displayed-only branches, collapses repeated exact bytes to one card while retaining divergence
+provenance over generic reasons, assigns no semantic recency to capture sequence, and returns
+bounded note previews rather than retaining full serialized roots in UI state. If durable journal reading fails
 while exact memory-only candidates still exist, the UI exposes an explicitly partial inventory
 instead of hiding those candidates. A monotonic UI revision invalidates already-published catalogs;
 the epoch version attached to a completed bundle is rechecked through platform delivery so a long
@@ -863,9 +865,9 @@ share cannot republish stale “shown now” labels.
 The Recovery Center can create a versioned, strict, token-free local JSON bundle. Export first
 flushes only already-staged candidates to the journal and refuses to produce an incomplete
 artifact if that verification fails. It does not save the primary root or call a network client.
-Every journal snapshot retains its exact serialized bytes; the exact displayed root is either
-referenced by its byte-identical journal sequence or embedded separately, even when another root
-is only structurally equal. The completed artifact is reparsed through the strict owner/shape and
+Every journal snapshot and its provenance retains its exact serialized bytes; the exact displayed
+root is either referenced by every byte-identical journal sequence or embedded separately, even
+when another root is only structurally equal. The completed artifact is reparsed through the strict owner/shape and
 semantic-integrity gates before delivery. Web attaches a temporary download anchor and defers Blob
 URL revocation. Native writes and reads back a file in an Iris-only cache directory before opening
 the share sheet; handed-off files are retained for slow receivers, and a later launch/export
@@ -880,13 +882,13 @@ Recovery data and retained local export files duplicate private note content, so
 at-rest policy and eventual local-account erasure must cover primary, synthetic, and Iris-owned
 cache paths.
 
-This is **not** the mixed-version promotion divergence protocol: by itself it cannot stop an
+This ADR is **not** the mixed-version promotion divergence protocol: by itself it cannot stop an
 already-loaded old client from writing the legacy key, elect a browser leader, gate old server
 clients, or prove real browser/native lifecycle behavior. ADR-022 separately supplies
-current-runtime browser leadership. `EXPO_PUBLIC_DURABLE_STORAGE` stays off by default; the
-legacy/primary divergence journal, enforceable compatibility contract, recovery
-resolution/import/discard controls, storage-erasure path, and remaining acceptance evidence are
-still explicit A3 release gates.
+current-runtime browser leadership, and ADR-023 subsequently supplies digest-only divergence
+evidence plus exact branch preservation. `EXPO_PUBLIC_DURABLE_STORAGE` stays off by default;
+enforceable compatibility, recovery resolution/import/discard controls, storage erasure, and
+remaining native acceptance evidence are still explicit A3 release gates.
 
 ---
 
@@ -926,9 +928,85 @@ contract bug: derived Legend-State selectors are now cached so `useSyncExternalS
 stable snapshot until an observed value actually changes.
 
 Web Locks coordinate only tabs running this protocol. They cannot stop an already-loaded old
-runtime from writing the untouched legacy key. This ADR therefore does not flip the default,
-establish a server storage epoch, add the mixed-version divergence journal, resolve recovery
-branches, change `/v1`, or prove native force-quit behavior. Those remain explicit release gates.
+runtime from writing the untouched legacy key. This ADR therefore does not flip the default or
+establish a server storage epoch. ADR-023 subsequently adds the mixed-version divergence journal;
+recovery resolution, `/v1` compatibility, and native force-quit behavior remain explicit release
+gates.
+
+---
+
+## ADR-023 — Digest-only mixed-version authority journal and exact branch preservation
+
+**Accepted behind the default-off durable-storage flag; server compatibility and the production
+cutover remain human-gated.**
+
+An already-loaded legacy runtime cannot honor ADR-022's Web Lock and can still replace the old
+SecureStore/localStorage owner key after a current runtime promotes it. Iris now treats that as an
+observable two-authority condition rather than silently choosing whichever copy it last read. For
+each source owner, the raw transactional backend stores a strict versioned control journal under a
+domain-separated synthetic key. Its immutable baseline and entries contain only absent markers or
+SHA-256 digests of the exact UTF-8 serialized root, prefixed by
+`iris.owner-replica.v2.exact-bytes` plus a NUL separator. Hashes support exact equality; they are
+not encryption and do not replace the private source/recovery stores.
+
+An initial journal begins in `preparing`, resolves to `transactional`, and may enter absorbing
+`diverged`. A promotion first verifies a token-free baseline copy in ADR-021's recovery journal,
+records the intended primary digest, commits the exact legacy bytes, rereads both roots, and only
+then records transactional authority. Fresh commits use the same write-ahead order. A crash before
+the primary write closes at the prior root; a crash after the exact target landed finalizes that
+target. Promotion can retry from unchanged legacy bytes. Disconnected primary lineages, malformed
+or future envelopes, non-contiguous entries, mutable baselines, unknown fields, invalid digests,
+and illegal transitions all fail closed without normalizing a source root.
+
+Routine saves do not grow that control envelope without bound. Once a verified non-diverged
+history exceeds 64 entries, Iris rereads both source roots, verifies there is no unreferenced
+crash-preserved divergence evidence, and CAS-replaces only that completed history with one
+`transactional/checkpoint` anchor carrying the immutable baseline and current primary digest.
+Preparing or diverged history is never compacted. A failed replacement leaves the full valid
+history intact; a competing preparing/diverged writer wins the CAS and is never truncated.
+
+Every authority check rereads both exact roots. Iris checks before publishing leader authority,
+before and after every primary commit, and immediately before each authenticated fetch. Legacy
+drift or an unjournaled primary revision first appends every present valid branch to the strict
+credential-free recovery journal, records the recovery sequence references, then appends a
+diverged control entry and rejects the operation. A later old runtime revision remains within the
+absorbing state but is also preserved as new evidence. If ambiguity blocks an optimistic save
+before its target reaches the primary, the exact local candidate is journaled as a superseded
+local writer too. Control and recovery journals write directly through the raw transactional
+repository; routing them back through the promoter would recursively coordinate synthetic roots.
+Distinct reason provenance is durable even when the exact bytes were already preserved. If a
+crash lands those divergence-labeled recovery records before their control transition and a source
+root later returns to its baseline, the unreferenced evidence still fences authority on restart.
+
+For an already-active projection, the store converts an authority rejection into an owner-scoped
+recovery fence before returning the exact error. It invalidates operation leases, exposes
+`recovery-required`, blocks reducers and sync, and keeps the primary/legacy bytes untouched. The
+API guard reasserts the fixed-token lease around the async authority check and dispatches zero
+fetches when verification rejects, including the direct server-export response path. Followers
+remain observational: they never promote or write journals. A failed leader preparation cannot be
+cleared merely because a read-only primary happens to parse successfully. Initial/reload native
+recovery presentation remains Step 3c lifecycle debt; startup ambiguity currently fails closed
+without claiming the browser's active-session Recovery Center proof.
+
+Deterministic tests cover the strict SHA-256 adapter contract, semantic idempotency independent of
+object key order, stale-CAS retry, owner isolation, real-SQLite promotion, initial branch
+ambiguity, every write/crash boundary, pre/post-commit drift, orphaned divergence evidence,
+shared-repository append races, bounded checkpoint restart/CAS behavior, later legacy revisions,
+malformed control state, optimistic-candidate preservation, and the zero-request store/API fence. The
+production Expo web bundle loads the Expo Crypto chunk, and Playwright runs both the existing
+two-tab leadership journey and a frozen same-origin old-writer fixture that imports no current
+authority code. That fixture changes the exact legacy root after promotion and proves both source
+roots remain exact, recovery contains both branches, the control journal contains no replica or
+credential sentinel, the UI becomes read-only recovery mode, and no later authenticated request
+is sent.
+
+This is detection and preservation, not old-client exclusion. There is still a race after any
+client-side check, and old code can continue writing its own key. `EXPO_PUBLIC_DURABLE_STORAGE`
+therefore remains off by default. Production requires a separately approved and implemented
+server storage epoch, upgrade-required response, or other enforceable old-client invalidation
+contract, plus recovery resolution, web/native lifecycle acceptance, at-rest policy, and local
+erasure coverage. This ADR does not choose a branch, merge, restore, import, discard, change the
+`/v1` coordinator, or flip authority.
 
 ---
 

@@ -17,8 +17,9 @@ Read order for a new session: [`VISION.md`](VISION.md) → [`DECISIONS.md`](DECI
 **Verified locally on 2026-07-19:**
 
 - Current worktree: API **155 tests pass / 2 skipped locally** (the real-Postgres gates run in
-  CI), mobile **332 tests pass**, and the production-bundle two-tab Chromium authority test passes.
-  Typecheck, lint, changed-file formatting, and isolated web/Android/iOS Metro exports pass. The
+  CI), mobile **365 tests pass**, and the production-bundle Chromium authority journeys pass for
+  both current-runtime leadership and frozen-old-writer divergence. Typecheck, changed-file lint
+  and formatting, and isolated web/Android/iOS Metro exports pass. The
   workflow adds a dedicated browser job to frozen install, typecheck, lint, both test suites with
   PostgreSQL 16, and web export. Expo's dependency compatibility check remains red on the
   pre-existing Expo/React/TypeScript cohort; SDK alignment remains a separate release-health slice.
@@ -45,10 +46,13 @@ and preserves unreadable winners while allowing safe session departure. An owner
 Center now inventories durable, memory-only, and distinct displayed roots and creates a strict
 local exact-byte export on web/native without a server request; it cannot choose, restore, import,
 merge, or discard a root. A default-off owner-scoped Web Lock now coordinates current-runtime
-browser tabs, with read-only followers and metadata-only refresh. Cross-version promotion still
-leaves the legacy copy writable; client-only code cannot prevent an already-loaded old tab from
-writing it, and there is no mixed-version divergence journal, enforceable compatibility gate,
-or v2 pull applier.
+browser tabs, with read-only followers and metadata-only refresh. ADR-023 adds a default-off,
+digest-only mixed-version authority journal: it verifies the immutable legacy baseline around
+promotion/commits and every authenticated fetch, preserves exact diverged branches, and fences an
+active projection into read-only recovery before another request. Client-only code still cannot
+prevent an already-loaded old tab from writing its legacy key; initial native reload recovery
+presentation, an enforceable compatibility gate, the recovery resolution lifecycle, and the v2
+pull applier remain open.
 
 **Still missing for release:** deploy/infra configuration, migration-on-deploy and
 observability; account-deletion mobile UX, export-first confirmation, privacy policy, local
@@ -64,12 +68,12 @@ assets. Stripe remains fake outside explicitly configured test/live credentials.
 **You cannot ship to the App Store / Play Store until four blockers are closed.** They
 are independent of feature count and independent of the Sync v2 machinery being clever:
 
-| #       | Blocker                                   | Why it blocks launch                                                                                                                                                                                                                                                                                                                                                                            | Evidence                                                                                                                                                                          |
-| ------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **B-1** | **Durable-authority cutover**             | SQLite/IndexedDB primitives and current-runtime web leadership exist, but authority defaults to the legacy size-limited blob. Promotion leaves that legacy copy writable to old tabs/versions; client-only code can detect but cannot prevent old-client writes. There is no mixed-version divergence journal, server compatibility fence, recovery-resolution lifecycle, or device acceptance. | `promoting-replica-repository.ts`; `select-owner-replica-repository.ts`; A3b/c                                                                                                    |
-| **B-2** | **Deploy + secrets + observability**      | There is no staging/deploy path, migration-on-deploy contract, readiness signal, or error telemetry. Production can still select PGlite, accept a weak JWT value, and retain the development Stripe price id.                                                                                                                                                                                   | no Docker/Fly/Render config; no Sentry/otel; `index.ts`; `env.ts`                                                                                                                 |
-| **B-3** | **Safe account erasure + privacy UX**     | The API erase route exists, but Stripe cancellation failure is swallowed before its only reconciliation identifiers are deleted. Mobile has no export-first deletion flow, privacy policy/link, or local-replica erasure.                                                                                                                                                                       | `services/account.ts`; `settings.tsx`; no `docs/PRIVACY.md`                                                                                                                       |
-| **B-4** | **Store billing/distribution compliance** | Native settings opens Stripe Checkout to unlock paid cloud sync. Apple and Google generally require approved billing paths for in-app digital functionality, subject to storefront and enrolled-program exceptions. Human/legal approval must choose StoreKit/Play Billing, an eligible alternative-billing/link program, or a consumption-only model.                                          | `settings.tsx`; [Apple §3.1](https://developer.apple.com/app-store/review/guidelines/); [Google Payments](https://support.google.com/googleplay/android-developer/answer/9858738) |
+| #       | Blocker                                   | Why it blocks launch                                                                                                                                                                                                                                                                                                                                   | Evidence                                                                                                                                                                          |
+| ------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **B-1** | **Durable-authority cutover**             | SQLite/IndexedDB, current-runtime leadership, and exact mixed-version divergence preservation exist default-off. Client-only checks cannot exclude an already-loaded old version, so production still lacks an enforceable server compatibility fence, recovery-resolution lifecycle, and browser/native device acceptance.                            | ADR-023; `promoting-replica-repository.ts`; A3b/c                                                                                                                                 |
+| **B-2** | **Deploy + secrets + observability**      | There is no staging/deploy path, migration-on-deploy contract, readiness signal, or error telemetry. Production can still select PGlite, accept a weak JWT value, and retain the development Stripe price id.                                                                                                                                          | no Docker/Fly/Render config; no Sentry/otel; `index.ts`; `env.ts`                                                                                                                 |
+| **B-3** | **Safe account erasure + privacy UX**     | The API erase route exists, but Stripe cancellation failure is swallowed before its only reconciliation identifiers are deleted. Mobile has no export-first deletion flow, privacy policy/link, or local-replica erasure.                                                                                                                              | `services/account.ts`; `settings.tsx`; no `docs/PRIVACY.md`                                                                                                                       |
+| **B-4** | **Store billing/distribution compliance** | Native settings opens Stripe Checkout to unlock paid cloud sync. Apple and Google generally require approved billing paths for in-app digital functionality, subject to storefront and enrolled-program exceptions. Human/legal approval must choose StoreKit/Play Billing, an eligible alternative-billing/link program, or a consumption-only model. | `settings.tsx`; [Apple §3.1](https://developer.apple.com/app-store/review/guidelines/); [Google Payments](https://support.google.com/googleplay/android-developer/answer/9858738) |
 
 Everything else in this plan is either **launch-hardening** (should land right around
 launch) or **post-launch product**. Do not let the impressive Sync v2 backlog reorder these.
@@ -133,13 +137,10 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
   change in the repo, so it is broken into fenced steps, each shipped tested:
   - **Step 1 — storage-backend migration primitive. ✅ SHIPPED AS A FOUNDATION ONLY.**
     `PromotingOwnerReplicaRepository` copies an existing key/value replica into the
-    transactional store on first read. It retries transient failures and adopts a concurrent
-    promotion winner; tests cover SQLite and a fenced fake. **Blocking audit finding:** this is
-    copy-on-first-read, not a mixed-version fence. The legacy key remains writable, so an old
-    tab/binary can keep syncing and strand edits after the new runtime reads only the primary.
-    A new client can detect and preserve that divergence; it cannot prevent an already-loaded
-    old client from writing. Production cutover therefore also needs an enforceable compatibility
-    gate or explicit old-client invalidation.
+    transactional store on first read. ADR-023 now wraps that copy in a strict digest-only
+    write-ahead protocol and exact branch preservation. The legacy key remains writable, so this
+    detects and contains an old tab/binary rather than pretending to stop it. Production cutover
+    still needs an enforceable compatibility gate or explicit old-client invalidation.
   - **Step 2 — make `store.ts` fence-aware. ✅ SHIPPED; CAS + RECOVERY ORDERING CORRECTED.**
     Stale recovery is single-flight per owner and fences synchronously before another reducer can
     run. Before the authoritative read may publish anything, every exact losing v2 root—including
@@ -179,19 +180,22 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
       export pass. **Do not treat the flag as cutover-safe yet:** correct stale-CAS handling does
       not solve the two-writable-authorities window in Step 1. Enable it only in controlled test
       channels; flipping the default remains Step 3c.
-    - **Step 3b — mixed-version divergence + compatibility contract. IN PROGRESS.**
+    - **Step 3b — mixed-version divergence + compatibility contract. CLIENT HALF SHIPPED
+      DEFAULT-OFF (ADR-023); SERVER CONTRACT HUMAN-GATED.**
       **Current-runtime leadership is shipped as A2/ADR-022:** one owner-scoped Web Lock grants
       write/sync authority, followers are read-only and refresh from metadata-only notices, and
-      missing startup capabilities select legacy. The remaining mixed-version half needs a digest-only,
-      crash-recoverable journal recording preparing/transactional/diverged state and checking the
-      immutable legacy baseline before and after primary commits and before sync. Legacy drift must
-      enter `diverged`, preserve both exact roots, reject writes/network, and surface those roots in
-      the Recovery Center; it must not pretend to lock old code.
-      _Remaining DoD:_ Playwright covers every promotion crash boundary and a frozen old-writer
-      fixture that changes legacy after promotion and proves no later request is sent. Before
-      production default-on, approve and implement an enforceable server
+      missing startup capabilities select legacy. The new owner-scoped control journal records
+      legal preparing/transactional/diverged transitions using exact domain-separated digests.
+      It preserves valid source branches in the raw transactional recovery journal, fences
+      writes/network before another fetch, retains later old-runtime evidence, and exposes
+      recovery-required without choosing a winner. Verified non-diverged commit history compacts
+      to a CAS-safe transactional checkpoint after 64 entries; preparing/diverged evidence is
+      retained. Unit tests cover crash boundaries and real SQLite; a production-bundle frozen old-writer browser fixture proves exact preservation,
+      digest-only control state, disabled UI, and zero post-drift requests.
+      _Remaining DoD:_ before production default-on, approve and implement an enforceable server
       storage-epoch/upgrade-required contract or another explicit old-client invalidation scheme;
-      this protocol/schema decision is human-gated.
+      this protocol/schema decision is human-gated. Recovery choose/restore/import/discard and
+      browser/native lifecycle acceptance remain Step 3c.
     - **Step 3c — controlled device acceptance, then default-on and Sync v2 cutover.**
       Prove recovery UX, web reload, native force-quit/reopen, A→B switching, storage exhaustion,
       SQLite at-rest policy, and unsupported-platform behavior. Only after those gates and the
@@ -304,12 +308,11 @@ portable export. All ride the **generic sync resource envelope** already built i
 Do not enable transactional authority or wire Sync v2 merely because the primitives exist.
 Each slice must leave a rollback point and prove the exact transition it claims.
 
-1. **Mixed-version divergence journal + compatibility contract.** Current-runtime cross-tab
-   leadership is shipped under the default-off flag. Add a digest-only, crash-recoverable journal
-   and fail-closed legacy-drift detection around promotion and primary commits. A frozen old-writer browser
-   fixture must preserve both roots and prove no later request is sent. Because client-only code
-   cannot stop that old writer, approve an enforceable server storage epoch/upgrade response or
-   another explicit invalidation mechanism before production cutover.
+1. **Approve the enforceable old-client compatibility contract.** ADR-023's default-off client
+   journal now detects and preserves legacy/primary divergence and the frozen old-writer browser
+   gate proves no request follows detection. Client-only code still cannot stop that writer.
+   Human-review and implement a server storage epoch/upgrade response or another explicit
+   invalidation mechanism before production cutover.
 2. **Transactional authority acceptance + recovery UX.** Enable the flag only in test channels
    while retaining the v1 coordinator. Integrate diverged/quarantined roots into the Recovery
    Center and add choose/restore/import/discard handling, then prove web reload, native force-quit/reopen, A→B switching,
@@ -343,7 +346,7 @@ the current CAS diff. Closed findings stay visible so regressions do not re-ente
 
 | Sev         | State       | Finding                                                                                             | Evidence                            | Next          |
 | ----------- | ----------- | --------------------------------------------------------------------------------------------------- | ----------------------------------- | ------------- |
-| **blocker** | open        | Client-only promotion cannot stop an already-loaded old legacy writer                               | `promoting-replica-repository.ts`   | A3b           |
+| **blocker** | human-gated | Client detection cannot exclude an already-loaded old legacy writer; server compatibility is open   | ADR-023; compatibility decision     | A3b           |
 | high        | human-gated | Stripe cancel failure is swallowed before account identifiers are erased                            | `services/account.ts`               | A5            |
 | high        | human-gated | Native Stripe Checkout lacks an approved App Store/Play commerce model                              | `settings.tsx`; store policies      | A5b/B10       |
 | high        | open        | Production may select PGlite, weak JWT text, or the dev Stripe price id                             | `index.ts`, `env.ts`                | A4/B10        |
@@ -357,9 +360,10 @@ the current CAS diff. Closed findings stay visible so regressions do not re-ente
 | low         | open        | `Math.random` remains a UUID/device-id fallback                                                     | `manager.ts`, `store.ts`            | B12           |
 
 **Verification debt:** real PostgreSQL tests run only in CI; most IndexedDB contract tests use
-`fake-indexeddb`; SQLite tests use Node SQLite. A production-bundle, two-tab Chromium test now
-proves current-runtime leadership and transfer, but frozen-old-writer divergence and iOS/Android
-force-quit/reopen evidence do not exist. Treat that remainder as release debt, not a passing footnote.
+`fake-indexeddb`; SQLite tests use Node SQLite. Production-bundle Chromium now proves both
+current-runtime leadership/transfer and frozen-old-writer divergence with zero later request.
+iOS/Android force-quit/reopen and recovery-resolution evidence do not exist. Treat that remainder
+as release debt, not a passing footnote.
 
 ---
 

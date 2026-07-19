@@ -22,7 +22,13 @@ const RECOVERY_REPLICA_KEYS = [
   'workspaceId',
 ] as const;
 
-export type ReplicaRecoveryReason = 'stale-writer' | 'session-departure' | 'session-rejected';
+export type ReplicaRecoveryReason =
+  | 'stale-writer'
+  | 'session-departure'
+  | 'session-rejected'
+  | 'promotion-baseline'
+  | 'legacy-divergence'
+  | 'primary-divergence';
 
 export interface ReplicaRecoverySnapshot {
   sequence: number;
@@ -45,6 +51,17 @@ export class ReplicaRecoveryJournalError extends Error {
   }
 }
 
+const repositoryAppendQueues = new WeakMap<OwnerReplicaRepository, Map<string, Promise<void>>>();
+
+function appendQueueFor(repository: OwnerReplicaRepository): Map<string, Promise<void>> {
+  let queue = repositoryAppendQueues.get(repository);
+  if (!queue) {
+    queue = new Map();
+    repositoryAppendQueues.set(repository, queue);
+  }
+  return queue;
+}
+
 /**
  * Domain-separate recovery records from UUID.UUID replica owners.
  *
@@ -64,7 +81,14 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
 }
 
 function isRecoveryReason(value: unknown): value is ReplicaRecoveryReason {
-  return value === 'stale-writer' || value === 'session-departure' || value === 'session-rejected';
+  return (
+    value === 'stale-writer' ||
+    value === 'session-departure' ||
+    value === 'session-rejected' ||
+    value === 'promotion-baseline' ||
+    value === 'legacy-divergence' ||
+    value === 'primary-divergence'
+  );
 }
 
 const RECOVERY_CREDENTIAL_FIELD_NAMES = new Set([
@@ -294,7 +318,7 @@ export function parseReplicaRecoveryEnvelope(
     throw new ReplicaRecoveryJournalError('Recovery journal ownership or shape is invalid');
   }
 
-  const seen = new Set<string>();
+  const seenReasonsByRoot = new Map<string, Set<ReplicaRecoveryReason>>();
   const snapshots = value.snapshots.map((candidate, index): ReplicaRecoverySnapshot => {
     if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
       throw new ReplicaRecoveryJournalError('Recovery journal snapshot is invalid');
@@ -312,14 +336,20 @@ export function parseReplicaRecoveryEnvelope(
       throw new ReplicaRecoveryJournalError('Recovery journal snapshot metadata is invalid');
     }
     assertReplicaRecoverySnapshot(sourceOwnerKey, snapshot.serializedReplica);
-    if (seen.has(snapshot.serializedReplica)) {
-      throw new ReplicaRecoveryJournalError('Recovery journal contains a duplicate snapshot');
+    const reason = snapshot.reason as ReplicaRecoveryReason;
+    let seenReasons = seenReasonsByRoot.get(snapshot.serializedReplica);
+    if (!seenReasons) {
+      seenReasons = new Set();
+      seenReasonsByRoot.set(snapshot.serializedReplica, seenReasons);
     }
-    seen.add(snapshot.serializedReplica);
+    if (seenReasons.has(reason)) {
+      throw new ReplicaRecoveryJournalError('Recovery journal contains duplicate root provenance');
+    }
+    seenReasons.add(reason);
     return {
       sequence: snapshot.sequence,
       capturedAt: snapshot.capturedAt,
-      reason: snapshot.reason,
+      reason,
       serializedReplica: snapshot.serializedReplica,
     };
   });
@@ -335,18 +365,20 @@ export function parseReplicaRecoveryEnvelope(
 /**
  * Append-only token-free recovery snapshots behind the same verified owner repository.
  *
- * The queue prevents this process from replacing a newer local append. Independent
- * transactional repository instances may still race; a stale CAS rereads, unions by exact
- * snapshot bytes, and retries without dropping either candidate.
+ * The repository-identity queue prevents separate journal clients in this process from replacing
+ * a newer local append. Independent transactional repository instances may still race; a stale
+ * CAS rereads, unions by exact root + reason provenance, and retries without dropping evidence.
  */
 export class ReplicaRecoveryJournal {
-  private readonly pending = new Map<string, Promise<void>>();
+  private readonly pending: Map<string, Promise<void>>;
 
   constructor(
     private readonly repository: OwnerReplicaRepository,
     private readonly now: () => string = () => new Date().toISOString(),
     private readonly maxAttempts = 8,
-  ) {}
+  ) {
+    this.pending = appendQueueFor(repository);
+  }
 
   read(sourceOwnerKey: string): Promise<ReplicaRecoveryEnvelope | null> {
     const pending = this.pending.get(sourceOwnerKey) ?? Promise.resolve();
@@ -398,7 +430,12 @@ export class ReplicaRecoveryJournal {
     const recoveryOwnerKey = replicaRecoveryJournalOwnerKey(sourceOwnerKey);
     for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
       const current = await this.readDirect(sourceOwnerKey);
-      if (current?.snapshots.some((snapshot) => snapshot.serializedReplica === serializedReplica)) {
+      if (
+        current?.snapshots.some(
+          (snapshot) =>
+            snapshot.serializedReplica === serializedReplica && snapshot.reason === reason,
+        )
+      ) {
         return current;
       }
 

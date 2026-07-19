@@ -164,10 +164,17 @@ commit/sync authority. Other current-runtime tabs are visibly read-only, make no
 reread durable state after exact metadata-only BroadcastChannel notices; a production-bundle
 two-tab Chromium gate proves transfer with pending work intact. Capabilities absent during startup
 selection choose the exact legacy adapter; a later authority failure instead pauses fail-closed.
-The flag is still not cutover-safe or default-on: client-only code cannot stop an
-already-loaded old tab/version from writing the legacy copy. Mixed-version divergence detection,
-an enforceable server compatibility gate, recovery choose/restore/import/discard controls, the v2
-pull applier, at-rest policy, and frozen-old-runtime/native acceptance remain open. See
+ADR-023 now wraps promotion and primary saves in a strict digest-only authority journal. It
+rechecks the immutable exact legacy baseline around each commit and immediately before every
+authenticated fetch; drift preserves valid primary, legacy, and optimistic branches in the
+token-free Recovery Center journal, invalidates active leases, and sends no later request. A
+CAS-safe transactional checkpoint bounds routine completed control history after 64 entries while
+retaining preparing/diverged evidence. A production-bundle frozen old-writer Chromium journey
+proves that containment without importing current lock code. The flag is still not cutover-safe or default-on: client-only code detects but
+cannot stop an already-loaded old tab/version from writing the legacy copy. An enforceable
+human-approved server compatibility gate, recovery choose/restore/import/discard controls, the v2
+pull applier, at-rest policy, and native lifecycle acceptance—including initial reload recovery
+presentation—remain open. See
 `docs/MASTER_PLAN.md` for the ordered release gates.
 GitHub Actions run `29506816638` passed the PostgreSQL 16
 independent-connection commit-order and concurrent device-gate gate for commit
