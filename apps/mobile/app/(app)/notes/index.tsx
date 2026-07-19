@@ -6,6 +6,7 @@ import { Button, Muted, RecoveryNotice, Screen } from '../../../src/components/u
 import { useObs } from '../../../src/state/hooks';
 import {
   assertCurrentSession,
+  replicaMutationsBlocked,
   selectTags,
   selectVisibleNotes,
   store$,
@@ -19,6 +20,8 @@ export default function NotesList() {
   const tags = useObs(selectTags);
   const status = useObs(() => store$.status.get());
   const recoveryRequired = status === 'recovery-required';
+  const authorityBlocked = useObs(replicaMutationsBlocked);
+  const actionsBlocked = recoveryRequired || authorityBlocked;
   const gated = useObs(() => store$.syncGated.get());
   const pending = useObs(() => store$.outbox.get().length);
   const syncIssue = useObs(() => store$.syncIssue.get());
@@ -73,13 +76,13 @@ export default function NotesList() {
       : allNotes;
 
   function onNew() {
-    if (recoveryRequired) return;
+    if (actionsBlocked) return;
     const note = createNoteLocal({ title: '', bodyMd: '', tags: activeTag ? [activeTag] : [] });
     router.push(`/notes/${note.id}`);
   }
 
   async function onRecoverSync() {
-    if (recoveryRequired) return;
+    if (actionsBlocked) return;
     setRecoveringSync(true);
     try {
       await recoverSyncIssue();
@@ -95,17 +98,19 @@ export default function NotesList() {
         <Text style={styles.sync}>
           {recoveryRequired
             ? 'local recovery required'
-            : gated
-              ? '🔒 sync gated'
-              : status === 'syncing'
-                ? 'syncing…'
-                : status === 'offline'
-                  ? 'offline'
-                  : status === 'error'
-                    ? 'sync error'
-                    : status === 'auth-required'
-                      ? 'sign in required'
-                      : 'synced'}
+            : authorityBlocked
+              ? 'view only'
+              : gated
+                ? '🔒 sync gated'
+                : status === 'syncing'
+                  ? 'syncing…'
+                  : status === 'offline'
+                    ? 'offline'
+                    : status === 'error'
+                      ? 'sync error'
+                      : status === 'auth-required'
+                        ? 'sign in required'
+                        : 'synced'}
           {pending > 0 ? ` · ${pending} pending` : ''}
           {conflicts.size > 0 ? ` · ${conflicts.size} conflicts` : ''}
         </Text>
@@ -164,12 +169,12 @@ export default function NotesList() {
             onPress={() => void onRecoverSync()}
             variant="ghost"
             loading={recoveringSync}
-            disabled={recoveryRequired}
+            disabled={actionsBlocked}
           />
         </View>
       ) : null}
 
-      {gated && !recoveryRequired ? (
+      {gated && !actionsBlocked ? (
         <Text style={styles.gateBanner}>
           You&apos;re editing locally. Subscribe to Iris Sync (Settings) to sync this device.
         </Text>
@@ -211,7 +216,7 @@ export default function NotesList() {
       />
 
       <View style={styles.footer}>
-        <Button label="＋ New note" onPress={onNew} disabled={recoveryRequired} />
+        <Button label="＋ New note" onPress={onNew} disabled={actionsBlocked} />
       </View>
     </Screen>
   );

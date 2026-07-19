@@ -11,6 +11,7 @@ import {
   openRecoveryInspectionLease,
   readReplicaRecoveryCatalogForLease,
   recoveryCatalogRevision$,
+  replicaMutationsBlocked,
   store$,
 } from '../../src/state/store';
 import { useObs } from '../../src/state/hooks';
@@ -20,6 +21,8 @@ export default function Settings() {
   const email = useObs(() => store$.session.get()?.email ?? '');
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
   const recoveryRequired = useObs(() => store$.status.get() === 'recovery-required');
+  const authorityBlocked = useObs(replicaMutationsBlocked);
+  const actionsBlocked = recoveryRequired || authorityBlocked;
   const recoveryCatalogRevision = useObs(() => recoveryCatalogRevision$.get());
   const [billing, setBilling] = useState<BillingStatus | null>(null);
   const [tokens, setTokens] = useState<AgentToken[]>([]);
@@ -48,7 +51,7 @@ export default function Settings() {
   }, [ownerKey]);
 
   const load = useCallback(async () => {
-    if (recoveryRequired) {
+    if (actionsBlocked) {
       setBilling(null);
       setTokens([]);
       return;
@@ -64,7 +67,7 @@ export default function Settings() {
     } catch {
       // offline
     }
-  }, [ownerKey, recoveryRequired]);
+  }, [ownerKey, actionsBlocked]);
 
   const loadRecovery = useCallback(async () => {
     const request = ++recoveryRequest.current;
@@ -108,7 +111,7 @@ export default function Settings() {
   );
 
   async function subscribe() {
-    if (recoveryRequired) return;
+    if (actionsBlocked) return;
     try {
       const { lease, value } = await authenticatedRequest((api) => api.createCheckout());
       assertCurrentSession(lease);
@@ -120,7 +123,7 @@ export default function Settings() {
   }
 
   async function issueToken() {
-    if (recoveryRequired) return;
+    if (actionsBlocked) return;
     try {
       const { lease, value } = await authenticatedRequest((api) =>
         api.issueAgentToken({
@@ -138,7 +141,7 @@ export default function Settings() {
   }
 
   async function revoke(id: string) {
-    if (recoveryRequired) return;
+    if (actionsBlocked) return;
     try {
       const { lease } = await authenticatedRequest((api) => api.revokeAgentToken(id));
       assertCurrentSession(lease);
@@ -149,7 +152,7 @@ export default function Settings() {
   }
 
   async function exportData() {
-    if (recoveryRequired) return;
+    if (actionsBlocked) return;
     try {
       const { lease, value: res } = await authenticatedRequest((api, currentLease) =>
         fetch(api.exportUrl(), {
@@ -194,8 +197,12 @@ export default function Settings() {
 
         <Card style={{ marginTop: theme.space(4) }}>
           <Text style={styles.cardTitle}>Sync plan</Text>
-          {recoveryRequired ? (
-            <Muted>Billing and device sync are unavailable while local recovery is active.</Muted>
+          {actionsBlocked ? (
+            <Muted>
+              {authorityBlocked
+                ? 'Billing and device sync controls are available only in the active Iris tab.'
+                : 'Billing and device sync are unavailable while local recovery is active.'}
+            </Muted>
           ) : billing ? (
             <>
               <Text style={styles.line}>
@@ -213,7 +220,7 @@ export default function Settings() {
                   <Button
                     label="Subscribe to Iris Sync"
                     onPress={subscribe}
-                    disabled={recoveryRequired}
+                    disabled={actionsBlocked}
                   />
                 </>
               ) : (
@@ -233,13 +240,13 @@ export default function Settings() {
             placeholder="Agent name (e.g. Researcher)"
             value={newAgentName}
             onChangeText={setNewAgentName}
-            editable={!recoveryRequired}
+            editable={!actionsBlocked}
           />
           <Button
             label="Issue agent token"
             variant="ghost"
             onPress={issueToken}
-            disabled={recoveryRequired}
+            disabled={actionsBlocked}
           />
           {issuedToken ? (
             <View style={styles.tokenBox}>
@@ -250,12 +257,16 @@ export default function Settings() {
             </View>
           ) : null}
           <View style={{ height: theme.space(2) }} />
-          {recoveryRequired ? (
-            <Muted>Agent status and controls are paused during local recovery.</Muted>
+          {actionsBlocked ? (
+            <Muted>
+              {authorityBlocked
+                ? 'Agent status and controls are available only in the active Iris tab.'
+                : 'Agent status and controls are paused during local recovery.'}
+            </Muted>
           ) : tokens.length === 0 ? (
             <Muted>No agents yet.</Muted>
           ) : null}
-          {!recoveryRequired
+          {!actionsBlocked
             ? tokens.map((t) => (
                 <View key={t.id} style={styles.tokenRow}>
                   <View style={{ flex: 1 }}>
@@ -269,7 +280,7 @@ export default function Settings() {
                       label="Revoke"
                       variant="danger"
                       onPress={() => revoke(t.id)}
-                      disabled={recoveryRequired}
+                      disabled={actionsBlocked}
                     />
                   ) : null}
                 </View>
@@ -322,7 +333,7 @@ export default function Settings() {
             label="Export server workspace (.zip)"
             variant="ghost"
             onPress={exportData}
-            disabled={recoveryRequired}
+            disabled={actionsBlocked}
           />
           {Platform.OS !== 'web' ? (
             <Muted>On device, server export sharing remains a follow-up.</Muted>
@@ -338,7 +349,9 @@ export default function Settings() {
           label="Sign out"
           variant="danger"
           loading={signingOut}
+          disabled={authorityBlocked}
           onPress={async () => {
+            if (authorityBlocked) return;
             setSigningOut(true);
             setSignOutError(false);
             try {

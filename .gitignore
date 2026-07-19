@@ -19,6 +19,9 @@ build/
 .expo/
 .expo-shared/
 web-build/
+apps/mobile/dist-browser/
+playwright-report/
+test-results/
 *.jks
 *.p8
 *.p12

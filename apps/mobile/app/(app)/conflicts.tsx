@@ -3,7 +3,7 @@ import { router } from 'expo-router';
 import type { SyncMutation } from '@iris/shared';
 import { Button, Card, Muted, RecoveryNotice, Screen, Title } from '../../src/components/ui';
 import { useObs } from '../../src/state/hooks';
-import { store$ } from '../../src/state/store';
+import { replicaMutationsBlocked, store$ } from '../../src/state/store';
 import { keepLocalConflict, useServerConflict } from '../../src/sync/manager';
 import { conflictResolutionLabels } from '../../src/history-safety';
 import { theme } from '../../src/theme';
@@ -17,6 +17,8 @@ export default function ConflictInbox() {
   const conflictMap = useObs(() => store$.conflicts.get());
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
   const recoveryRequired = useObs(() => store$.status.get() === 'recovery-required');
+  const authorityBlocked = useObs(replicaMutationsBlocked);
+  const actionsBlocked = recoveryRequired || authorityBlocked;
   const conflicts = Object.values(conflictMap).sort((a, b) =>
     a.detectedAt < b.detectedAt ? 1 : -1,
   );
@@ -87,9 +89,9 @@ export default function ConflictInbox() {
 
               <Button
                 label={labels.keepLocal}
-                disabled={recoveryRequired}
+                disabled={actionsBlocked}
                 onPress={() => {
-                  if (ownerKey && !recoveryRequired) {
+                  if (ownerKey && !actionsBlocked) {
                     void keepLocalConflict(ownerKey, item.noteId, item.localMutation.opId);
                   }
                 }}
@@ -97,9 +99,9 @@ export default function ConflictInbox() {
               <Button
                 label={labels.useServer}
                 variant="ghost"
-                disabled={recoveryRequired}
+                disabled={actionsBlocked}
                 onPress={() => {
-                  if (ownerKey && !recoveryRequired) {
+                  if (ownerKey && !actionsBlocked) {
                     void useServerConflict(ownerKey, item.noteId, item.localMutation.opId);
                   }
                 }}

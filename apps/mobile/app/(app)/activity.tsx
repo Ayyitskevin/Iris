@@ -13,7 +13,12 @@ import {
   undoResultNotice,
 } from '../../src/history-safety';
 import { useObs } from '../../src/state/hooks';
-import { assertCurrentSession, store$, updateReplicaForLease } from '../../src/state/store';
+import {
+  assertCurrentSession,
+  replicaMutationsBlocked,
+  store$,
+  updateReplicaForLease,
+} from '../../src/state/store';
 import { sync } from '../../src/sync/manager';
 import { theme } from '../../src/theme';
 
@@ -28,6 +33,8 @@ const ACTION_LABEL: Record<string, string> = {
 export default function Activity() {
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
   const recoveryRequired = useObs(() => store$.status.get() === 'recovery-required');
+  const authorityBlocked = useObs(replicaMutationsBlocked);
+  const actionsBlocked = recoveryRequired || authorityBlocked;
   const outbox = useObs(() => store$.outbox.get());
   const pendingPush = useObs(() => store$.pendingPush.get());
   const conflictMap = useObs(() => store$.conflicts.get());
@@ -52,16 +59,16 @@ export default function Activity() {
   }, [ownerKey]);
 
   useEffect(() => {
-    if (!recoveryRequired) return;
+    if (!actionsBlocked) return;
     loadRequestRef.current += 1;
     undoRequestRef.current += 1;
     setLoading(false);
     setUndoProtocolVersion(null);
     setUndoingId(null);
-  }, [recoveryRequired]);
+  }, [actionsBlocked]);
 
   const load = useCallback(async () => {
-    if (recoveryRequired) {
+    if (actionsBlocked) {
       setLoading(false);
       return;
     }
@@ -112,7 +119,7 @@ export default function Activity() {
         setLoading(false);
       }
     }
-  }, [ownerKey, recoveryRequired]);
+  }, [ownerKey, actionsBlocked]);
 
   useFocusEffect(
     useCallback(() => {
@@ -122,7 +129,7 @@ export default function Activity() {
 
   async function undo(entry: ActivityEntry) {
     if (
-      recoveryRequired ||
+      actionsBlocked ||
       undoProtocolVersion !== UNDO_PROTOCOL_VERSION ||
       loading ||
       undoingId ||
@@ -252,14 +259,16 @@ export default function Activity() {
             refreshing={loading}
             onRefresh={load}
             tintColor={theme.colors.accent}
-            enabled={!recoveryRequired}
+            enabled={!actionsBlocked}
           />
         }
         ItemSeparatorComponent={() => <View style={{ height: theme.space(2) }} />}
         ListEmptyComponent={
           <Muted>
-            {recoveryRequired
-              ? 'Activity refresh is paused during local recovery.'
+            {actionsBlocked
+              ? authorityBlocked
+                ? 'Activity is view-only while another tab holds local authority.'
+                : 'Activity refresh is paused during local recovery.'
               : loading
                 ? 'Loading activity…'
                 : loadError
@@ -298,7 +307,7 @@ export default function Activity() {
                   variant="ghost"
                   loading={undoingId === item.id}
                   disabled={
-                    recoveryRequired ||
+                    actionsBlocked ||
                     loading ||
                     pendingForNote ||
                     undoProtocolVersion !== UNDO_PROTOCOL_VERSION ||

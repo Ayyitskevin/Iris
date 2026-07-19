@@ -207,18 +207,19 @@ null`; route keys include the owner so component state cannot survive an account
     **no static `react-native` import**, so it loads under vitest/tsc.
   - **The flip is gated by `EXPO_PUBLIC_DURABLE_STORAGE` (default off).** Off — or a platform
     with no transactional store — returns the legacy `SerializedKvReplicaRepository` unchanged.
-    Set it to `1`/`true` only in controlled device/browser tests. It is **not cutover-safe**:
-    the promoter leaves legacy writable, and an already-loaded old client cannot honor a new
-    marker or Web Lock even though the current store handles stale CAS correctly.
+    Set it to `1`/`true` only in controlled device/browser tests. On capable web runtimes the
+    selector also installs one owner-scoped Web Lock authority: followers are read-only, receive
+    exact metadata-only refresh notices, and reread before takeover. It is **not cutover-safe**:
+    the promoter leaves legacy writable, and an already-loaded old client cannot honor the lock
+    even though current-runtime tabs and stale CAS are fenced correctly.
   - **`expo-sqlite` is native-only in the bundle:** the opener is platform-split
     (`open-expo-sqlite-store.native.ts` real vs `open-expo-sqlite-store.ts` stub) so Metro never
     pulls `expo-sqlite` into the **web** bundle. If you add another native-only dependency to the
     replica path, split it the same way and re-run `pnpm --filter @iris/mobile run export:web`.
     The recovery sink follows the same split so `expo-file-system` and `expo-sharing` stay on
     native while the base file remains the browser implementation.
-  - Remaining CUTOVER: add a mixed-version legacy/primary divergence journal, one Web Lock
-    leader with read-only followers, metadata-only refresh, an enforceable old-client
-    compatibility gate, integrate divergence roots into Recovery Center, add
+  - Remaining CUTOVER: add a mixed-version legacy/primary divergence journal and an enforceable
+    old-client compatibility gate, integrate divergence roots into Recovery Center, add
     choose/restore/import/discard controls, and complete browser/native acceptance.
     Only then flip the default and port the coordinator to `/v2`.
     Writes are verified and non-fence failures set `error`; staging failure prevents dispatch.

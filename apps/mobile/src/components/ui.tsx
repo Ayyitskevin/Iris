@@ -11,12 +11,15 @@ import {
   type ViewProps,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useObs } from '../state/hooks';
+import { selectReplicaAuthorityState } from '../state/store';
 import { theme } from '../theme';
 
 export function Screen({ children, style, ...rest }: ViewProps & { children: ReactNode }) {
   return (
     <SafeAreaView style={styles.screen} edges={['top', 'bottom']}>
       <View style={[styles.screenInner, style]} {...rest}>
+        <ReplicaAuthorityNotice />
         {children}
       </View>
     </SafeAreaView>
@@ -40,9 +43,49 @@ export function RecoveryNotice() {
     <View style={styles.recoveryNotice} accessibilityRole="alert">
       <Text style={styles.recoveryTitle}>Local recovery mode</Text>
       <Text style={styles.recoveryText}>
-        Iris paused edits, sync, and account actions. One or more local copies need attention. The
-        copy shown in Iris may not be newer or more complete. Open Settings → Recovery Center to
-        inspect what Iris can currently verify and request a fail-closed local export.
+        Iris paused edits, sync, and remote billing/token actions. One or more local copies need
+        attention. The copy shown in Iris may not be newer or more complete. You can still sign out,
+        or open Settings → Recovery Center to inspect what Iris can currently verify and request a
+        fail-closed local export.
+      </Text>
+    </View>
+  );
+}
+
+export function ReplicaAuthorityNotice() {
+  const authority = useObs(selectReplicaAuthorityState);
+  if (authority === 'local') return null;
+  if (authority === 'leader') {
+    return (
+      <Text
+        style={styles.visuallyHidden}
+        accessibilityLiveRegion="polite"
+        testID="replica-authority-status"
+      >
+        This tab is active. Editing and sync are available.
+      </Text>
+    );
+  }
+  const unavailable = authority === 'unavailable';
+  return (
+    <View
+      style={[styles.authorityNotice, unavailable && styles.authorityUnavailable]}
+      accessibilityRole="alert"
+      testID="replica-authority-notice"
+    >
+      <Text style={styles.authorityTitle}>
+        {unavailable
+          ? 'Local editing is paused'
+          : authority === 'acquiring'
+            ? 'Taking over this local workspace…'
+            : 'View only in this tab'}
+      </Text>
+      <Text style={styles.authorityText}>
+        {unavailable
+          ? 'Iris could not verify exclusive browser authority. Your notes remain visible, but this tab will not edit or sync.'
+          : authority === 'acquiring'
+            ? 'Iris is rereading the verified local replica before enabling edits or sync.'
+            : 'Another Iris tab is active. This tab refreshes after verified local changes. Close the active tab to take over.'}
       </Text>
     </View>
   );
@@ -128,6 +171,29 @@ const styles = StyleSheet.create({
     marginBottom: theme.space(1),
   },
   recoveryText: { color: theme.colors.text, fontSize: 13, lineHeight: 19 },
+  authorityNotice: {
+    backgroundColor: theme.colors.surfaceAlt,
+    borderColor: theme.colors.accent,
+    borderWidth: 1,
+    borderRadius: theme.radius,
+    padding: theme.space(3),
+    marginBottom: theme.space(3),
+  },
+  authorityUnavailable: { borderColor: theme.colors.danger },
+  authorityTitle: {
+    color: theme.colors.text,
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: theme.space(1),
+  },
+  authorityText: { color: theme.colors.textDim, fontSize: 13, lineHeight: 19 },
+  visuallyHidden: {
+    position: 'absolute',
+    left: -10_000,
+    width: 1,
+    height: 1,
+    overflow: 'hidden',
+  },
   field: {
     backgroundColor: theme.colors.surface,
     borderColor: theme.colors.border,

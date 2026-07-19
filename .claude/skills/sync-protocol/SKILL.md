@@ -238,8 +238,8 @@ To add a synced field: add it to `SyncMutation.note` and `Note` in `schemas.ts`,
   controlled tests only: copy-on-first-read leaves legacy writable to old clients. Stale-CAS
   losers already use a strict local recovery journal and read-only warning. Append union across
   processes requires the transactional CAS repository; failed writes remain only for same-process
-  retry. Remaining
-  CUTOVER gates are mixed-version divergence detection, single web leadership/read-only
-  followers, enforceable old-client compatibility, divergence integration plus
-  choose/restore/import/discard controls, and real
-  browser/device acceptance—not a missing store.
+  retry. Current-runtime web tabs now use one owner-scoped Web Lock leader, read-only followers,
+  and exact metadata-only refresh behind the same flag, with production-bundle two-tab Chromium
+  coverage. Remaining CUTOVER gates are mixed-version divergence detection, enforceable old-client
+  compatibility, divergence integration plus choose/restore/import/discard controls, and frozen-old-
+  runtime/native acceptance—not a missing store or current-tab leader.

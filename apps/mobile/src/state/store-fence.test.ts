@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Note, SyncMutation } from '@iris/shared';
+import type { OwnerAuthorityHooks } from './owner-replica-authority';
 
 /**
  * Fence-awareness of the owner store (plan A3, step 2).
@@ -58,8 +59,8 @@ vi.mock('./storage', () => ({
   },
 }));
 
-vi.mock('./select-owner-replica-repository', () => ({
-  ownerReplicaRepository: {
+vi.mock('./select-owner-replica-repository', () => {
+  const repository = {
     async read(ownerKey: string): Promise<string | null> {
       repo.reads.push(ownerKey);
       if (repo.failReadKey === ownerKey) {
@@ -96,8 +97,30 @@ vi.mock('./select-owner-replica-repository', () => ({
       if (repo.fenced.has(ownerKey)) throw repo.makeStaleError!(ownerKey);
       repo.durable.set(ownerKey, raw);
     },
-  },
-}));
+  };
+  return {
+    ownerReplicaRepository: repository,
+    ownerReplicaRuntime: {
+      repository,
+      mode: 'transactional-native',
+      readFollower: (ownerKey: string) => repository.read(ownerKey),
+      authority: {
+        async start(ownerKey: string, hooks: OwnerAuthorityHooks) {
+          const acquiring = { ownerKey, epoch: 1, role: 'acquiring' as const };
+          hooks.onRole(acquiring);
+          await hooks.prepareLeader(acquiring);
+          const leader = { ownerKey, epoch: 2, role: 'leader' as const };
+          hooks.onRole(leader);
+          return {
+            snapshot: () => leader,
+            publishRefresh: () => undefined,
+            close: async () => undefined,
+          };
+        },
+      },
+    },
+  };
+});
 
 import {
   parseReplicaRecoveryEnvelope,

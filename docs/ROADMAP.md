@@ -154,7 +154,16 @@ These were named as out of scope and are staying out until the foundation is pro
   retains it across share handoff, and later attempts to purge expired files without blocking a
   new export on cleanup failure. Choose/restore/import/discard
   and force-quit browser/device acceptance remain open.
-- **Phase 2.12 — server launch hardening, partial**: user-only device deregistration and
+- **Phase 2.12 — current-runtime web authority, default-off** (ADR-022): when the durable
+  flag is explicitly enabled, one owner-scoped Web Lock grants commit/sync authority. Other tabs
+  are visibly read-only, hold no operation leases, perform no sync requests, and refresh by
+  rereading the repository after an exact metadata-only BroadcastChannel notice. Takeover rereads
+  before authority is published; owner switches release A before acquiring B. Missing IndexedDB,
+  Web Locks, or BroadcastChannel selects the exact legacy adapter. A production-bundle two-tab
+  Chromium test covers leader/follower behavior, transfer with pending work, channel privacy, and
+  reacquisition. This does not detect or stop an already-loaded old legacy writer, so the flag
+  remains off pending the mixed-version divergence and compatibility contract.
+- **Phase 2.13 — server launch hardening, partial**: user-only device deregistration and
   account deletion endpoints, runtime non-superuser RLS tests, production Stripe-key
   guards, and a coarse per-IP rate limiter are shipped. Client device/deletion UX,
   durable Stripe-cancellation reconciliation, production database/JWT/price validation,
@@ -162,11 +171,10 @@ These were named as out of scope and are staying out until the foundation is pro
 
 ## Near-term follow-ups (ordered)
 
-1. **Mixed-version divergence journal + cross-tab leadership + compatibility gate.** A
-   digest-only promotion journal detects legacy/primary drift and preserves both roots; one Web
-   Lock leader may write/sync,
-   followers are read-only, and BroadcastChannel carries metadata only. Prove leader transfer,
-   crash recovery, and frozen old-writer divergence with no later request. Client-only code
+1. **Mixed-version divergence journal + compatibility gate.** Current-runtime web leadership is
+   shipped default-off. Add a digest-only promotion journal that detects legacy/primary drift and
+   preserves both roots. Prove every promotion crash boundary and frozen-old-writer divergence
+   with no later request. Client-only code
    cannot prevent the old write, so production also requires an approved server storage epoch,
    upgrade-required response, or explicit old-client invalidation.
 2. **Controlled transactional-authority acceptance + recovery resolution UX.** Keep `/v1`
@@ -180,7 +188,7 @@ These were named as out of scope and are staying out until the foundation is pro
    retirement through the production `SyncPort`.
 4. **Launch operations.** Add staging deploy, migrations-on-deploy, `/ready`, secret
    documentation, production DB/JWT/Stripe-price validation, PII-scrubbed observability, and
-   browser/native/security CI gates.
+   the remaining format/root-build/coverage/native/security CI gates.
 5. **Safe account erasure + privacy (human-gated).** Make Stripe cancellation confirmed or
    durably reconcilable before deleting identifiers; prove old-token 401; add export-first
    mobile confirmation, privacy policy/link, and legacy/IndexedDB/SQLite replica erasure.

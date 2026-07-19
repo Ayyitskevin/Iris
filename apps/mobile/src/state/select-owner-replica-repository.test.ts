@@ -8,6 +8,7 @@ vi.mock('./storage', () => ({
 import {
   LazyTransactionalReplicaStore,
   selectOwnerReplicaRepository,
+  selectOwnerReplicaRuntime,
   type ReplicaEnvironment,
 } from './select-owner-replica-repository';
 import { SerializedKvReplicaRepository } from './replica-repository';
@@ -25,11 +26,26 @@ const legacy = new SerializedKvReplicaRepository({
 });
 
 function env(overrides: Partial<ReplicaEnvironment>): ReplicaEnvironment {
-  return { durableEnabled: false, indexedDB: undefined, isReactNative: false, ...overrides };
+  return {
+    durableEnabled: false,
+    indexedDB: undefined,
+    isReactNative: false,
+    webLocks: undefined,
+    createBroadcastChannel: undefined,
+    ...overrides,
+  };
 }
 
 // A minimal IDBFactory stand-in — the selector only needs a truthy factory to pick the web store.
 const fakeIndexedDB = {} as IDBFactory;
+const fakeWebLocks: ReplicaEnvironment['webLocks'] = {
+  request: async () => undefined,
+};
+const createBroadcastChannel: NonNullable<ReplicaEnvironment['createBroadcastChannel']> = () => ({
+  onmessage: null,
+  postMessage: () => undefined,
+  close: () => undefined,
+});
 
 describe('selectOwnerReplicaRepository', () => {
   it('returns the legacy key/value repository unchanged when the flag is off', () => {
@@ -40,7 +56,12 @@ describe('selectOwnerReplicaRepository', () => {
 
   it('promotes onto the IndexedDB store on web when enabled', () => {
     const repo = selectOwnerReplicaRepository(
-      env({ durableEnabled: true, indexedDB: fakeIndexedDB }),
+      env({
+        durableEnabled: true,
+        indexedDB: fakeIndexedDB,
+        webLocks: fakeWebLocks,
+        createBroadcastChannel,
+      }),
       legacy,
     );
     expect(repo).toBeInstanceOf(PromotingOwnerReplicaRepository);
@@ -55,14 +76,47 @@ describe('selectOwnerReplicaRepository', () => {
     expect(repo).toBeInstanceOf(PromotingOwnerReplicaRepository);
   });
 
-  it('falls back to the legacy repository when enabled but no transactional store exists (Node/SSR)', () => {
+  it('falls back to legacy when enabled but no transactional store exists (Node/SSR)', () => {
     expect(selectOwnerReplicaRepository(env({ durableEnabled: true }), legacy)).toBe(legacy);
+  });
+
+  it('falls back to the exact legacy repository when either web coordination primitive is missing', () => {
+    expect(
+      selectOwnerReplicaRuntime(
+        env({
+          durableEnabled: true,
+          indexedDB: fakeIndexedDB,
+          createBroadcastChannel,
+        }),
+        legacy,
+      ),
+    ).toMatchObject({ repository: legacy, mode: 'legacy' });
+    expect(
+      selectOwnerReplicaRuntime(
+        env({ durableEnabled: true, indexedDB: fakeIndexedDB, webLocks: fakeWebLocks }),
+        legacy,
+      ),
+    ).toMatchObject({ repository: legacy, mode: 'legacy' });
   });
 
   it('prefers IndexedDB over SQLite when both signals are present', () => {
     // A web build could expose a React-Native-looking navigator via a polyfill; IndexedDB wins.
     const repo = selectOwnerReplicaRepository(
       env({ durableEnabled: true, indexedDB: fakeIndexedDB, isReactNative: true }),
+      legacy,
+    );
+    expect(repo).toBe(legacy);
+  });
+
+  it('prefers coordinated IndexedDB over SQLite when all web signals are present', () => {
+    const repo = selectOwnerReplicaRepository(
+      env({
+        durableEnabled: true,
+        indexedDB: fakeIndexedDB,
+        isReactNative: true,
+        webLocks: fakeWebLocks,
+        createBroadcastChannel,
+      }),
       legacy,
     );
     // The promoting repo's primary must be the IndexedDB-backed transactional store, which we

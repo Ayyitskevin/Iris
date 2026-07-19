@@ -10,8 +10,8 @@
  * stale-CAS recovery in `store.ts` prevents false commit acknowledgements, but it does not make
  * legacy promotion cutover-safe: old tabs/binaries can still write the legacy key after a new
  * runtime adopts the primary. Use this flag only in controlled tests until the mixed-version
- * divergence journal, web leadership, enforceable old-client compatibility, recovery UX, and
- * browser/device acceptance gates are complete.
+ * divergence journal, enforceable old-client compatibility, recovery UX, frozen-old-runtime
+ * browser coverage, and native acceptance gates are complete.
  *
  * Deliberately a leaf module (nothing here imports it back) and free of any static
  * `react-native`/`expo-sqlite` import, so it loads cleanly under Node/vitest.
@@ -26,6 +26,13 @@ import {
 import { IndexedDbTransactionalReplicaStore } from './indexeddb-replica-store';
 import { openExpoSqliteReplicaStore } from './open-expo-sqlite-store';
 import { PromotingOwnerReplicaRepository } from './promoting-replica-repository';
+import {
+  AlwaysWritableOwnerAuthorityDriver,
+  WebOwnerAuthorityDriver,
+  type BroadcastChannelPort,
+  type OwnerAuthorityDriver,
+  type OwnerLockPort,
+} from './owner-replica-authority';
 import { storage } from './storage';
 
 /**
@@ -69,6 +76,20 @@ export interface ReplicaEnvironment {
   indexedDB: IDBFactory | undefined;
   /** Whether this is a React Native (device) runtime. */
   isReactNative: boolean;
+  /** Current-runtime web exclusivity, required before IndexedDB may become authoritative. */
+  webLocks: OwnerLockPort | undefined;
+  /** Owner-scoped invalidation channel factory; messages never carry replica bytes. */
+  createBroadcastChannel: ((name: string) => BroadcastChannelPort) | undefined;
+}
+
+export type OwnerReplicaRuntimeMode = 'legacy' | 'transactional-web' | 'transactional-native';
+
+export interface OwnerReplicaRuntime {
+  readonly repository: OwnerReplicaRepository;
+  readonly authority: OwnerAuthorityDriver;
+  readonly mode: OwnerReplicaRuntimeMode;
+  /** Read the durable/legacy winner without promoting or committing from a follower. */
+  readFollower(ownerKey: string): Promise<string | null>;
 }
 
 /** Read the environment without importing `react-native` — capability detection only. */
@@ -76,21 +97,27 @@ export function detectReplicaEnvironment(): ReplicaEnvironment {
   const flag = process.env.EXPO_PUBLIC_DURABLE_STORAGE;
   const globals = globalThis as {
     indexedDB?: IDBFactory;
-    navigator?: { product?: string };
+    navigator?: { product?: string; locks?: OwnerLockPort };
+    BroadcastChannel?: new (name: string) => BroadcastChannelPort;
   };
+  const Channel = globals.BroadcastChannel;
   return {
     durableEnabled: flag === '1' || flag === 'true',
     indexedDB: globals.indexedDB,
     isReactNative: globals.navigator?.product === 'ReactNative',
+    webLocks: globals.navigator?.locks,
+    createBroadcastChannel: Channel ? (name) => new Channel(name) : undefined,
   };
 }
 
 /** Pick the platform's transactional store, or null when none is available (Node/SSR). */
-function selectTransactionalStore(env: ReplicaEnvironment): TransactionalReplicaStore | null {
-  if (env.indexedDB) return new IndexedDbTransactionalReplicaStore(env.indexedDB);
-  if (env.isReactNative)
-    return new LazyTransactionalReplicaStore(() => openExpoSqliteReplicaStore());
-  return null;
+function legacyRuntime(legacy: OwnerReplicaRepository): OwnerReplicaRuntime {
+  return {
+    repository: legacy,
+    authority: new AlwaysWritableOwnerAuthorityDriver(),
+    mode: 'legacy',
+    readFollower: (ownerKey) => legacy.read(ownerKey),
+  };
 }
 
 /**
@@ -101,17 +128,53 @@ export function selectOwnerReplicaRepository(
   env: ReplicaEnvironment,
   legacy: OwnerReplicaRepository = new SerializedKvReplicaRepository(storage),
 ): OwnerReplicaRepository {
-  if (!env.durableEnabled) return legacy;
-  const store = selectTransactionalStore(env);
-  if (!store) return legacy;
-  // Promote the existing key/value replica into the fenced store on first read.
-  return new PromotingOwnerReplicaRepository(
-    new TransactionalOwnerReplicaRepository(store),
-    legacy,
-  );
+  return selectOwnerReplicaRuntime(env, legacy).repository;
+}
+
+/**
+ * Assemble storage and current-runtime authority as one decision. Web never selects IndexedDB
+ * unless every coordination primitive exists; a missing primitive returns the exact legacy
+ * repository without opening a database, lock, or channel.
+ */
+export function selectOwnerReplicaRuntime(
+  env: ReplicaEnvironment,
+  legacy: OwnerReplicaRepository = new SerializedKvReplicaRepository(storage),
+): OwnerReplicaRuntime {
+  if (!env.durableEnabled) return legacyRuntime(legacy);
+
+  if (env.indexedDB) {
+    if (!env.webLocks || !env.createBroadcastChannel) return legacyRuntime(legacy);
+    const primary = new TransactionalOwnerReplicaRepository(
+      new IndexedDbTransactionalReplicaStore(env.indexedDB),
+    );
+    return {
+      repository: new PromotingOwnerReplicaRepository(primary, legacy),
+      authority: new WebOwnerAuthorityDriver({
+        locks: env.webLocks,
+        createChannel: env.createBroadcastChannel,
+      }),
+      mode: 'transactional-web',
+      readFollower: async (ownerKey) => (await primary.read(ownerKey)) ?? legacy.read(ownerKey),
+    };
+  }
+
+  if (env.isReactNative) {
+    const primary = new TransactionalOwnerReplicaRepository(
+      new LazyTransactionalReplicaStore(() => openExpoSqliteReplicaStore()),
+    );
+    return {
+      repository: new PromotingOwnerReplicaRepository(primary, legacy),
+      authority: new AlwaysWritableOwnerAuthorityDriver(),
+      mode: 'transactional-native',
+      readFollower: (ownerKey) => primary.read(ownerKey),
+    };
+  }
+
+  return legacyRuntime(legacy);
 }
 
 /** The singleton the owner store commits and reads through. */
-export const ownerReplicaRepository: OwnerReplicaRepository = selectOwnerReplicaRepository(
+export const ownerReplicaRuntime: OwnerReplicaRuntime = selectOwnerReplicaRuntime(
   detectReplicaEnvironment(),
 );
+export const ownerReplicaRepository: OwnerReplicaRepository = ownerReplicaRuntime.repository;

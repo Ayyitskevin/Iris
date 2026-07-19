@@ -159,11 +159,16 @@ the handed-off file long enough for receivers, and attempts to purge Iris-owned 
 verified timestamps older than 24 hours on a later launch/export. Unknown timestamps are retained;
 cleanup failures are surfaced without blocking a separately named export. Neither platform claims
 that the user retained the destination file.
-The flag is still not cutover-safe:
-client-only code cannot stop an already-loaded old tab/version from writing the legacy copy.
-Mixed-version divergence detection, one web leader, an enforceable server compatibility gate,
-recovery choose/restore/import/discard controls, the v2 pull applier, at-rest policy, and browser/native
-acceptance remain open. See `docs/MASTER_PLAN.md` for the ordered release gates.
+With the flag explicitly enabled in a capable browser, one owner-scoped Web Lock now grants
+commit/sync authority. Other current-runtime tabs are visibly read-only, make no sync request, and
+reread durable state after exact metadata-only BroadcastChannel notices; a production-bundle
+two-tab Chromium gate proves transfer with pending work intact. Capabilities absent during startup
+selection choose the exact legacy adapter; a later authority failure instead pauses fail-closed.
+The flag is still not cutover-safe or default-on: client-only code cannot stop an
+already-loaded old tab/version from writing the legacy copy. Mixed-version divergence detection,
+an enforceable server compatibility gate, recovery choose/restore/import/discard controls, the v2
+pull applier, at-rest policy, and frozen-old-runtime/native acceptance remain open. See
+`docs/MASTER_PLAN.md` for the ordered release gates.
 GitHub Actions run `29506816638` passed the PostgreSQL 16
 independent-connection commit-order and concurrent device-gate gate for commit
 `8a8785114623d3e601f26ddf7b6eed21b23415cf`.

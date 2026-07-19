@@ -16,7 +16,10 @@ import {
 import { replicaStorageKey } from './replica-repository';
 import {
   assertReplicaRecoverySnapshot,
+  parseReplicaRecoveryEnvelope,
+  replicaRecoveryJournalOwnerKey,
   ReplicaRecoveryJournal,
+  type ReplicaRecoveryEnvelope,
   type ReplicaRecoveryReason,
 } from './replica-recovery-journal';
 import {
@@ -25,7 +28,8 @@ import {
   type ReplicaRecoveryCatalog,
 } from './replica-recovery-catalog';
 import { assertReplicaSemanticIntegrity, ReplicaIntegrityError } from './replica-integrity';
-import { ownerReplicaRepository } from './select-owner-replica-repository';
+import type { OwnerAuthorityHandle, OwnerAuthoritySnapshot } from './owner-replica-authority';
+import { ownerReplicaRepository, ownerReplicaRuntime } from './select-owner-replica-repository';
 import { ReplicaRepositoryStaleWriterError } from './transactional-replica-repository';
 import { storage } from './storage';
 export { ReplicaIntegrityError } from './replica-integrity';
@@ -40,6 +44,9 @@ export interface Session {
 
 export type SyncStatus =
   'idle' | 'syncing' | 'offline' | 'error' | 'auth-required' | 'recovery-required';
+
+/** Ephemeral current-tab authority; never serialized into an owner replica. */
+export type ReplicaAuthorityState = 'local' | 'acquiring' | 'leader' | 'follower' | 'unavailable';
 
 export type SyncIssueRecoveryKind = 'rekey' | 'reset-cursor' | 'restage' | 'retry';
 
@@ -166,6 +173,7 @@ function blankState(status: SyncStatus = 'idle'): AppState {
 }
 
 export const store$ = observable<AppState>(blankState());
+export const replicaAuthority$ = observable<ReplicaAuthorityState>('local');
 /** UI invalidation hint only; epoch assertions below remain the freshness authority. */
 export const recoveryCatalogRevision$ = observable(0);
 
@@ -193,6 +201,19 @@ let sessionSaveQueue: Promise<void> = Promise.resolve();
 let sessionTransitionQueue: Promise<void> = Promise.resolve();
 let hydrationPromise: Promise<void> | null = null;
 let pendingRejectedTombstone: string | null = null;
+
+interface ReplicaAuthorityBinding {
+  readonly ownerKey: string;
+  readonly request: number;
+  handle: OwnerAuthorityHandle | null;
+  refreshVersion: number;
+  refreshWaiters: Set<() => void>;
+  refreshPromise: Promise<void> | null;
+  refreshAgain: boolean;
+}
+
+let replicaAuthorityRequest = 0;
+let replicaAuthorityBinding: ReplicaAuthorityBinding | null = null;
 // A transactional repository read clears its stale-writer fence before the application can
 // validate and publish the returned replica. Keep a second, owner-scoped fence for that whole
 // recovery interval, and retain it when the bytes are absent or unreadable, so neither a
@@ -208,6 +229,18 @@ interface AuthoritativeRecoveryBarrier {
   authoritative: PersistedReplica | null;
 }
 const authoritativeRecoveryBarriers = new Map<string, AuthoritativeRecoveryBarrier>();
+
+async function readReplicaRecoveryEnvelope(
+  sourceOwnerKey: string,
+): Promise<ReplicaRecoveryEnvelope | null> {
+  if (!usesCoordinatedWebAuthority() || isOwnerReplicaWritable(sourceOwnerKey)) {
+    return replicaRecoveryJournal.read(sourceOwnerKey);
+  }
+  const raw = await ownerReplicaRuntime.readFollower(
+    replicaRecoveryJournalOwnerKey(sourceOwnerKey),
+  );
+  return raw === null ? null : parseReplicaRecoveryEnvelope(raw, sourceOwnerKey);
+}
 
 export class StaleSessionError extends Error {
   constructor() {
@@ -350,6 +383,241 @@ function parseReplica(raw: string, session: Session): PersistedReplica {
   return parsed;
 }
 
+function usesCoordinatedWebAuthority(): boolean {
+  return ownerReplicaRuntime.mode === 'transactional-web';
+}
+
+function authorityStateFor(snapshot: OwnerAuthoritySnapshot): ReplicaAuthorityState {
+  return usesCoordinatedWebAuthority() ? snapshot.role : 'local';
+}
+
+function isCurrentAuthorityBinding(binding: ReplicaAuthorityBinding): boolean {
+  return (
+    replicaAuthorityBinding === binding &&
+    binding.request === replicaAuthorityRequest &&
+    binding.ownerKey.length > 0
+  );
+}
+
+function isOwnerReplicaWritable(ownerKey: string): boolean {
+  if (!usesCoordinatedWebAuthority()) return true;
+  const binding = replicaAuthorityBinding;
+  return Boolean(
+    binding &&
+    isCurrentAuthorityBinding(binding) &&
+    binding.ownerKey === ownerKey &&
+    binding.handle?.snapshot().role === 'leader',
+  );
+}
+
+export function replicaMutationsBlocked(): boolean {
+  const authority = replicaAuthority$.get();
+  return authority !== 'local' && authority !== 'leader';
+}
+
+export function selectReplicaAuthorityState(): ReplicaAuthorityState {
+  return replicaAuthority$.get();
+}
+
+function assertOwnerReplicaAuthorityWritable(ownerKey: string): void {
+  if (isOwnerReplicaWritable(ownerKey)) return;
+  throw new StatePersistenceError(
+    'This Iris tab does not hold write authority for the active owner replica',
+  );
+}
+
+function notifyAuthorityRefreshWaiters(binding: ReplicaAuthorityBinding): void {
+  binding.refreshVersion += 1;
+  for (const resolve of binding.refreshWaiters) resolve();
+  binding.refreshWaiters.clear();
+}
+
+function waitForAuthorityRefresh(
+  binding: ReplicaAuthorityBinding,
+  observedVersion: number,
+  timeoutMs = 5000,
+): Promise<boolean> {
+  if (binding.refreshVersion !== observedVersion) return Promise.resolve(true);
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (refreshed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      binding.refreshWaiters.delete(onRefresh);
+      resolve(refreshed);
+    };
+    const onRefresh = () => finish(true);
+    const timeout = setTimeout(() => finish(false), timeoutMs);
+    binding.refreshWaiters.add(onRefresh);
+  });
+}
+
+async function readReplicaWithoutPromotion(ownerKey: string): Promise<string | null> {
+  try {
+    return await ownerReplicaRuntime.readFollower(ownerKey);
+  } catch (cause) {
+    throw new StatePersistenceError('Could not read the follower owner replica', { cause });
+  }
+}
+
+function authoritySession(binding: ReplicaAuthorityBinding): Session | null {
+  const session = store$.session.get();
+  return session && ownerKeyFor(session) === binding.ownerKey ? session : null;
+}
+
+async function prepareReplicaAuthorityLeader(
+  binding: ReplicaAuthorityBinding,
+  snapshot: OwnerAuthoritySnapshot,
+): Promise<void> {
+  if (!isCurrentAuthorityBinding(binding) || snapshot.ownerKey !== binding.ownerKey) return;
+  const session = authoritySession(binding);
+  // Initial hydration owns no published session yet. `loadReplica` performs the required read
+  // before activation. A rollback may still display the same owner while reacquiring; the new
+  // handle is not installed yet, and its caller likewise performs an explicit authoritative read.
+  if (!binding.handle || !session || store$.activeOwnerKey.get() !== binding.ownerKey) return;
+
+  const raw = await readReplicaWithoutPromotion(binding.ownerKey);
+  if (raw === null) {
+    throw new StatePersistenceError(
+      'The owner replica disappeared before this tab could take write authority',
+    );
+  }
+  const replica = parseReplica(raw, session);
+  if (
+    !isCurrentAuthorityBinding(binding) ||
+    binding.handle?.snapshot().epoch !== snapshot.epoch ||
+    store$.activeOwnerKey.get() !== binding.ownerKey
+  ) {
+    throw new StaleSessionError();
+  }
+  publishReplicaProjection(replica);
+}
+
+async function performFollowerRefresh(binding: ReplicaAuthorityBinding): Promise<void> {
+  do {
+    binding.refreshAgain = false;
+    const session = authoritySession(binding);
+    const snapshot = binding.handle?.snapshot();
+    if (
+      !session ||
+      !snapshot ||
+      snapshot.role !== 'follower' ||
+      store$.activeOwnerKey.get() !== binding.ownerKey
+    ) {
+      return;
+    }
+    const raw = await readReplicaWithoutPromotion(binding.ownerKey);
+    if (raw === null) return;
+    const replica = parseReplica(raw, session);
+    const current = binding.handle?.snapshot();
+    if (
+      !isCurrentAuthorityBinding(binding) ||
+      !current ||
+      current.epoch !== snapshot.epoch ||
+      current.role !== 'follower' ||
+      store$.activeOwnerKey.get() !== binding.ownerKey
+    ) {
+      return;
+    }
+    publishReplicaProjection(replica);
+  } while (binding.refreshAgain && isCurrentAuthorityBinding(binding));
+}
+
+function enqueueFollowerRefresh(binding: ReplicaAuthorityBinding): void {
+  if (!isCurrentAuthorityBinding(binding)) return;
+  notifyAuthorityRefreshWaiters(binding);
+  if (binding.refreshPromise) {
+    binding.refreshAgain = true;
+    return;
+  }
+  const run = performFollowerRefresh(binding).catch(() => {
+    if (isCurrentAuthorityBinding(binding) && store$.activeOwnerKey.get() === binding.ownerKey) {
+      store$.status.set('error');
+    }
+  });
+  binding.refreshPromise = run;
+  void run.finally(() => {
+    if (binding.refreshPromise === run) binding.refreshPromise = null;
+  });
+}
+
+function applyReplicaAuthorityRole(
+  binding: ReplicaAuthorityBinding,
+  snapshot: OwnerAuthoritySnapshot,
+): void {
+  if (!isCurrentAuthorityBinding(binding) || snapshot.ownerKey !== binding.ownerKey) return;
+  if (usesCoordinatedWebAuthority()) invalidateLeases();
+  replicaAuthority$.set(authorityStateFor(snapshot));
+  if (
+    snapshot.role === 'unavailable' &&
+    store$.activeOwnerKey.get() === binding.ownerKey &&
+    !sessionTransitioning
+  ) {
+    store$.status.set('error');
+  }
+}
+
+async function startReplicaAuthority(session: Session): Promise<void> {
+  const ownerKey = ownerKeyFor(session);
+  const request = ++replicaAuthorityRequest;
+  const binding: ReplicaAuthorityBinding = {
+    ownerKey,
+    request,
+    handle: null,
+    refreshVersion: 0,
+    refreshWaiters: new Set(),
+    refreshPromise: null,
+    refreshAgain: false,
+  };
+  replicaAuthorityBinding = binding;
+  replicaAuthority$.set(usesCoordinatedWebAuthority() ? 'acquiring' : 'local');
+
+  const handle = await ownerReplicaRuntime.authority.start(ownerKey, {
+    prepareLeader: (snapshot) => prepareReplicaAuthorityLeader(binding, snapshot),
+    onRole: (snapshot) => applyReplicaAuthorityRole(binding, snapshot),
+    onRefresh: () => enqueueFollowerRefresh(binding),
+  });
+  if (!isCurrentAuthorityBinding(binding)) {
+    await handle.close();
+    throw new StaleSessionError();
+  }
+  binding.handle = handle;
+  applyReplicaAuthorityRole(binding, handle.snapshot());
+}
+
+async function closeReplicaAuthority(): Promise<void> {
+  const binding = replicaAuthorityBinding;
+  replicaAuthorityRequest += 1;
+  replicaAuthorityBinding = null;
+  replicaAuthority$.set('local');
+  if (!binding) return;
+  for (const resolve of binding.refreshWaiters) resolve();
+  binding.refreshWaiters.clear();
+  await binding.handle?.close();
+}
+
+function publishReplicaAuthorityRefresh(ownerKey: string): void {
+  if (!usesCoordinatedWebAuthority()) return;
+  const binding = replicaAuthorityBinding;
+  if (
+    !binding ||
+    !isCurrentAuthorityBinding(binding) ||
+    binding.ownerKey !== ownerKey ||
+    binding.handle?.snapshot().role !== 'leader'
+  ) {
+    return;
+  }
+  try {
+    binding.handle.publishRefresh();
+  } catch (cause) {
+    // A verified replica commit remains a verified commit. The web driver synchronously moves to
+    // `unavailable` and releases its lock when channel publication fails; do not misreport the
+    // already-durable write as a storage failure. Unexpected handle failures still fail loud.
+    if (binding.handle.snapshot().role !== 'unavailable') throw cause;
+  }
+}
+
 function snapshotActiveReplica(): PersistedReplica | null {
   const session = store$.session.get();
   const ownerKey = store$.activeOwnerKey.get();
@@ -395,9 +663,11 @@ async function enqueueReplicaSave(replica: PersistedReplica): Promise<void> {
   assertReplicaIntegrity(replica);
   const snapshot = cloneReplica(replica);
   assertAuthoritativeReplicaWritable(snapshot.ownerKey);
+  assertOwnerReplicaAuthorityWritable(snapshot.ownerKey);
   const raw = JSON.stringify(snapshot);
   try {
     await ownerReplicaRepository.commit(snapshot.ownerKey, raw);
+    publishReplicaAuthorityRefresh(snapshot.ownerKey);
   } catch (cause) {
     // Preserve the storage-level signal: the caller must validate and rehydrate the winner,
     // then report that this exact reducer was superseded rather than wrapping the conflict as
@@ -492,6 +762,9 @@ async function persistReplicaBeforeSessionDeparture(
   session: Session,
   replica: PersistedReplica,
 ): Promise<{ replica: PersistedReplica; superseded: boolean }> {
+  if (usesCoordinatedWebAuthority() && !isOwnerReplicaWritable(replica.ownerKey)) {
+    return { replica, superseded: false };
+  }
   const recoveryInFlight = authoritativeRecoveryPromises.get(replica.ownerKey);
   if (recoveryInFlight) {
     return departureResultAfterAuthoritativeRecovery(replica, recoveryInFlight);
@@ -605,6 +878,12 @@ function invalidateLeases(): number {
 function activate(session: Session, replica: PersistedReplica): void {
   assertReplicaIntegrity(replica);
   advanceProjectionEpoch();
+  const binding = replicaAuthorityBinding;
+  replicaAuthority$.set(
+    binding && binding.ownerKey === replica.ownerKey && binding.handle
+      ? authorityStateFor(binding.handle.snapshot())
+      : 'local',
+  );
   const recoveryRequired = authoritativeRecoveryFencedOwners.has(replica.ownerKey);
   store$.set({
     session,
@@ -627,7 +906,7 @@ async function compatibleRecoveryReplica(session: Session): Promise<PersistedRep
   const ownerKey = ownerKeyFor(session);
   let recovery;
   try {
-    recovery = await replicaRecoveryJournal.read(ownerKey);
+    recovery = await readReplicaRecoveryEnvelope(ownerKey);
   } catch (cause) {
     throw new StatePersistenceError('Could not read the owner recovery journal', { cause });
   }
@@ -654,8 +933,26 @@ async function loadReplica(session: Session, allowCreate: boolean): Promise<Pers
   }
 
   let raw: string | null;
+  const followerBinding = replicaAuthorityBinding;
+  const followerRefreshVersion = followerBinding?.refreshVersion ?? 0;
   try {
-    raw = await ownerReplicaRepository.read(ownerKey);
+    raw = isOwnerReplicaWritable(ownerKey)
+      ? await ownerReplicaRepository.read(ownerKey)
+      : await readReplicaWithoutPromotion(ownerKey);
+    if (
+      raw === null &&
+      allowCreate &&
+      usesCoordinatedWebAuthority() &&
+      followerBinding?.ownerKey === ownerKey &&
+      followerBinding.handle?.snapshot().role === 'follower'
+    ) {
+      if (
+        followerBinding.refreshVersion !== followerRefreshVersion ||
+        (await waitForAuthorityRefresh(followerBinding, followerRefreshVersion))
+      ) {
+        raw = await readReplicaWithoutPromotion(ownerKey);
+      }
+    }
   } catch (primaryCause) {
     // Transactional adapters validate the record envelope before returning its serialized root.
     // A corrupt or misrouted primary therefore rejects at the repository boundary; recovery must
@@ -692,6 +989,11 @@ async function loadReplica(session: Session, allowCreate: boolean): Promise<Pers
   if (!allowCreate) {
     throw new StatePersistenceError(
       'Persisted session has no owner replica; refusing to create an empty replacement',
+    );
+  }
+  if (!isOwnerReplicaWritable(ownerKey)) {
+    throw new StatePersistenceError(
+      'The active Iris tab has not created this owner replica yet; this tab remains read-only',
     );
   }
 
@@ -834,6 +1136,7 @@ async function hydrateState(): Promise<void> {
   store$.set(blankState());
   sessionRejected = false;
   try {
+    await closeReplicaAuthority();
     if (pendingRejectedTombstone) {
       if (await persistRejectedCredential(pendingRejectedTombstone)) {
         pendingRejectedTombstone = null;
@@ -851,28 +1154,79 @@ async function hydrateState(): Promise<void> {
     ]);
     let sessionRaw = storedSessionRaw;
     let migratedLegacy = false;
+    let followerLegacyReplica: PersistedReplica | null = null;
     const migrationComplete = isMigrationComplete(markerRaw);
     if (legacyRaw && !migrationComplete) {
-      sessionRaw = await migrateLegacy(legacyRaw, storedSessionRaw);
-      migratedLegacy = true;
+      const legacy = JSON.parse(legacyRaw) as LegacyPersistedV1;
+      const legacySession = isSession(legacy.session) ? legacy.session : null;
+      if (legacySession) await startReplicaAuthority(legacySession);
+
+      if (
+        legacySession &&
+        usesCoordinatedWebAuthority() &&
+        !isOwnerReplicaWritable(ownerKeyFor(legacySession))
+      ) {
+        // The leader owns the one-time write/removal. This tab can still display the exact
+        // attributable v1 projection until the leader publishes the migrated IndexedDB root.
+        let keepStoredSession = false;
+        let storedOwnerSession: Session | null = null;
+        if (storedSessionRaw) {
+          try {
+            const stored = JSON.parse(storedSessionRaw) as unknown;
+            if (isSession(stored)) {
+              keepStoredSession = true;
+              storedOwnerSession = stored;
+            } else {
+              keepStoredSession = isSessionTombstone(stored);
+            }
+          } catch {
+            // A malformed partial v2 session does not suppress the attributable v1 owner.
+          }
+        }
+        sessionRaw = keepStoredSession ? storedSessionRaw : JSON.stringify(legacySession);
+        const projectionSession =
+          storedOwnerSession && ownerKeyFor(storedOwnerSession) === ownerKeyFor(legacySession)
+            ? storedOwnerSession
+            : !keepStoredSession
+              ? legacySession
+              : null;
+        if (projectionSession) followerLegacyReplica = safeLegacyReplica(legacy, projectionSession);
+      } else {
+        sessionRaw = await migrateLegacy(legacyRaw, storedSessionRaw);
+        migratedLegacy = true;
+        if (legacySession) publishReplicaAuthorityRefresh(ownerKeyFor(legacySession));
+      }
     } else if (legacyRaw && migrationComplete) {
       void storage.remove(LEGACY_STATE_KEY).catch(() => undefined);
     }
 
-    if (!sessionRaw) return;
+    if (!sessionRaw) {
+      await closeReplicaAuthority();
+      return;
+    }
     const session = JSON.parse(sessionRaw) as unknown;
     if (isSessionTombstone(session)) {
+      await closeReplicaAuthority();
       sessionRejected = session.reason === 'rejected';
       store$.set(blankState(session.reason === 'rejected' ? 'auth-required' : 'idle'));
       return;
     }
     if (!isSession(session)) throw new ReplicaIntegrityError('Persisted session is invalid');
+    if (replicaAuthorityBinding?.ownerKey !== ownerKeyFor(session)) {
+      await closeReplicaAuthority();
+      await startReplicaAuthority(session);
+    }
     // A verified v1 migration may intentionally retain an already-active v2 session whose
     // owner root did not exist yet. That explicit conversion may materialize an empty root;
     // ordinary hydration stays fail-closed so missing authority cannot erase recovery.
-    const replica = await loadReplica(session, migratedLegacy);
+    const replica =
+      followerLegacyReplica?.ownerKey === ownerKeyFor(session)
+        ? followerLegacyReplica
+        : await loadReplica(session, migratedLegacy);
     activate(session, replica);
+    publishReplicaAuthorityRefresh(replica.ownerKey);
   } catch {
+    await closeReplicaAuthority();
     store$.set(blankState('error'));
   } finally {
     finishSessionTransition();
@@ -906,6 +1260,7 @@ export async function saveState(): Promise<boolean> {
     return false;
   }
   if (!replica || !session) return true;
+  if (usesCoordinatedWebAuthority() && !isOwnerReplicaWritable(replica.ownerKey)) return true;
   try {
     await enqueueReplicaSave(replica);
     return true;
@@ -935,6 +1290,7 @@ export function openSessionLease(): SessionLease | null {
     !ownerKey ||
     !deviceId ||
     ownerKey !== ownerKeyFor(session) ||
+    !isOwnerReplicaWritable(ownerKey) ||
     authoritativeRecoveryFencedOwners.has(ownerKey)
   ) {
     return null;
@@ -985,6 +1341,7 @@ export function isCurrentSession(lease: SessionLease): boolean {
     !lease.signal.aborted &&
     lease.generation === generation &&
     store$.activeOwnerKey.get() === lease.ownerKey &&
+    isOwnerReplicaWritable(lease.ownerKey) &&
     !authoritativeRecoveryFencedOwners.has(lease.ownerKey) &&
     store$.deviceId.get() === lease.deviceId &&
     session?.token === lease.token &&
@@ -1174,6 +1531,10 @@ export function adoptSession(next: Session): Promise<void> {
     const priorSession = store$.session.get();
     let priorReplica = snapshotActiveReplica();
     const priorSessionRaw = priorSession ? JSON.stringify(priorSession) : null;
+    const priorOwnerKey = priorSession ? ownerKeyFor(priorSession) : null;
+    const nextOwnerKey = ownerKeyFor(next);
+    const authorityChanged = priorOwnerKey !== nextOwnerKey;
+    let authoritySwitched = false;
     beginSessionTransition();
 
     try {
@@ -1182,22 +1543,38 @@ export function adoptSession(next: Session): Promise<void> {
         priorReplica = departure.replica;
         if (departure.superseded) throw new ReplicaCommitSupersededError(priorReplica.ownerKey);
       }
+      if (authorityChanged) {
+        await closeReplicaAuthority();
+        authoritySwitched = true;
+      }
+      if (replicaAuthorityBinding?.ownerKey !== nextOwnerKey) await startReplicaAuthority(next);
       const replica = await loadReplica(next, true);
       const raw = JSON.stringify(next);
       await persistSessionValue(raw);
       activate(next, replica);
+      publishReplicaAuthorityRefresh(replica.ownerKey);
       sessionRejected = false;
       pendingRejectedTombstone = null;
     } catch (error) {
       let rollbackVerified = false;
       try {
+        if (authoritySwitched) await closeReplicaAuthority();
         await persistSessionValue(priorSessionRaw);
+        if (priorSession && priorReplica) {
+          if (authoritySwitched && replicaAuthorityBinding?.ownerKey !== priorOwnerKey) {
+            await startReplicaAuthority(priorSession);
+          }
+          if (authoritySwitched) priorReplica = await loadReplica(priorSession, false);
+          activate(priorSession, priorReplica);
+        }
         rollbackVerified = true;
       } catch {
         // Unknown durable state must never reactivate either account.
       }
-      if (rollbackVerified && priorSession && priorReplica) activate(priorSession, priorReplica);
-      else store$.set(blankState('error'));
+      if (!rollbackVerified) {
+        await closeReplicaAuthority();
+        store$.set(blankState('error'));
+      }
       if (!rollbackVerified) sessionRejected = true;
       if (priorReplica) setOwnerPersistenceFailureStatus(priorReplica.ownerKey);
       else store$.status.set('error');
@@ -1224,6 +1601,7 @@ export function signOutSession(): Promise<void> {
       await persistSessionValue(
         sessionTombstone('sign-out', priorSession ? ownerKeyFor(priorSession) : null),
       );
+      await closeReplicaAuthority();
       store$.set(blankState());
       sessionRejected = false;
       pendingRejectedTombstone = null;
@@ -1298,6 +1676,7 @@ export function expireSessionIfCurrent(lease: SessionLease): Promise<boolean> {
       }
       return true;
     } finally {
+      await closeReplicaAuthority();
       finishSessionTransition();
     }
   });
@@ -1447,7 +1826,7 @@ async function readReplicaRecoveryCatalogAttempt(
   let envelope = null;
   let journalFailure: unknown;
   try {
-    envelope = await replicaRecoveryJournal.read(lease.ownerKey);
+    envelope = await readReplicaRecoveryEnvelope(lease.ownerKey);
   } catch (cause) {
     journalFailure = cause;
   }
@@ -1511,7 +1890,7 @@ export async function createReplicaRecoveryExportForLease(
   const epochs = captureRecoveryInspectionEpochs(lease);
   let envelope;
   try {
-    envelope = await replicaRecoveryJournal.read(lease.ownerKey);
+    envelope = await readReplicaRecoveryEnvelope(lease.ownerKey);
   } catch (cause) {
     throw new StatePersistenceError('Could not verify the owner recovery journal', { cause });
   }

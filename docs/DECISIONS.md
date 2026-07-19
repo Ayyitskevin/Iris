@@ -880,12 +880,55 @@ Recovery data and retained local export files duplicate private note content, so
 at-rest policy and eventual local-account erasure must cover primary, synthetic, and Iris-owned
 cache paths.
 
-This is **not** the mixed-version promotion divergence protocol: it cannot stop an already-loaded
-old client from writing the legacy key, elect a browser leader, gate old server clients, or prove
-real browser/native lifecycle behavior. `EXPO_PUBLIC_DURABLE_STORAGE` therefore stays off by
-default. The legacy/primary divergence journal, Web Lock leadership, enforceable compatibility
-contract, recovery resolution/import/discard controls, storage-erasure path, and acceptance evidence
-remain explicit A3 release gates.
+This is **not** the mixed-version promotion divergence protocol: by itself it cannot stop an
+already-loaded old client from writing the legacy key, elect a browser leader, gate old server
+clients, or prove real browser/native lifecycle behavior. ADR-022 separately supplies
+current-runtime browser leadership. `EXPO_PUBLIC_DURABLE_STORAGE` stays off by default; the
+legacy/primary divergence journal, enforceable compatibility contract, recovery
+resolution/import/discard controls, storage-erasure path, and remaining acceptance evidence are
+still explicit A3 release gates.
+
+---
+
+## ADR-022 — Current-runtime web owner authority and metadata-only refresh
+
+**Accepted behind the existing default-off durable-storage flag; mixed-version cutover remains blocked.**
+
+When `EXPO_PUBLIC_DURABLE_STORAGE` is enabled in a capable browser, Iris binds each authenticated
+owner to one owner-scoped Web Lock. Only the tab holding that lock may commit the owner replica,
+create operation leases, run sync, or perform other remote mutations. Waiting tabs expose a shared
+read-only notice, reject reducer entry before state can become optimistic, and refresh only by
+rereading validated durable state. BroadcastChannel messages have one exact versioned
+`replica-changed` shape and contain no owner, token, device, note, or replica bytes. Senders post a
+notice only after a verified commit; receivers treat it as an invalidation hint, never as state.
+
+Initial acquisition is fail-closed. A follower queues for the exclusive lock, and after transfer it
+rereads and validates the selected repository before publishing leader authority. Owner switching
+closes A's binding before opening B's, invalidates existing leases, and keeps late callbacks from a
+closed authority inert. A follower v1 migration can project legacy bytes read-only but cannot
+promote, remove, or create storage. Missing IndexedDB, Web Locks, or BroadcastChannel selects the
+existing legacy adapter unchanged rather than granting multiple transactional writers. Native and
+flag-off behavior remain single-runtime and unchanged.
+
+After transactional selection, a lock or channel failure never falls back to legacy. The tab moves
+to visible `unavailable`, invalidates operation leases, closes the failed channel, and releases its
+owner lock so a healthy waiter can perform the same reread-before-leadership sequence. If a refresh
+publication fails after repository commit verification, the exact root remains a successful durable
+write; the notification failure is an authority-staleness signal, not a false storage failure.
+
+The UI disables note, history, conflict, activity-undo, billing/token, export, and session actions
+that require authority; the Recovery Center remains credential-free inspection/export only. A
+production Expo web export runs in Playwright with two real Chromium tabs and proves one leader,
+zero follower requests across the periodic sync interval, no follower revision change, exact
+metadata-only messages, an unannounced newer primary revision appearing only after the mandatory
+takeover reread, and a subsequent new-leader write verified in IndexedDB. This gate also exposed a React 19 snapshot
+contract bug: derived Legend-State selectors are now cached so `useSyncExternalStore` returns a
+stable snapshot until an observed value actually changes.
+
+Web Locks coordinate only tabs running this protocol. They cannot stop an already-loaded old
+runtime from writing the untouched legacy key. This ADR therefore does not flip the default,
+establish a server storage epoch, add the mixed-version divergence journal, resolve recovery
+branches, change `/v1`, or prove native force-quit behavior. Those remain explicit release gates.
 
 ---
 

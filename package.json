@@ -14,6 +14,8 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "pnpm --filter @iris/api --filter @iris/mobile run test",
+    "test:browser": "playwright test",
+    "browser:serve": "pnpm --filter @iris/mobile exec expo export --platform web --output-dir dist-browser && pnpm exec vite apps/mobile/dist-browser --host 127.0.0.1 --port 4197",
     "dev:api": "pnpm --filter @iris/api run dev",
     "dev:mobile": "pnpm --filter @iris/mobile run start",
     "db:migrate": "pnpm --filter @iris/api run db:migrate",
@@ -21,11 +23,13 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.61.1",
     "@types/node": "^22.10.0",
     "eslint": "10.7.0",
     "eslint-config-prettier": "10.1.8",
     "prettier": "3.9.5",
     "typescript": "5.9.3",
-    "typescript-eslint": "8.64.0"
+    "typescript-eslint": "8.64.0",
+    "vite": "^8.1.4"
   }
 }
