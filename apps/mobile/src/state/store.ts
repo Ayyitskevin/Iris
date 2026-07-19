@@ -8,11 +8,27 @@
 import { observable } from '@legendapp/state';
 import type { Note, SyncMutation } from '@iris/shared';
 import type { SyncConflictDraft } from '../sync/reconcile';
+import {
+  createReplicaRecoveryExport,
+  parseReplicaRecoveryExport,
+  replicaRecoveryExportFileName,
+} from '../recovery/export';
 import { replicaStorageKey } from './replica-repository';
-import { ReplicaRecoveryJournal, type ReplicaRecoveryReason } from './replica-recovery-journal';
+import {
+  assertReplicaRecoverySnapshot,
+  ReplicaRecoveryJournal,
+  type ReplicaRecoveryReason,
+} from './replica-recovery-journal';
+import {
+  buildReplicaRecoveryCatalog,
+  type PendingReplicaRecovery,
+  type ReplicaRecoveryCatalog,
+} from './replica-recovery-catalog';
+import { assertReplicaSemanticIntegrity, ReplicaIntegrityError } from './replica-integrity';
 import { ownerReplicaRepository } from './select-owner-replica-repository';
 import { ReplicaRepositoryStaleWriterError } from './transactional-replica-repository';
 import { storage } from './storage';
+export { ReplicaIntegrityError } from './replica-integrity';
 
 export interface Session {
   token: string;
@@ -61,6 +77,27 @@ export interface SessionLease extends Session {
   ownerKey: string;
   deviceId: string;
   signal: AbortSignal;
+}
+
+/** Credential-free lease for owner-local recovery inspection and export only. */
+export interface RecoveryInspectionLease {
+  generation: number;
+  ownerKey: string;
+  userId: string;
+  workspaceId: string;
+  signal: AbortSignal;
+}
+
+export interface RecoveryInspectionVersion {
+  readonly projection: number;
+  readonly recovery: number;
+}
+
+export interface ReplicaRecoveryExportArtifact {
+  catalog: ReplicaRecoveryCatalog;
+  serializedExport: string;
+  fileName: string;
+  inspectionVersion: RecoveryInspectionVersion;
 }
 
 interface PersistedReplica extends ReplicaState {
@@ -129,9 +166,27 @@ function blankState(status: SyncStatus = 'idle'): AppState {
 }
 
 export const store$ = observable<AppState>(blankState());
+/** UI invalidation hint only; epoch assertions below remain the freshness authority. */
+export const recoveryCatalogRevision$ = observable(0);
 
 let generation = 0;
 let generationController = new AbortController();
+let projectionEpoch = 0;
+const recoveryEpochs = new Map<string, number>();
+
+function notifyRecoveryCatalogChanged(): void {
+  recoveryCatalogRevision$.set(recoveryCatalogRevision$.get() + 1);
+}
+
+function advanceProjectionEpoch(): void {
+  projectionEpoch += 1;
+  notifyRecoveryCatalogChanged();
+}
+
+function advanceRecoveryEpoch(ownerKey: string): void {
+  recoveryEpochs.set(ownerKey, (recoveryEpochs.get(ownerKey) ?? 0) + 1);
+  notifyRecoveryCatalogChanged();
+}
 let sessionTransitioning = false;
 let sessionRejected = false;
 let sessionSaveQueue: Promise<void> = Promise.resolve();
@@ -161,6 +216,13 @@ export class StaleSessionError extends Error {
   }
 }
 
+export class StaleRecoveryInspectionError extends Error {
+  constructor() {
+    super('Local recovery state changed while it was being inspected');
+    this.name = 'StaleRecoveryInspectionError';
+  }
+}
+
 export class StatePersistenceError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -173,13 +235,6 @@ export class ReplicaCommitSupersededError extends StatePersistenceError {
   constructor(ownerKey: string) {
     super(`Owner replica commit for ${ownerKey} was superseded by an authoritative writer`);
     this.name = 'ReplicaCommitSupersededError';
-  }
-}
-
-export class ReplicaIntegrityError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'ReplicaIntegrityError';
   }
 }
 
@@ -268,58 +323,7 @@ function cloneReplica(replica: PersistedReplica): PersistedReplica {
 }
 
 function assertReplicaIntegrity(replica: PersistedReplica): void {
-  if (
-    replica.version !== 2 ||
-    replica.ownerKey !== replica.workspaceId + '.' + replica.userId ||
-    !replica.deviceId
-  ) {
-    throw new ReplicaIntegrityError('Replica owner metadata is invalid');
-  }
-
-  for (const [id, note] of Object.entries(replica.notes)) {
-    if (id !== note.id || note.workspaceId !== replica.workspaceId) {
-      throw new ReplicaIntegrityError('Replica contains a note owned by another workspace');
-    }
-  }
-  if (replica.pendingPush !== null && !Array.isArray(replica.pendingPush)) {
-    throw new ReplicaIntegrityError('Replica pending push is invalid');
-  }
-  if (replica.pendingPush?.length === 0) {
-    throw new ReplicaIntegrityError('Replica pending push cannot be empty');
-  }
-  if (replica.syncIssue !== null) {
-    const issue = replica.syncIssue;
-    if (
-      !issue ||
-      typeof issue !== 'object' ||
-      typeof issue.code !== 'string' ||
-      issue.code.length === 0 ||
-      typeof issue.message !== 'string' ||
-      issue.message.length === 0 ||
-      !Array.isArray(issue.affectedOpIds) ||
-      issue.affectedOpIds.some((opId) => typeof opId !== 'string' || opId.length === 0) ||
-      new Set(issue.affectedOpIds).size !== issue.affectedOpIds.length ||
-      !['rekey', 'reset-cursor', 'restage', 'retry'].includes(issue.recoveryKind)
-    ) {
-      throw new ReplicaIntegrityError('Replica sync issue is invalid');
-    }
-  }
-  for (const mutation of [...replica.outbox, ...(replica.pendingPush ?? [])]) {
-    const note = replica.notes[mutation.note.id];
-    if (!note || note.workspaceId !== replica.workspaceId) {
-      throw new ReplicaIntegrityError('Replica sync queue is not backed by an owned note');
-    }
-  }
-  for (const [id, conflict] of Object.entries(replica.conflicts)) {
-    if (
-      id !== conflict.noteId ||
-      conflict.serverNote.id !== id ||
-      conflict.serverNote.workspaceId !== replica.workspaceId ||
-      conflict.localMutation.note.id !== id
-    ) {
-      throw new ReplicaIntegrityError('Replica conflict is not owned by this workspace');
-    }
-  }
+  assertReplicaSemanticIntegrity(replica);
 }
 
 function parseReplica(raw: string, session: Session): PersistedReplica {
@@ -334,6 +338,7 @@ function parseReplica(raw: string, session: Session): PersistedReplica {
     // Replicas written before terminal sync holds shipped have no syncIssue field.
     syncIssue: stored.syncIssue === undefined ? null : stored.syncIssue,
   } as PersistedReplica;
+  assertReplicaRecoverySnapshot(ownerKeyFor(session), JSON.stringify(parsed));
   assertReplicaIntegrity(parsed);
   if (
     parsed.ownerKey !== ownerKeyFor(session) ||
@@ -599,6 +604,7 @@ function invalidateLeases(): number {
 
 function activate(session: Session, replica: PersistedReplica): void {
   assertReplicaIntegrity(replica);
+  advanceProjectionEpoch();
   const recoveryRequired = authoritativeRecoveryFencedOwners.has(replica.ownerKey);
   store$.set({
     session,
@@ -942,6 +948,37 @@ export function openSessionLease(): SessionLease | null {
   });
 }
 
+export function openRecoveryInspectionLease(): RecoveryInspectionLease | null {
+  if (sessionTransitioning || sessionRejected) return null;
+  const session = store$.session.get();
+  const ownerKey = store$.activeOwnerKey.get();
+  if (!session || !ownerKey || ownerKey !== ownerKeyFor(session)) return null;
+  return Object.freeze({
+    generation,
+    ownerKey,
+    userId: session.userId,
+    workspaceId: session.workspaceId,
+    signal: generationController.signal,
+  });
+}
+
+export function isCurrentRecoveryInspectionLease(lease: RecoveryInspectionLease): boolean {
+  const session = store$.session.get();
+  return Boolean(
+    !lease.signal.aborted &&
+    lease.generation === generation &&
+    store$.activeOwnerKey.get() === lease.ownerKey &&
+    session &&
+    ownerKeyFor(session) === lease.ownerKey &&
+    session.userId === lease.userId &&
+    session.workspaceId === lease.workspaceId,
+  );
+}
+
+export function assertCurrentRecoveryInspectionLease(lease: RecoveryInspectionLease): void {
+  if (!isCurrentRecoveryInspectionLease(lease)) throw new StaleSessionError();
+}
+
 export function isCurrentSession(lease: SessionLease): boolean {
   const session = store$.session.get();
   return (
@@ -1025,6 +1062,7 @@ function persistedReplicaForLease(lease: SessionLease, state: ReplicaState): Per
 }
 
 function publishReplicaProjection(replica: PersistedReplica): void {
+  advanceProjectionEpoch();
   const current = store$.get();
   store$.set({
     ...current,
@@ -1309,7 +1347,10 @@ function stageReplicaRecovery(replica: PersistedReplica, reason: ReplicaRecovery
     pending = new Map<string, ReplicaRecoveryReason>();
     pendingReplicaRecoveries.set(replica.ownerKey, pending);
   }
-  if (!pending.has(raw)) pending.set(raw, reason);
+  if (!pending.has(raw)) {
+    pending.set(raw, reason);
+    advanceRecoveryEpoch(replica.ownerKey);
+  }
 }
 
 async function flushPendingReplicaRecoveries(ownerKey: string): Promise<void> {
@@ -1326,6 +1367,7 @@ async function flushPendingReplicaRecoveries(ownerKey: string): Promise<void> {
       await replicaRecoveryJournal.append(ownerKey, raw, reason);
       if (pendingReplicaRecoveries.get(ownerKey)?.get(raw) === reason) {
         pending.delete(raw);
+        advanceRecoveryEpoch(ownerKey);
       }
     }
   } catch (cause) {
@@ -1339,6 +1381,164 @@ async function preserveReplicaRecovery(
 ): Promise<void> {
   stageReplicaRecovery(replica, reason);
   await flushPendingReplicaRecoveries(replica.ownerKey);
+}
+
+function captureRecoveryInspectionEpochs(
+  lease: RecoveryInspectionLease,
+): RecoveryInspectionVersion {
+  assertCurrentRecoveryInspectionLease(lease);
+  return {
+    projection: projectionEpoch,
+    recovery: recoveryEpochs.get(lease.ownerKey) ?? 0,
+  };
+}
+
+function assertRecoveryInspectionUnchanged(
+  lease: RecoveryInspectionLease,
+  epochs: RecoveryInspectionVersion,
+): void {
+  assertCurrentRecoveryInspectionLease(lease);
+  if (
+    projectionEpoch !== epochs.projection ||
+    (recoveryEpochs.get(lease.ownerKey) ?? 0) !== epochs.recovery
+  ) {
+    throw new StaleRecoveryInspectionError();
+  }
+}
+
+/** Recheck a completed local bundle immediately before and after platform delivery. */
+export function isCurrentReplicaRecoveryExportArtifact(
+  lease: RecoveryInspectionLease,
+  artifact: ReplicaRecoveryExportArtifact,
+): boolean {
+  return Boolean(
+    isCurrentRecoveryInspectionLease(lease) &&
+    artifact.catalog.sourceOwnerKey === lease.ownerKey &&
+    projectionEpoch === artifact.inspectionVersion.projection &&
+    (recoveryEpochs.get(lease.ownerKey) ?? 0) === artifact.inspectionVersion.recovery,
+  );
+}
+
+function pendingRecoverySnapshot(ownerKey: string): PendingReplicaRecovery[] {
+  return [...(pendingReplicaRecoveries.get(ownerKey)?.entries() ?? [])].map(
+    ([serializedReplica, reason]) => ({ serializedReplica, reason }),
+  );
+}
+
+function displayedReplicaForRecoveryInspection(lease: RecoveryInspectionLease): string {
+  assertCurrentRecoveryInspectionLease(lease);
+  const replica = snapshotActiveReplica();
+  if (!replica || replica.ownerKey !== lease.ownerKey) throw new StaleSessionError();
+  return serializedReplicaForRecovery(replica);
+}
+
+/** Read every durable and current-process recovery candidate without committing state. */
+export async function readReplicaRecoveryCatalogForLease(
+  lease: RecoveryInspectionLease,
+): Promise<ReplicaRecoveryCatalog | null> {
+  return readReplicaRecoveryCatalogAttempt(lease, 1);
+}
+
+async function readReplicaRecoveryCatalogAttempt(
+  lease: RecoveryInspectionLease,
+  attempt: number,
+): Promise<ReplicaRecoveryCatalog | null> {
+  const epochs = captureRecoveryInspectionEpochs(lease);
+  let envelope = null;
+  let journalFailure: unknown;
+  try {
+    envelope = await replicaRecoveryJournal.read(lease.ownerKey);
+  } catch (cause) {
+    journalFailure = cause;
+  }
+  try {
+    assertRecoveryInspectionUnchanged(lease, epochs);
+  } catch (error) {
+    if (
+      error instanceof StaleRecoveryInspectionError &&
+      isCurrentRecoveryInspectionLease(lease) &&
+      projectionEpoch === epochs.projection &&
+      attempt < 8
+    ) {
+      return readReplicaRecoveryCatalogAttempt(lease, attempt + 1);
+    }
+    throw error;
+  }
+  const pending = pendingRecoverySnapshot(lease.ownerKey);
+  if (journalFailure && pending.length === 0) {
+    throw new StatePersistenceError('Could not verify the owner recovery journal', {
+      cause: journalFailure,
+    });
+  }
+  const catalog = buildReplicaRecoveryCatalog({
+    sourceOwnerKey: lease.ownerKey,
+    envelope,
+    pending,
+    displayedSerializedReplica: displayedReplicaForRecoveryInspection(lease),
+    inventoryComplete: !journalFailure,
+  });
+  try {
+    assertRecoveryInspectionUnchanged(lease, epochs);
+  } catch (error) {
+    if (
+      error instanceof StaleRecoveryInspectionError &&
+      isCurrentRecoveryInspectionLease(lease) &&
+      projectionEpoch === epochs.projection &&
+      attempt < 8
+    ) {
+      return readReplicaRecoveryCatalogAttempt(lease, attempt + 1);
+    }
+    throw error;
+  }
+  return catalog;
+}
+
+/**
+ * Flush already-staged candidates, then build a strict exact-byte local bundle.
+ * The active owner root is never saved and no network client is involved.
+ */
+export async function createReplicaRecoveryExportForLease(
+  lease: RecoveryInspectionLease,
+  exportedAt: string = new Date().toISOString(),
+): Promise<ReplicaRecoveryExportArtifact> {
+  assertCurrentRecoveryInspectionLease(lease);
+  await flushPendingReplicaRecoveries(lease.ownerKey);
+  assertCurrentRecoveryInspectionLease(lease);
+  if ((pendingReplicaRecoveries.get(lease.ownerKey)?.size ?? 0) > 0) {
+    throw new StatePersistenceError('Recovery export is incomplete because a copy is not durable');
+  }
+
+  const epochs = captureRecoveryInspectionEpochs(lease);
+  let envelope;
+  try {
+    envelope = await replicaRecoveryJournal.read(lease.ownerKey);
+  } catch (cause) {
+    throw new StatePersistenceError('Could not verify the owner recovery journal', { cause });
+  }
+  assertRecoveryInspectionUnchanged(lease, epochs);
+  if (!envelope) throw new StatePersistenceError('No preserved recovery copies are available');
+
+  const displayedSerializedReplica = displayedReplicaForRecoveryInspection(lease);
+  const catalog = buildReplicaRecoveryCatalog({
+    sourceOwnerKey: lease.ownerKey,
+    envelope,
+    pending: [],
+    displayedSerializedReplica,
+  });
+  if (!catalog) throw new StatePersistenceError('No preserved recovery copies are available');
+  const serializedExport = createReplicaRecoveryExport({
+    envelope,
+    displayedSerializedReplica,
+    exportedAt,
+  });
+  parseReplicaRecoveryExport(serializedExport, lease.ownerKey);
+  assertRecoveryInspectionUnchanged(lease, epochs);
+  return Object.freeze({
+    catalog,
+    serializedExport,
+    fileName: replicaRecoveryExportFileName(exportedAt),
+    inspectionVersion: Object.freeze({ ...epochs }),
+  });
 }
 
 function fenceOwnerForAuthoritativeRecovery(ownerKey: string): void {

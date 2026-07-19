@@ -848,17 +848,43 @@ it. A 401 for the exact still-active bearer remains authoritative when recovery 
 the operation lease; matching the active token and owner still prevents a late A response from
 expiring B.
 
-Recovery records are append-only in this slice. There is intentionally no automatic deletion,
-winner selection, merge, export, import, or discard, and a valid authoritative winner may remain
-the live projection after its losers are journaled. Recovery data duplicates private note content
-inside the selected local repository, so the native at-rest policy and eventual local-account
-erasure must cover both primary and synthetic keys.
+Recovery records remain append-only. A credential-free recovery-inspection lease may operate while
+ordinary token/device leases are fenced, but it is bound to the exact owner and session generation.
+Catalog reads fence both projection publication and recovery-candidate lifecycle epochs. A
+pending-to-journal transition triggers a bounded coherent-snapshot retry; an owner or displayed
+projection change fails stale. The catalog distinguishes journal-verified, memory-only, and
+displayed-only branches, assigns no semantic recency to capture sequence, and returns bounded note
+previews rather than retaining full serialized roots in UI state. If durable journal reading fails
+while exact memory-only candidates still exist, the UI exposes an explicitly partial inventory
+instead of hiding those candidates. A monotonic UI revision invalidates already-published catalogs;
+the epoch version attached to a completed bundle is rechecked through platform delivery so a long
+share cannot republish stale “shown now” labels.
+
+The Recovery Center can create a versioned, strict, token-free local JSON bundle. Export first
+flushes only already-staged candidates to the journal and refuses to produce an incomplete
+artifact if that verification fails. It does not save the primary root or call a network client.
+Every journal snapshot retains its exact serialized bytes; the exact displayed root is either
+referenced by its byte-identical journal sequence or embedded separately, even when another root
+is only structurally equal. The completed artifact is reparsed through the strict owner/shape and
+semantic-integrity gates before delivery. Web attaches a temporary download anchor and defers Blob
+URL revocation. Native writes and reads back a file in an Iris-only cache directory before opening
+the share sheet; handed-off files are retained for slow receivers, and a later launch/export
+attempts to purge files with a verified positive timestamp older than 24 hours. Unknown timestamps
+are retained. A cleanup failure is surfaced but does not block a separately named export. Browser
+click and native share-sheet completion are requests, not proof that a user retained a destination,
+and the UI says so.
+
+There is still no automatic deletion, winner selection, merge, restore, import, or discard, and a
+valid authoritative winner may remain the live projection after its losers are journaled.
+Recovery data and retained local export files duplicate private note content, so the native
+at-rest policy and eventual local-account erasure must cover primary, synthetic, and Iris-owned
+cache paths.
 
 This is **not** the mixed-version promotion divergence protocol: it cannot stop an already-loaded
 old client from writing the legacy key, elect a browser leader, gate old server clients, or prove
 real browser/native lifecycle behavior. `EXPO_PUBLIC_DURABLE_STORAGE` therefore stays off by
 default. The legacy/primary divergence journal, Web Lock leadership, enforceable compatibility
-contract, recovery resolution/export controls, storage-erasure path, and acceptance evidence
+contract, recovery resolution/import/discard controls, storage-erasure path, and acceptance evidence
 remain explicit A3 release gates.
 
 ---

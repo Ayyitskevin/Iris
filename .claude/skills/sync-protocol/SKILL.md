@@ -63,7 +63,11 @@ all automatic network work until the user invokes its explicit recovery action.
 - `apps/mobile/src/sync/coordinator.ts` — lease-bound register → staged push → paged pull.
 - `apps/mobile/src/sync/reconcile.ts` — pure response validation/reconciliation.
 - `apps/mobile/src/state/store.ts` — owner replicas, `pendingPush`, durable
-  `syncIssue`, persistence, and leases.
+  `syncIssue`, persistence, operation leases, and credential-free recovery inspection/export
+  leases.
+- `apps/mobile/src/state/replica-recovery-journal.ts`,
+  `replica-recovery-catalog.ts`, and `src/recovery/export.ts` — strict exact-root
+  preservation, non-preferential local inventory, and the token-free all-branch bundle.
 - `apps/api/src/app.ts` — parsed routes with `notes:read`/`notes:write` scopes.
 - `apps/api/src/services/note-write.ts` — `loadNote`, `recordVersionAndActivity` (every applied mutation calls this: version snapshot + activity row).
 - `apps/api/src/services/devices.ts` — user-only explicit registration plus
@@ -221,6 +225,12 @@ To add a synced field: add it to `SyncMutation.note` and `Note` in `schemas.ts`,
   performs the explicit registration step and treats its 402 as `syncGated`; local
   edits still work.
 - **Everything runs inside `runTenant`'s single transaction**, workspace-scoped via the RLS GUC. A push batch is atomic per request; `loadNote`/writes already filter by `ctx.workspaceId`. Never reach around `ctx.db`.
+- **Recovery export does not resume or contact sync.** Recovery Center may read with a
+  credential-free owner/generation lease while operation leases are fenced. Export flushes only
+  already-staged exact roots into the local journal, writes no primary root, and emits no bundle
+  unless the full local set is verified. It preserves exact displayed bytes separately when only
+  structural journal matches exist. Choosing, restoring, importing, merging, or discarding a root
+  remains unimplemented and must not be inferred from export.
 - **Transactional repository selection is wired but default-off.** Production authority is
   still SecureStore/localStorage because `EXPO_PUBLIC_DURABLE_STORAGE` defaults off. When
   explicitly enabled, `select-owner-replica-repository.ts` chooses revision-fenced IndexedDB
@@ -230,5 +240,6 @@ To add a synced field: add it to `SyncMutation.note` and `Note` in `schemas.ts`,
   processes requires the transactional CAS repository; failed writes remain only for same-process
   retry. Remaining
   CUTOVER gates are mixed-version divergence detection, single web leadership/read-only
-  followers, enforceable old-client compatibility, recovery resolution/export controls, and real
+  followers, enforceable old-client compatibility, divergence integration plus
+  choose/restore/import/discard controls, and real
   browser/device acceptance—not a missing store.

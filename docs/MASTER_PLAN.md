@@ -17,9 +17,12 @@ Read order for a new session: [`VISION.md`](VISION.md) → [`DECISIONS.md`](DECI
 **Verified locally on 2026-07-19:**
 
 - Current worktree: API **155 tests pass / 2 skipped locally** (the real-Postgres gates run in
-  CI) and mobile **281 tests pass** after the CAS semantic-correctness slice. Typecheck, lint,
-  changed-file formatting, and web export pass. The current CI workflow gates frozen install,
-  typecheck, lint, both test suites with Postgres 16, and web export.
+  CI) and mobile **319 tests pass** after the non-destructive Recovery Center slice. Typecheck, lint,
+  changed-file formatting, and web/Android/iOS Metro exports pass. The current CI workflow gates
+  frozen install, typecheck, lint, both test suites with Postgres 16, and web export. Expo's
+  dependency compatibility check remains red on the pre-existing Expo/React/TypeScript cohort;
+  neither new recovery dependency is flagged, but SDK alignment remains a separate release-health
+  slice.
 - Recovery implementation commit `1aa95a2` passed exact-head CI run `29694190949`, including
   all 31 additional mobile regressions plus the PostgreSQL-backed API gates. Root
   `format:check` and `build` remain known repository/CI gaps; do not describe them as green.
@@ -39,7 +42,10 @@ stores, lazy legacy promotion, and the platform selector all exist. Transactiona
 still defaults off behind `EXPO_PUBLIC_DURABLE_STORAGE`, and the production coordinator still
 dispatches frozen `/v1` payloads. The current CAS layer single-flights authoritative recovery,
 fences before reducer execution through winner publication, rejects every superseded reducer,
-and preserves unreadable winners while allowing safe session departure. Cross-version promotion
+and preserves unreadable winners while allowing safe session departure. An owner-fenced Recovery
+Center now inventories durable, memory-only, and distinct displayed roots and creates a strict
+local exact-byte export on web/native without a server request; it cannot choose, restore, import,
+merge, or discard a root. Cross-version promotion
 still leaves the legacy copy writable; client-only code cannot prevent an already-loaded old tab
 from writing it, and there is no enforceable compatibility gate, web leader, or v2 pull applier.
 
@@ -59,7 +65,7 @@ are independent of feature count and independent of the Sync v2 machinery being 
 
 | #       | Blocker                                   | Why it blocks launch                                                                                                                                                                                                                                                                                                                                   | Evidence                                                                                                                                                                          |
 | ------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **B-1** | **Durable-authority cutover**             | SQLite/IndexedDB primitives exist, but authority defaults to the legacy size-limited blob. Promotion leaves that legacy copy writable to old tabs/versions; a client-only journal can detect but cannot prevent old-client writes. There is no leader, server compatibility fence, recovery UX, or device acceptance.                                  | `promoting-replica-repository.ts`; `select-owner-replica-repository.ts`; A2/A3                                                                                                    |
+| **B-1** | **Durable-authority cutover**             | SQLite/IndexedDB primitives exist, but authority defaults to the legacy size-limited blob. Promotion leaves that legacy copy writable to old tabs/versions; a client-only journal can detect but cannot prevent old-client writes. There is no leader, server compatibility fence, recovery-resolution lifecycle, or device acceptance.                | `promoting-replica-repository.ts`; `select-owner-replica-repository.ts`; A2/A3                                                                                                    |
 | **B-2** | **Deploy + secrets + observability**      | There is no staging/deploy path, migration-on-deploy contract, readiness signal, or error telemetry. Production can still select PGlite, accept a weak JWT value, and retain the development Stripe price id.                                                                                                                                          | no Docker/Fly/Render config; no Sentry/otel; `index.ts`; `env.ts`                                                                                                                 |
 | **B-3** | **Safe account erasure + privacy UX**     | The API erase route exists, but Stripe cancellation failure is swallowed before its only reconciliation identifiers are deleted. Mobile has no export-first deletion flow, privacy policy/link, or local-replica erasure.                                                                                                                              | `services/account.ts`; `settings.tsx`; no `docs/PRIVACY.md`                                                                                                                       |
 | **B-4** | **Store billing/distribution compliance** | Native settings opens Stripe Checkout to unlock paid cloud sync. Apple and Google generally require approved billing paths for in-app digital functionality, subject to storefront and enrolled-program exceptions. Human/legal approval must choose StoreKit/Play Billing, an eligible alternative-billing/link program, or a consumption-only model. | `settings.tsx`; [Apple §3.1](https://developer.apple.com/app-store/review/guidelines/); [Google Payments](https://support.google.com/googleplay/android-developer/answer/9858738) |
@@ -145,7 +151,18 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
     `ReplicaCommitSupersededError`; `saveState` returns false. Tests cover overlapping losers,
     append failure/retry, exact outbox bytes, delayed reads, observer re-entry, session departure,
     401, sign-out/login recovery, corrupt/future authority, rejected primary reads, and pull
-    pagination stopping before page N+1. Force-quit recovery still needs real browser/device
+    pagination stopping before page N+1. A hidden owner-reset Recovery Center route is always
+    discoverable from Settings. Credential-free inspection leases and projection/recovery epochs
+    produce a coherent catalog of journal-verified, memory-only, and displayed-only branches with
+    bounded previews; a journal read failure still surfaces an explicitly partial memory inventory.
+    Local export verifies every staged branch in the journal, preserves exact journal and displayed
+    bytes in a strict token-free v1 bundle, reparses before handoff, rechecks its projection/recovery
+    epoch through delivery, and never commits the primary root or calls the API. Web uses a
+    deferred-cleanup Blob download; native verifies a private
+    cache file, retains it for slow share receivers, and attempts to purge files older than 24
+    hours on a later launch/export without blocking a new export on cleanup failure. Delivery copy
+    does not claim the user saved a destination. Force-quit recovery
+    still needs real browser/device
     acceptance. Transactional authority remains default-off. ADR-021 records the boundary.
   - **Step 3 — platform store selection + flip production authority**, then port the
     coordinator to `/v2` and freeze the v1 path. Itself staged:
@@ -164,7 +181,8 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
       crash-recoverable journal records preparing/transactional/diverged state and checks the
       immutable legacy baseline before and after primary commits and before sync. Legacy drift
       enters `diverged`, preserves both exact roots, rejects writes/network, and surfaces
-      export/import/discard recovery UX; it does not pretend to lock old code.
+      those roots in the Recovery Center with choose/import/discard recovery UX; it does not
+      pretend to lock old code.
       _DoD:_ Playwright covers two current tabs, leader transfer, every promotion crash boundary,
       and a frozen old-writer fixture that changes legacy after promotion and proves no later
       request is sent. Before production default-on, approve and implement an enforceable server
@@ -270,7 +288,8 @@ portable export. All ride the **generic sync resource envelope** already built i
   ADR-015 explicit resurrection and the ADR-016 `/v2` resource envelope/cursor/replay rules.
 - **D2 · 🟢 Fable · Skill drift sweep. ✅ CURRENT WORKTREE.** `client-architecture` now
   describes exact durability, stale-CAS recovery journaling, read-only recovery, and the
-  default-off unsafe cutover; `sync-protocol` records the opt-in runtime selector; ADR-005
+  local inspection/export lease plus platform handoff lifecycle; `sync-protocol` records the
+  opt-in runtime selector and fail-closed recovery bundle; ADR-005
   records Iris-owned repository adapters rather than unused Legend-State persistence plugins.
   Continue grooming ROADMAP as items land.
 
@@ -281,11 +300,12 @@ portable export. All ride the **generic sync resource envelope** already built i
 Do not enable transactional authority or wire Sync v2 merely because the primitives exist.
 Each slice must leave a rollback point and prove the exact transition it claims.
 
-1. **CAS recovery journal + read-only recovery mode. ✅ CURRENT WORKTREE.** Stage every exact
-   loser before authoritative publication, append all candidates behind the final barrier, retain
-   failed appends for same-process retry, stop paged pull on a lost commit, and reopen compatible
-   candidates read-only without replacing missing/corrupt/future authority. Crash recovery from a
-   failing repository plus resolution/export/discard remain in slice 3.
+1. **Recovery Center inspection + exact local export. ✅ CURRENT WORKTREE.** Inventory every
+   journal, memory-only, and distinct displayed branch behind an owner/generation/projection fence;
+   expose partial memory state when the journal is unreadable; and build a strict token-free bundle
+   only after all staged roots are durable. Preserve exact displayed bytes, keep web/native handoff
+   claims honest, and retain native cache files long enough for slow receivers. Choose, restore,
+   import, merge, and discard remain in slice 3.
 2. **Divergence journal + web leadership + compatibility contract.** Add a digest-only,
    crash-recoverable journal; one Web Lock leader; read-only followers; metadata-only
    BroadcastChannel refresh; and fail-closed legacy-drift detection. A frozen old-writer browser
@@ -293,8 +313,8 @@ Each slice must leave a rollback point and prove the exact transition it claims.
    cannot stop that old writer, approve an enforceable server storage epoch/upgrade response or
    another explicit invalidation mechanism before production cutover.
 3. **Transactional authority acceptance + recovery UX.** Enable the flag only in test channels
-   while retaining the v1 coordinator. Build user-visible export/import/discard handling for
-   diverged or quarantined roots, then prove web reload, native force-quit/reopen, A→B switching,
+   while retaining the v1 coordinator. Integrate diverged/quarantined roots into the Recovery
+   Center and add choose/restore/import/discard handling, then prove web reload, native force-quit/reopen, A→B switching,
    storage exhaustion, SQLite at-rest policy, and unsupported-platform fallback. Only after the
    compatibility contract and these gates pass may the default flip.
 4. **Sync v2 runtime cutover.** Add the missing pull-v2 applier, bind the v3 root through
@@ -331,7 +351,7 @@ the current CAS diff. Closed findings stay visible so regressions do not re-ente
 | high        | open        | `sync_idempotency` retains full payloads forever                                | `schema.ts`, `sync.ts`              | B5            |
 | medium      | partial     | Coarse per-IP limiter lacks principal/sync/agent budgets and proxy proof        | `app.ts`, `rate-limit.test.ts`      | B7            |
 | medium      | API only    | Device reclamation has no client settings/recovery flow                         | `devices.ts`, `settings.tsx`        | B4            |
-| medium      | partial     | Read-only stale-CAS warning exists; export/resolve/discard is still missing     | `store.ts`; recovery notices        | A3b/c         |
+| medium      | partial     | Recovery inventory + local export ship; choose/restore/import/discard is open   | `recovery.tsx`; ADR-021             | A3b/c         |
 | medium      | open        | CI omits format, root-build, coverage, security, browser, and native gates      | `.github/workflows/ci.yml`          | CI/acceptance |
 | low         | open        | `Math.random` remains a UUID/device-id fallback                                 | `manager.ts`, `store.ts`            | B12           |
 

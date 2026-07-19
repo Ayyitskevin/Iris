@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { MAX_NOTE_BODY_BYTES } from '@iris/shared';
 import { assertSerializedReplicaOwner, type OwnerReplicaRepository } from './replica-repository';
 import {
   type CompareAndSwapResult,
@@ -114,6 +115,50 @@ describe('ReplicaRecoveryJournal', () => {
     expect(() => parseReplicaRecoveryEnvelope(raw, sourceOwner)).not.toThrow();
   });
 
+  it('preserves a pre-limit oversized local mutation for the coordinator terminal hold', async () => {
+    const repository = new MemoryOwnerRepository();
+    const journal = new ReplicaRecoveryJournal(repository, () => '2026-07-19T10:00:10.000Z');
+    const noteId = '33333333-3333-4333-8333-333333333333';
+    const workspaceId = sourceOwner.split('.')[0]!;
+    const bodyMd = 'x'.repeat(MAX_NOTE_BODY_BYTES + 1);
+    const root = {
+      ...(JSON.parse(replica('oversized-local')) as Record<string, unknown>),
+      notes: {
+        [noteId]: {
+          id: noteId,
+          workspaceId,
+          title: 'Oversized local note',
+          bodyMd,
+          folder: null,
+          tags: [],
+          version: 1,
+          createdAt: '2026-07-19T10:00:10.000Z',
+          updatedAt: '2026-07-19T10:00:10.000Z',
+          deletedAt: null,
+        },
+      },
+      outbox: [
+        {
+          opId: 'op-oversized-local',
+          type: 'upsert',
+          note: {
+            id: noteId,
+            title: 'Oversized local note',
+            bodyMd,
+            folder: null,
+            tags: [],
+          },
+          baseVersion: 1,
+        },
+      ],
+    };
+    const serialized = JSON.stringify(root);
+
+    await journal.append(sourceOwner, serialized, 'stale-writer');
+
+    expect((await journal.read(sourceOwner))!.snapshots[0]!.serializedReplica).toBe(serialized);
+  });
+
   it('serializes overlapping in-process appends without replacing either snapshot', async () => {
     const repository = new MemoryOwnerRepository();
     const journal = new ReplicaRecoveryJournal(repository, () => '2026-07-19T10:01:00.000Z');
@@ -218,6 +263,138 @@ describe('ReplicaRecoveryJournal', () => {
     ).rejects.toBeInstanceOf(ReplicaRecoveryJournalError);
   });
 
+  it('uses the same semantic owner-root invariants as the active store', async () => {
+    const noteId = '33333333-3333-4333-8333-333333333333';
+    const workspaceId = sourceOwner.split('.')[0]!;
+    const ownedNote = {
+      id: noteId,
+      workspaceId,
+      title: 'Owned',
+      bodyMd: 'Body',
+      folder: null,
+      tags: [],
+      version: 1,
+      createdAt: '2026-07-19T10:03:00.000Z',
+      updatedAt: '2026-07-19T10:03:00.000Z',
+      deletedAt: null,
+    };
+    const ownedMutation = {
+      opId: 'op-owned',
+      type: 'upsert',
+      note: { id: noteId, title: 'Owned', bodyMd: 'Body', folder: null, tags: [] },
+      baseVersion: 1,
+    };
+    const valid = {
+      ...(JSON.parse(replica('semantic-base')) as Record<string, unknown>),
+      notes: { [noteId]: ownedNote },
+    };
+    const acceptedRepository = new MemoryOwnerRepository();
+    const acceptedJournal = new ReplicaRecoveryJournal(acceptedRepository);
+    await acceptedJournal.append(
+      sourceOwner,
+      JSON.stringify({
+        ...valid,
+        outbox: [ownedMutation],
+        pendingPush: [
+          {
+            ...ownedMutation,
+            note: { ...ownedMutation.note, tags: [...ownedMutation.note.tags] },
+          },
+        ],
+      }),
+      'stale-writer',
+    );
+    expect(acceptedRepository.commits).toBe(1);
+
+    const invalidRoots = [
+      { ...valid, deviceId: '' },
+      {
+        ...valid,
+        notes: { [noteId]: { ...ownedNote, workspaceId: 'foreign-workspace' } },
+      },
+      {
+        ...valid,
+        outbox: [{ ...ownedMutation, note: { ...ownedMutation.note, id: 'orphan-note' } }],
+      },
+      { ...valid, outbox: [{ ...ownedMutation, opId: '' }] },
+      { ...valid, outbox: [{ ...ownedMutation, opId: 'x'.repeat(201) }] },
+      { ...valid, outbox: [{ ...ownedMutation, opId: 'nul\u0000operation' }] },
+      { ...valid, outbox: [ownedMutation, { ...ownedMutation }] },
+      {
+        ...valid,
+        outbox: [ownedMutation],
+        pendingPush: [
+          {
+            ...ownedMutation,
+            note: { ...ownedMutation.note, bodyMd: 'Different local draft' },
+          },
+        ],
+      },
+      { ...valid, pendingPush: [] },
+      {
+        ...valid,
+        syncIssue: {
+          code: 'held',
+          message: 'Held',
+          affectedOpIds: ['duplicate', 'duplicate'],
+          recoveryKind: 'retry',
+        },
+      },
+      {
+        ...valid,
+        conflicts: {
+          [noteId]: {
+            noteId,
+            localMutation: {
+              ...ownedMutation,
+              note: { ...ownedMutation.note, id: 'mismatched-note' },
+            },
+            serverNote: ownedNote,
+            detectedAt: '2026-07-19T10:03:00.000Z',
+          },
+        },
+      },
+    ];
+
+    for (const invalid of invalidRoots) {
+      const repository = new MemoryOwnerRepository();
+      const journal = new ReplicaRecoveryJournal(repository);
+      await expect(
+        journal.append(sourceOwner, JSON.stringify(invalid), 'stale-writer'),
+      ).rejects.toBeInstanceOf(ReplicaRecoveryJournalError);
+      expect(repository.commits).toBe(0);
+    }
+  });
+
+  it('reads observationally and returns detached frozen metadata', async () => {
+    const repository = new MemoryOwnerRepository();
+    const recoveryOwner = replicaRecoveryJournalOwnerKey(sourceOwner);
+    const raw = JSON.stringify({
+      version: 1,
+      ownerKey: recoveryOwner,
+      sourceOwnerKey: sourceOwner,
+      snapshots: [
+        {
+          sequence: 1,
+          capturedAt: '2026-07-19T10:03:00.000Z',
+          reason: 'stale-writer',
+          serializedReplica: replica('observational'),
+        },
+      ],
+    });
+    repository.values.set(recoveryOwner, raw);
+    const journal = new ReplicaRecoveryJournal(repository);
+
+    const first = await journal.read(sourceOwner);
+    const second = await journal.read(sourceOwner);
+
+    expect(repository.commits).toBe(0);
+    expect(repository.values.get(recoveryOwner)).toBe(raw);
+    expect(first).toEqual(second);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(Object.isFrozen(first!.snapshots)).toBe(true);
+    expect(Object.isFrozen(first!.snapshots[0])).toBe(true);
+  });
   it('rejects invalid capture metadata before writing a journal record', async () => {
     const repository = new MemoryOwnerRepository();
     const journal = new ReplicaRecoveryJournal(repository, () => 'not-an-iso-timestamp');

@@ -28,14 +28,23 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 - `app/_layout.tsx` — hydrates before routing, retries rejected-session tombstones, and runs the 8-second sync loop.
 - `app/index.tsx` — the root gate: `useObs(() => store$.session.get() !== null)` → `<Redirect href={signedIn ? '/notes' : '/sign-in'} />`.
 - `app/(auth)/_layout.tsx` — `<Stack>` for `sign-in` / `sign-up`. `(auth)` group is not in the URL.
-- `app/(app)/_layout.tsx` — `<Tabs>` for the signed-in app. Second gate: `if (!signedIn) return <Redirect href="/sign-in" />`. Declares **four** tabs via `<Tabs.Screen>`: `notes` (Notes), `conflicts` (title **Review**, with a `tabBarBadge` of the live `conflictCount`), `activity` (Activity), and `settings` (Settings). The tabs are keyed by `ownerKey` so they reset across an account switch.
+- `app/(app)/_layout.tsx` — `<Tabs>` for the signed-in app. Second gate: `if (!signedIn) return <Redirect href="/sign-in" />`. Declares **four** visible tabs via `<Tabs.Screen>`: `notes` (Notes), `conflicts` (title **Review**, with a `tabBarBadge` of the live `conflictCount`), `activity` (Activity), and `settings` (Settings), plus the hidden `recovery` route. The tabs are keyed by `ownerKey` so route and component state reset across an account switch.
 - `app/(app)/conflicts.tsx` — the **Review** inbox (`ConflictInbox`). Reads `store$.conflicts` and resolves each retained sync conflict via `keepLocalConflict` / `useServerConflict` from `sync/manager`.
 - `app/(app)/notes/_layout.tsx` — nested `<Stack>` registering `index` and `[id]`.
 - `app/(app)/notes/index.tsx` — list screen. Reactive reads via `useObs(selectVisibleNotes)`, `store$.status`, `store$.syncGated`, `store$.syncIssue`, `store$.outbox.length`. It owns the visible terminal-sync banner and manual recovery action. New note: `createNoteLocal(...)` then `router.push('/notes/'+id)`.
 - `app/(app)/notes/[id].tsx` — editor. `useLocalSearchParams<{id}>()`, `useObs(() => store$.notes[id].get())`, edits call `updateNoteLocal`/`deleteNoteLocal`. History/restore hit `api` directly.
+- `app/(app)/recovery.tsx` — owner-reset Recovery Center. It inventories journal,
+  memory-only, and distinct displayed branches through a credential-free inspection lease,
+  renders bounded previews, and requests the strict local all-branch export. It has no
+  choose/restore/import/merge/discard controls.
 - `src/state/store.ts` — owner-keyed replicas, separate session/tombstone storage,
   legacy `iris:state:v1` recovery quarantine, generation leases, verified writes, an
-  append-only stale-CAS recovery journal, read-only recovery mode, and selectors.
+  append-only stale-CAS recovery journal, read-only recovery mode, credential-free recovery
+  inspection/export leases, and selectors.
+- `src/state/replica-recovery-catalog.ts` + `src/recovery/export.ts` — bounded,
+  non-preferential branch summaries and the strict token-free exact-byte bundle.
+- `src/recovery/export-sink.ts` / `.native.ts` — web Blob download vs native
+  verified-cache/share handoff. Delivery is not proof that the user retained a destination.
 - `src/state/hooks.ts` — `useObs<T>(selector)`. The only sanctioned way to read `store$` in a component.
 - `src/state/storage.ts` — `storage: KVStore`. Web `localStorage`; native `expo-secure-store` (~2KB/key cap).
 - `src/sync/manager.ts` — optimistic mutations/conflict choices and deliberate
@@ -177,6 +186,20 @@ null`; route keys include the owner so component state cannot survive an account
   stays untouched; a
   compatible recovery candidate reopens read-only as `recovery-required`, and session departure
   is permitted only after pending candidates are verified.
+  - **Recovery inspection is a separate capability.** `openRecoveryInspectionLease` contains
+    owner identity + generation + abort signal, never bearer or device authority. Catalog reads
+    fence projection and recovery-candidate epochs, retry only a bounded pending→journal
+    transition, and fail stale on owner/display changes. A failed durable-journal read may expose
+    exact memory-only branches only as an explicitly partial inventory.
+  - **Local recovery export is fail-closed and all-branch.** It flushes only already-staged
+    candidates, never saves the primary root, never calls the API, and emits nothing if every
+    branch cannot be verified. Journal roots and a byte-distinct displayed root survive exactly;
+    structural equality is for UI matching only. The bundle's projection/recovery epoch is checked
+    through platform delivery. Web attaches the anchor and defers URL cleanup. Native reads the
+    cache file back before sharing, retains handed-off files for slow receivers, and attempts to
+    purge only files with verified timestamps older than 24 hours from Iris's dedicated cache
+    directory on later launches/exports; unknown timestamps remain, and a cleanup failure is
+    disclosed without blocking a separately named export.
   - **The singleton lives in `select-owner-replica-repository.ts`** (not `replica-repository.ts`,
     which is now pure building blocks). `store.ts` imports `ownerReplicaRepository` from there.
     It picks the platform store by capability detection (IndexedDB present → web; a
@@ -191,11 +214,15 @@ null`; route keys include the owner so component state cannot survive an account
     (`open-expo-sqlite-store.native.ts` real vs `open-expo-sqlite-store.ts` stub) so Metro never
     pulls `expo-sqlite` into the **web** bundle. If you add another native-only dependency to the
     replica path, split it the same way and re-run `pnpm --filter @iris/mobile run export:web`.
+    The recovery sink follows the same split so `expo-file-system` and `expo-sharing` stay on
+    native while the base file remains the browser implementation.
   - Remaining CUTOVER: add a mixed-version legacy/primary divergence journal, one Web Lock
     leader with read-only followers, metadata-only refresh, an enforceable old-client
-    compatibility gate, recovery export/resolve/discard controls, and browser/native acceptance.
+    compatibility gate, integrate divergence roots into Recovery Center, add
+    choose/restore/import/discard controls, and complete browser/native acceptance.
     Only then flip the default and port the coordinator to `/v2`.
     Writes are verified and non-fence failures set `error`; staging failure prevents dispatch.
 - **Everything is workspace-scoped by a fixed-token lease.** The client never sends a
   `workspaceId`; the server derives it. Do not replace `apiForLease` with a mutable
-  token callback for authenticated work.
+  token callback for authenticated work. Do not give Recovery Center a `SessionLease`; its
+  local-only `RecoveryInspectionLease` is intentionally credential-free.

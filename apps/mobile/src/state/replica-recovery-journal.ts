@@ -1,4 +1,9 @@
 import { assertSerializedReplicaOwner, type OwnerReplicaRepository } from './replica-repository';
+import {
+  assertReplicaSemanticIntegrity,
+  isValidReplicaOperationId,
+  type ReplicaIntegrityCandidate,
+} from './replica-integrity';
 import { ReplicaRepositoryStaleWriterError } from './transactional-replica-repository';
 
 export const REPLICA_RECOVERY_JOURNAL_VERSION = 1 as const;
@@ -156,7 +161,7 @@ function assertRecoveryNote(value: unknown): void {
 function assertRecoveryMutation(value: unknown): void {
   const mutation = strictRecord(value, RECOVERY_MUTATION_KEYS, 'mutation');
   if (
-    typeof mutation.opId !== 'string' ||
+    !isValidReplicaOperationId(mutation.opId) ||
     !['upsert', 'delete', 'resurrect'].includes(mutation.type as string) ||
     !Number.isSafeInteger(mutation.baseVersion) ||
     (mutation.baseVersion as number) < 0
@@ -226,7 +231,10 @@ function assertStrictNestedReplicaShape(parsed: Record<string, unknown>): void {
   }
 }
 
-function assertTokenFreeReplica(sourceOwnerKey: string, serializedReplica: string): void {
+export function assertReplicaRecoverySnapshot(
+  sourceOwnerKey: string,
+  serializedReplica: string,
+): void {
   try {
     assertSerializedReplicaOwner(sourceOwnerKey, serializedReplica);
     const parsed = JSON.parse(serializedReplica) as Record<string, unknown>;
@@ -245,6 +253,7 @@ function assertTokenFreeReplica(sourceOwnerKey: string, serializedReplica: strin
     }
     assertStrictNestedReplicaShape(parsed);
     assertNoCredentialFields(parsed);
+    assertReplicaSemanticIntegrity(parsed as unknown as ReplicaIntegrityCandidate);
   } catch (cause) {
     if (cause instanceof ReplicaRecoveryJournalError) throw cause;
     throw new ReplicaRecoveryJournalError('Recovery snapshot ownership is invalid', { cause });
@@ -302,7 +311,7 @@ export function parseReplicaRecoveryEnvelope(
     ) {
       throw new ReplicaRecoveryJournalError('Recovery journal snapshot metadata is invalid');
     }
-    assertTokenFreeReplica(sourceOwnerKey, snapshot.serializedReplica);
+    assertReplicaRecoverySnapshot(sourceOwnerKey, snapshot.serializedReplica);
     if (seen.has(snapshot.serializedReplica)) {
       throw new ReplicaRecoveryJournalError('Recovery journal contains a duplicate snapshot');
     }
@@ -350,7 +359,7 @@ export class ReplicaRecoveryJournal {
     reason: ReplicaRecoveryReason,
   ): Promise<ReplicaRecoveryEnvelope> {
     try {
-      assertTokenFreeReplica(sourceOwnerKey, serializedReplica);
+      assertReplicaRecoverySnapshot(sourceOwnerKey, serializedReplica);
     } catch (cause) {
       return Promise.reject(
         cause instanceof ReplicaRecoveryJournalError

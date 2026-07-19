@@ -146,7 +146,14 @@ These were named as out of scope and are staying out until the foundation is pro
   pending candidates; rejected credentials are still tombstoned and surface any recovery failure.
   Pull pagination stops on a lost commit. Tests cover overlapping losers, append failure, delayed
   reads, observer re-entry, gated departure, 401, sign-out/login recovery, rejected primary reads,
-  and invalid authority. Force-quit recovery remains an explicit browser/device acceptance gate.
+  and invalid authority. An owner-fenced Recovery Center now inventories every journal, memory,
+  and distinct displayed branch it can verify, exposes a clearly partial memory inventory when the
+  journal is unreadable, and creates a strict token-free local bundle without saving the primary
+  root or calling the API. Exact displayed bytes are embedded when no byte-identical journal root
+  exists. Web requests a deferred-cleanup Blob download; native verifies a private cache file,
+  retains it across share handoff, and later attempts to purge expired files without blocking a
+  new export on cleanup failure. Choose/restore/import/discard
+  and force-quit browser/device acceptance remain open.
 - **Phase 2.12 — server launch hardening, partial**: user-only device deregistration and
   account deletion endpoints, runtime non-superuser RLS tests, production Stripe-key
   guards, and a coarse per-IP rate limiter are shipped. Client device/deletion UX,
@@ -163,8 +170,8 @@ These were named as out of scope and are staying out until the foundation is pro
    cannot prevent the old write, so production also requires an approved server storage epoch,
    upgrade-required response, or explicit old-client invalidation.
 2. **Controlled transactional-authority acceptance + recovery resolution UX.** Keep `/v1`
-   networking while extending the shipped read-only warning with local export, choose-winner,
-   import, and discard controls for stale-CAS, diverged, and quarantined roots, then test
+   networking while integrating diverged and quarantined roots into the shipped local Recovery
+   Center and adding choose-winner, restore/import, and discard controls, then test
    IndexedDB reload, native SQLite force-quit/reopen, A→B switching, unsupported-platform
    fallback, and the explicit at-rest policy. Flip the default only after the compatibility
    contract and these gates pass.

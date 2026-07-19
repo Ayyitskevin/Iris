@@ -3,6 +3,7 @@ import { ActivityIndicator, View } from 'react-native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { purgeStaleReplicaRecoveryExports } from '../src/recovery/export-sink';
 import { loadState, retryPendingSessionPersistence, store$ } from '../src/state/store';
 import { sync } from '../src/sync/manager';
 import { theme } from '../src/theme';
@@ -13,6 +14,9 @@ export default function RootLayout() {
   // Hydrate local state before rendering routes — the app must open instantly, offline.
   useEffect(() => {
     void loadState().then(() => setReady(true));
+    void purgeStaleReplicaRecoveryExports().catch((error: unknown) => {
+      console.warn('Could not clean stale recovery export cache files', error);
+    });
   }, []);
 
   // Background sync loop while signed in.

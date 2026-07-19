@@ -39,6 +39,7 @@ function OwnerTabs({ conflictCount }: { conflictCount: number }) {
         name="activity"
         options={{ title: 'Activity', tabBarIcon: ({ color }) => <Text style={{ color }}>◉</Text> }}
       />
+      <Tabs.Screen name="recovery" options={{ href: null }} />
       <Tabs.Screen
         name="settings"
         options={{ title: 'Settings', tabBarIcon: ({ color }) => <Text style={{ color }}>⚙</Text> }}

@@ -149,10 +149,20 @@ on a later login Iris can reopen the newest compatible recovery snapshot in a vi
 proceed only after pending recovery candidates are verified. A failed append retains its exact
 candidate only for same-process retry; it cannot be crash-durable while the selected repository is
 failing. Cross-process journal union requires the transactional CAS repository; the default legacy
-adapter remains last-write-wins. The flag is still not cutover-safe:
+adapter remains last-write-wins. Settings now links to an owner-fenced Recovery Center in both
+ordinary error and read-only recovery states. It inventories journal-verified, memory-only, and
+distinct displayed branches with bounded previews and can create a strict token-free local JSON
+bundle. Export first makes every already-staged branch journal-durable and aborts rather than claim
+an incomplete bundle; it never writes the primary root or calls the Iris API. Web requests a Blob
+download. Native verifies an app-private cache file byte-for-byte, opens the share sheet, retains
+the handed-off file long enough for receivers, and attempts to purge Iris-owned cache files with
+verified timestamps older than 24 hours on a later launch/export. Unknown timestamps are retained;
+cleanup failures are surfaced without blocking a separately named export. Neither platform claims
+that the user retained the destination file.
+The flag is still not cutover-safe:
 client-only code cannot stop an already-loaded old tab/version from writing the legacy copy.
 Mixed-version divergence detection, one web leader, an enforceable server compatibility gate,
-recovery export/resolve/discard controls, the v2 pull applier, at-rest policy, and browser/native
+recovery choose/restore/import/discard controls, the v2 pull applier, at-rest policy, and browser/native
 acceptance remain open. See `docs/MASTER_PLAN.md` for the ordered release gates.
 GitHub Actions run `29506816638` passed the PostgreSQL 16
 independent-connection commit-order and concurrent device-gate gate for commit

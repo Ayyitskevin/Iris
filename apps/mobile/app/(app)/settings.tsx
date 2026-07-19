@@ -1,11 +1,18 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Linking, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router, useFocusEffect } from 'expo-router';
 import { ApiRequestError, type AgentToken, type BillingStatus } from '@iris/shared';
 import { Button, Card, Field, Muted, RecoveryNotice, Screen, Title } from '../../src/components/ui';
 import { authenticatedRequest } from '../../src/api';
 import { signOut } from '../../src/auth/session';
-import { assertCurrentSession, store$ } from '../../src/state/store';
+import {
+  assertCurrentSession,
+  isCurrentRecoveryInspectionLease,
+  openRecoveryInspectionLease,
+  readReplicaRecoveryCatalogForLease,
+  recoveryCatalogRevision$,
+  store$,
+} from '../../src/state/store';
 import { useObs } from '../../src/state/hooks';
 import { theme } from '../../src/theme';
 
@@ -13,12 +20,18 @@ export default function Settings() {
   const email = useObs(() => store$.session.get()?.email ?? '');
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
   const recoveryRequired = useObs(() => store$.status.get() === 'recovery-required');
+  const recoveryCatalogRevision = useObs(() => recoveryCatalogRevision$.get());
   const [billing, setBilling] = useState<BillingStatus | null>(null);
   const [tokens, setTokens] = useState<AgentToken[]>([]);
   const [newAgentName, setNewAgentName] = useState('');
   const [issuedToken, setIssuedToken] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState(false);
+  const [recoveryCount, setRecoveryCount] = useState<number | null>(null);
+  const [recoveryInventoryComplete, setRecoveryInventoryComplete] = useState<boolean | null>(null);
+  const [recoveryMemoryOnlyCount, setRecoveryMemoryOnlyCount] = useState<number | null>(null);
+  const [recoveryLoadError, setRecoveryLoadError] = useState(false);
+  const recoveryRequest = useRef(0);
 
   useEffect(() => {
     setBilling(null);
@@ -27,6 +40,11 @@ export default function Settings() {
     setIssuedToken(null);
     setSigningOut(false);
     setSignOutError(false);
+    recoveryRequest.current += 1;
+    setRecoveryCount(null);
+    setRecoveryInventoryComplete(null);
+    setRecoveryMemoryOnlyCount(null);
+    setRecoveryLoadError(false);
   }, [ownerKey]);
 
   const load = useCallback(async () => {
@@ -48,10 +66,45 @@ export default function Settings() {
     }
   }, [ownerKey, recoveryRequired]);
 
+  const loadRecovery = useCallback(async () => {
+    const request = ++recoveryRequest.current;
+    setRecoveryCount(null);
+    setRecoveryInventoryComplete(null);
+    setRecoveryMemoryOnlyCount(null);
+    setRecoveryLoadError(false);
+    const lease = openRecoveryInspectionLease();
+    if (!lease) {
+      if (recoveryRequest.current === request) setRecoveryLoadError(true);
+      return;
+    }
+    try {
+      const catalog = await readReplicaRecoveryCatalogForLease(lease);
+      if (recoveryRequest.current !== request || !isCurrentRecoveryInspectionLease(lease)) {
+        return;
+      }
+      setRecoveryCount(catalog?.preservedCount ?? 0);
+      setRecoveryInventoryComplete(catalog?.inventoryComplete ?? true);
+      setRecoveryMemoryOnlyCount(catalog?.memoryOnlyCount ?? 0);
+    } catch {
+      if (recoveryRequest.current === request && store$.activeOwnerKey.get() === ownerKey) {
+        setRecoveryLoadError(true);
+      }
+    }
+  }, [ownerKey]);
+
   useFocusEffect(
     useCallback(() => {
       void load();
     }, [load]),
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      void loadRecovery();
+      return () => {
+        recoveryRequest.current += 1;
+      };
+    }, [loadRecovery, recoveryCatalogRevision]),
   );
 
   async function subscribe() {
@@ -224,9 +277,46 @@ export default function Settings() {
             : null}
         </Card>
 
-        <Card>
-          <Text style={styles.cardTitle}>Your data</Text>
-          <Muted>Export the whole workspace as plain Markdown. No lock-in.</Muted>
+        <Card style={recoveryRequired ? styles.recoveryDataCard : undefined}>
+          <Text accessibilityRole="header" style={styles.cardTitle}>
+            Your data
+          </Text>
+          <Text accessibilityRole="header" style={styles.dataTitle}>
+            Local recovery copies
+          </Text>
+          {recoveryLoadError ? (
+            <Text accessibilityRole="alert" style={styles.recoveryError}>
+              Recovery storage could not be verified. Open the Recovery Center to retry.
+            </Text>
+          ) : recoveryCount === null ? (
+            <Muted>Checking local recovery storage…</Muted>
+          ) : recoveryInventoryComplete === false ? (
+            <Muted>
+              At least {recoveryCount} memory-only {recoveryCount === 1 ? 'copy is' : 'copies are'}{' '}
+              available. Durable recovery storage could not be verified, so this count may be
+              incomplete.
+            </Muted>
+          ) : recoveryCount === 0 ? (
+            <Muted>No preserved copies for this account.</Muted>
+          ) : recoveryMemoryOnlyCount !== null && recoveryMemoryOnlyCount > 0 ? (
+            <Muted>
+              {recoveryCount} preserved {recoveryCount === 1 ? 'copy' : 'copies'} available;{' '}
+              {recoveryMemoryOnlyCount} {recoveryMemoryOnlyCount === 1 ? 'is' : 'are'} still
+              memory-only. Keep Iris open.
+            </Muted>
+          ) : (
+            <Muted>
+              {recoveryCount} preserved {recoveryCount === 1 ? 'copy' : 'copies'} available.
+            </Muted>
+          )}
+          <View style={{ height: theme.space(2) }} />
+          <Button
+            label="Open Recovery Center"
+            variant="ghost"
+            onPress={() => router.push('/recovery')}
+          />
+          <View style={styles.dataDivider} />
+          <Muted>Export the whole server workspace as plain Markdown. No lock-in.</Muted>
           <View style={{ height: theme.space(2) }} />
           <Button
             label="Export server workspace (.zip)"
@@ -235,7 +325,7 @@ export default function Settings() {
             disabled={recoveryRequired}
           />
           {Platform.OS !== 'web' ? (
-            <Muted>On device, export opens a share sheet in a full build (follow-up).</Muted>
+            <Muted>On device, server export sharing remains a follow-up.</Muted>
           ) : null}
         </Card>
 
@@ -273,6 +363,21 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginBottom: theme.space(2),
   },
+  dataTitle: {
+    color: theme.colors.text,
+    fontSize: 15,
+    fontWeight: '700',
+    marginBottom: theme.space(1),
+  },
+  dataDivider: {
+    borderTopColor: theme.colors.border,
+    borderTopWidth: 1,
+    marginVertical: theme.space(3),
+  },
+  recoveryDataCard: {
+    borderColor: theme.colors.danger,
+  },
+  recoveryError: { color: theme.colors.danger, fontSize: 14 },
   line: { color: theme.colors.text, fontSize: 14, marginBottom: theme.space(1) },
   strong: { fontWeight: '700', color: theme.colors.accent },
   tokenBox: {

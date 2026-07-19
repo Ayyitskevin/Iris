@@ -5,6 +5,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  type AccessibilityState,
   type TextInputProps,
   View,
   type ViewProps,
@@ -23,7 +24,11 @@ export function Screen({ children, style, ...rest }: ViewProps & { children: Rea
 }
 
 export function Title({ children }: { children: ReactNode }) {
-  return <Text style={styles.title}>{children}</Text>;
+  return (
+    <Text accessibilityRole="header" style={styles.title}>
+      {children}
+    </Text>
+  );
 }
 
 export function Muted({ children }: { children: ReactNode }) {
@@ -35,9 +40,9 @@ export function RecoveryNotice() {
     <View style={styles.recoveryNotice} accessibilityRole="alert">
       <Text style={styles.recoveryTitle}>Local recovery mode</Text>
       <Text style={styles.recoveryText}>
-        Iris paused edits, sync, and account actions to avoid overwriting a local copy. Notes are
-        read-only in this build. Keep the app open if storage failed; sign-out remains available but
-        may need to retry preservation.
+        Iris paused edits, sync, and account actions. One or more local copies need attention. The
+        copy shown in Iris may not be newer or more complete. Open Settings → Recovery Center to
+        inspect what Iris can currently verify and request a fail-closed local export.
       </Text>
     </View>
   );
@@ -54,6 +59,7 @@ export function Button({
   loading,
   disabled,
   accessibilityLabel,
+  accessibilityState,
 }: {
   label: string;
   onPress: () => void;
@@ -61,6 +67,7 @@ export function Button({
   loading?: boolean;
   disabled?: boolean;
   accessibilityLabel?: string;
+  accessibilityState?: AccessibilityState;
 }) {
   const unavailable = Boolean(disabled || loading);
   const bg =
@@ -76,7 +83,7 @@ export function Button({
       disabled={unavailable}
       accessibilityRole="button"
       accessibilityLabel={accessibilityLabel ?? label}
-      accessibilityState={{ disabled: unavailable }}
+      accessibilityState={{ ...accessibilityState, disabled: unavailable, busy: Boolean(loading) }}
       style={({ pressed }) => [
         styles.button,
         { backgroundColor: bg, opacity: unavailable ? 0.5 : pressed ? 0.85 : 1 },

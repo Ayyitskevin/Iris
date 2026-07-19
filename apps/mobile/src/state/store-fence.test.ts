@@ -65,6 +65,7 @@ vi.mock('./select-owner-replica-repository', () => ({
       if (repo.failReadKey === ownerKey) {
         throw new Error('injected invalid transactional record');
       }
+      const observed = repo.durable.get(ownerKey) ?? null;
       const gate = repo.readGates.get(ownerKey);
       if (gate) {
         repo.readGates.delete(ownerKey);
@@ -73,7 +74,7 @@ vi.mock('./select-owner-replica-repository', () => ({
       }
       // A read is what clears a stale-writer fence and returns the authoritative bytes.
       repo.fenced.delete(ownerKey);
-      return repo.durable.get(ownerKey) ?? null;
+      return observed;
     },
     async commit(ownerKey: string, raw: string): Promise<void> {
       repo.commits.push(ownerKey);
@@ -102,18 +103,25 @@ import {
   parseReplicaRecoveryEnvelope,
   replicaRecoveryJournalOwnerKey,
 } from './replica-recovery-journal';
+import { parseReplicaRecoveryExport } from '../recovery/export';
 import { ReplicaRepositoryStaleWriterError } from './transactional-replica-repository';
 import {
   adoptSession,
   applyReplicaForLease,
+  createReplicaRecoveryExportForLease,
   expireSessionIfCurrent,
+  isCurrentReplicaRecoveryExportArtifact,
   loadState,
+  openRecoveryInspectionLease,
   openSessionLease,
   ownerKeyFor,
+  readReplicaRecoveryCatalogForLease,
+  recoveryCatalogRevision$,
   ReplicaCommitSupersededError,
   saveState,
   signOutSession,
   stateStorageKeys,
+  StaleRecoveryInspectionError,
   StaleSessionError,
   StatePersistenceError,
   store$,
@@ -226,6 +234,12 @@ async function signIn(): Promise<SessionLease> {
   return lease;
 }
 
+function recoveryInspectionLease() {
+  const lease = openRecoveryInspectionLease();
+  if (!lease) throw new Error('expected a recovery inspection lease');
+  return lease;
+}
+
 async function expectUnreadableWinnerIsFenced(
   buildWinner: (deviceId: string) => string | null,
 ): Promise<void> {
@@ -326,6 +340,321 @@ describe('owner store fence-awareness', () => {
     expect(preserved.outbox).toEqual([localMutation]);
   });
 
+  it('surfaces and exports a preserved loser after a valid winner without rewriting either root', async () => {
+    const lease = await signIn();
+    const ownerKey = ownerKeyFor(sessionA);
+    const recoveryKey = replicaRecoveryJournalOwnerKey(ownerKey);
+    const loser = note(noteAId, 'preserved loser');
+    await updateReplicaForLease(lease, (current) => ({
+      ...current,
+      notes: { [loser.id]: loser },
+    }));
+    const loserRaw = repo.durable.get(ownerKey)!;
+    const winnerRaw = winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get());
+    repo.winner.set(ownerKey, winnerRaw);
+    repo.raceNextCommit.add(ownerKey);
+
+    expect(await saveState()).toBe(false);
+    expect(store$.status.get()).toBe('error');
+    const journalRaw = repo.durable.get(recoveryKey)!;
+    const commitsBeforeInspection = [...repo.commits];
+    repo.reads = [];
+    const inspection = recoveryInspectionLease();
+
+    const catalog = await readReplicaRecoveryCatalogForLease(inspection);
+    expect(catalog!.preservedCount).toBe(1);
+    expect(catalog!.copies.map((copy) => copy.persistence)).toEqual([
+      'journal-verified',
+      'displayed-only',
+    ]);
+    expect(catalog!.copies[0]!.matchesDisplayedProjection).toBe(false);
+    expect(catalog!.copies[1]!.matchesDisplayedProjection).toBe(true);
+
+    const firstExport = await createReplicaRecoveryExportForLease(
+      inspection,
+      '2026-07-19T16:00:00.000Z',
+    );
+    const secondExport = await createReplicaRecoveryExportForLease(
+      inspection,
+      '2026-07-19T16:00:00.000Z',
+    );
+    const parsed = parseReplicaRecoveryExport(firstExport.serializedExport, ownerKey);
+    expect(parsed.snapshots[0]!.serializedReplica).toBe(loserRaw);
+    expect(parsed.displayed).toMatchObject({ kind: 'embedded' });
+    expect(firstExport.serializedExport).toBe(secondExport.serializedExport);
+    expect(firstExport.serializedExport).not.toContain(sessionA.token);
+    expect(repo.commits).toEqual(commitsBeforeInspection);
+    expect(repo.durable.get(ownerKey)).toBe(winnerRaw);
+    expect(repo.durable.get(recoveryKey)).toBe(journalRaw);
+    expect(new Set(repo.reads)).toEqual(new Set([recoveryKey]));
+  });
+
+  it('lists every distinct loser in capture sequence during read-only recovery', async () => {
+    const firstLease = await signIn();
+    const ownerKey = ownerKeyFor(sessionA);
+    await updateReplicaForLease(firstLease, (current) => ({
+      ...current,
+      notes: { [noteAId]: note(noteAId, 'first loser') },
+    }));
+    repo.winner.set(
+      ownerKey,
+      winnerBytes({ [noteBId]: note(noteBId, 'first winner') }, store$.deviceId.get()),
+    );
+    repo.raceNextCommit.add(ownerKey);
+    expect(await saveState()).toBe(false);
+    expect(store$.status.get()).toBe('error');
+
+    const secondLease = openSessionLease();
+    if (!secondLease) throw new Error('expected a fresh lease after the first recovery');
+    await updateReplicaForLease(secondLease, (current) => ({
+      ...current,
+      notes: { ...current.notes, [noteCId]: note(noteCId, 'second loser') },
+    }));
+    repo.winner.set(ownerKey, '{');
+    repo.raceNextCommit.add(ownerKey);
+    expect(await saveState()).toBe(false);
+
+    expect(store$.status.get()).toBe('recovery-required');
+    expect(openSessionLease()).toBeNull();
+    const catalog = await readReplicaRecoveryCatalogForLease(recoveryInspectionLease());
+    expect(catalog!.copies.map((copy) => copy.sequence)).toEqual([1, 2]);
+    expect(catalog!.copies.map((copy) => copy.liveNoteCount)).toEqual([1, 2]);
+    expect(catalog!.copies.map((copy) => copy.matchesDisplayedProjection)).toEqual([false, true]);
+  });
+
+  it('shows memory-only candidates and refuses an incomplete export until append verification succeeds', async () => {
+    const lease = await signIn();
+    const ownerKey = ownerKeyFor(sessionA);
+    const recoveryKey = replicaRecoveryJournalOwnerKey(ownerKey);
+    const localNote = note(noteAId, 'pending recovery export');
+    const localMutation = mutation(noteAId, 'op-pending-export', localNote.bodyMd);
+    await updateReplicaForLease(lease, (current) => ({
+      ...current,
+      notes: { [localNote.id]: localNote },
+      outbox: [localMutation],
+    }));
+    const loserRaw = repo.durable.get(ownerKey)!;
+    const winnerRaw = winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get());
+    repo.winner.set(ownerKey, winnerRaw);
+    repo.raceNextCommit.add(ownerKey);
+    repo.failCommitKey = recoveryKey;
+
+    expect(await saveState()).toBe(false);
+    expect(store$.status.get()).toBe('recovery-required');
+    const inspection = recoveryInspectionLease();
+    const pendingCatalog = await readReplicaRecoveryCatalogForLease(inspection);
+    expect(pendingCatalog).toMatchObject({
+      preservedCount: 1,
+      journalVerifiedCount: 0,
+      memoryOnlyCount: 1,
+      hasUnverifiedCopies: true,
+    });
+    expect(pendingCatalog!.copies[0]).toMatchObject({
+      persistence: 'memory-only',
+      matchesDisplayedProjection: true,
+    });
+
+    repo.failCommitKey = recoveryKey;
+    await expect(
+      createReplicaRecoveryExportForLease(inspection, '2026-07-19T16:01:00.000Z'),
+    ).rejects.toBeInstanceOf(StatePersistenceError);
+    expect(repo.durable.has(recoveryKey)).toBe(false);
+    expect(repo.durable.get(ownerKey)).toBe(winnerRaw);
+    expect(store$.status.get()).toBe('recovery-required');
+
+    const artifact = await createReplicaRecoveryExportForLease(
+      inspection,
+      '2026-07-19T16:01:01.000Z',
+    );
+    const parsed = parseReplicaRecoveryExport(artifact.serializedExport, ownerKey);
+    expect(parsed.snapshots.map((snapshot) => snapshot.serializedReplica)).toEqual([loserRaw]);
+    expect(artifact.catalog).toMatchObject({ memoryOnlyCount: 0, journalVerifiedCount: 1 });
+    const commitsAfterVerifiedExport = [...repo.commits];
+    await createReplicaRecoveryExportForLease(inspection, '2026-07-19T16:01:02.000Z');
+    expect(repo.commits).toEqual(commitsAfterVerifiedExport);
+    expect(repo.durable.get(ownerKey)).toBe(winnerRaw);
+  });
+
+  it('retries an inventory read that overlaps a pending copy becoming journal-verified', async () => {
+    const lease = await signIn();
+    const ownerKey = ownerKeyFor(sessionA);
+    const recoveryKey = replicaRecoveryJournalOwnerKey(ownerKey);
+    const localNote = note(noteAId, 'pending transition');
+    await updateReplicaForLease(lease, (current) => ({
+      ...current,
+      notes: { [localNote.id]: localNote },
+    }));
+    const loserRaw = repo.durable.get(ownerKey)!;
+    repo.winner.set(
+      ownerKey,
+      winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()),
+    );
+    repo.raceNextCommit.add(ownerKey);
+    repo.failCommitKey = recoveryKey;
+    expect(await saveState()).toBe(false);
+
+    const inspection = recoveryInspectionLease();
+    const gate = holdNextRead(recoveryKey);
+    const delayedCatalog = readReplicaRecoveryCatalogForLease(inspection);
+    await gate.started;
+    const artifact = await createReplicaRecoveryExportForLease(
+      inspection,
+      '2026-07-19T16:02:00.000Z',
+    );
+    gate.unblock();
+
+    await expect(delayedCatalog).resolves.toMatchObject({
+      inventoryComplete: true,
+      preservedCount: 1,
+      journalVerifiedCount: 1,
+      memoryOnlyCount: 0,
+    });
+    expect(
+      parseReplicaRecoveryExport(artifact.serializedExport, ownerKey).snapshots[0]!
+        .serializedReplica,
+    ).toBe(loserRaw);
+  });
+
+  it('still shows exact memory-only copies when durable journal inspection fails', async () => {
+    const lease = await signIn();
+    const ownerKey = ownerKeyFor(sessionA);
+    const recoveryKey = replicaRecoveryJournalOwnerKey(ownerKey);
+    await updateReplicaForLease(lease, (current) => ({
+      ...current,
+      notes: { [noteAId]: note(noteAId, 'memory-only during read failure') },
+    }));
+    repo.winner.set(
+      ownerKey,
+      winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()),
+    );
+    repo.raceNextCommit.add(ownerKey);
+    repo.failCommitKey = recoveryKey;
+    expect(await saveState()).toBe(false);
+    repo.failReadKey = recoveryKey;
+
+    const catalog = await readReplicaRecoveryCatalogForLease(recoveryInspectionLease());
+
+    expect(catalog).toMatchObject({
+      inventoryComplete: false,
+      preservedCount: 1,
+      journalVerifiedCount: 0,
+      memoryOnlyCount: 1,
+    });
+    expect(catalog!.copies[0]).toMatchObject({
+      persistence: 'memory-only',
+      matchesDisplayedProjection: true,
+    });
+    repo.failReadKey = null;
+    await createReplicaRecoveryExportForLease(
+      recoveryInspectionLease(),
+      '2026-07-19T16:03:00.000Z',
+    );
+  });
+
+  it('rejects a delayed owner-A recovery read after switching to owner B', async () => {
+    const lease = await signIn();
+    const ownerKey = ownerKeyFor(sessionA);
+    const recoveryKey = replicaRecoveryJournalOwnerKey(ownerKey);
+    await updateReplicaForLease(lease, (current) => ({
+      ...current,
+      notes: { [noteAId]: note(noteAId, 'owner A loser') },
+    }));
+    repo.winner.set(
+      ownerKey,
+      winnerBytes({ [noteBId]: note(noteBId, 'owner A winner') }, store$.deviceId.get()),
+    );
+    repo.raceNextCommit.add(ownerKey);
+    expect(await saveState()).toBe(false);
+    const journalRaw = repo.durable.get(recoveryKey);
+    const gate = holdNextRead(recoveryKey);
+    const delayed = readReplicaRecoveryCatalogForLease(recoveryInspectionLease());
+
+    await gate.started;
+    await adoptSession(sessionB);
+    gate.unblock();
+
+    await expect(delayed).rejects.toBeInstanceOf(StaleSessionError);
+    expect(store$.session.get()).toEqual(sessionB);
+    expect(store$.activeOwnerKey.get()).toBe(ownerKeyFor(sessionB));
+    expect(repo.durable.get(recoveryKey)).toBe(journalRaw);
+  });
+
+  it('rejects a same-owner catalog read when the displayed projection changes in flight', async () => {
+    const lease = await signIn();
+    const ownerKey = ownerKeyFor(sessionA);
+    const recoveryKey = replicaRecoveryJournalOwnerKey(ownerKey);
+    await updateReplicaForLease(lease, (current) => ({
+      ...current,
+      notes: { [noteAId]: note(noteAId, 'loser') },
+    }));
+    repo.winner.set(
+      ownerKey,
+      winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()),
+    );
+    repo.raceNextCommit.add(ownerKey);
+    expect(await saveState()).toBe(false);
+    const inspection = recoveryInspectionLease();
+    const gate = holdNextRead(recoveryKey);
+    const delayed = readReplicaRecoveryCatalogForLease(inspection);
+
+    await gate.started;
+    const currentLease = openSessionLease();
+    if (!currentLease) throw new Error('expected writable winner lease');
+    await updateReplicaForLease(currentLease, (current) => ({
+      ...current,
+      notes: { ...current.notes, [noteCId]: note(noteCId, 'changed while reading') },
+    }));
+    gate.unblock();
+
+    await expect(delayed).rejects.toBeInstanceOf(StaleRecoveryInspectionError);
+  });
+
+  it('invalidates a completed export artifact when the displayed projection changes', async () => {
+    const lease = await signIn();
+    const ownerKey = ownerKeyFor(sessionA);
+    await updateReplicaForLease(lease, (current) => ({
+      ...current,
+      notes: { [noteAId]: note(noteAId, 'loser') },
+    }));
+    repo.winner.set(
+      ownerKey,
+      winnerBytes({ [noteBId]: note(noteBId, 'winner') }, store$.deviceId.get()),
+    );
+    repo.raceNextCommit.add(ownerKey);
+    expect(await saveState()).toBe(false);
+    const inspection = recoveryInspectionLease();
+    const artifact = await createReplicaRecoveryExportForLease(
+      inspection,
+      '2026-07-19T16:03:00.000Z',
+    );
+    expect(isCurrentReplicaRecoveryExportArtifact(inspection, artifact)).toBe(true);
+    const revision = recoveryCatalogRevision$.get();
+
+    const currentLease = openSessionLease();
+    if (!currentLease) throw new Error('expected writable winner lease');
+    await updateReplicaForLease(currentLease, (current) => ({
+      ...current,
+      notes: { ...current.notes, [noteCId]: note(noteCId, 'changed after export creation') },
+    }));
+
+    expect(recoveryCatalogRevision$.get()).toBeGreaterThan(revision);
+    expect(isCurrentReplicaRecoveryExportArtifact(inspection, artifact)).toBe(false);
+  });
+
+  it('fails closed on a malformed journal without normalizing or deleting its bytes', async () => {
+    await signIn();
+    const ownerKey = ownerKeyFor(sessionA);
+    const recoveryKey = replicaRecoveryJournalOwnerKey(ownerKey);
+    repo.durable.set(recoveryKey, '{');
+    const commitsBefore = [...repo.commits];
+
+    await expect(
+      readReplicaRecoveryCatalogForLease(recoveryInspectionLease()),
+    ).rejects.toBeInstanceOf(StatePersistenceError);
+
+    expect(repo.durable.get(recoveryKey)).toBe('{');
+    expect(repo.commits).toEqual(commitsBefore);
+  });
   it('retains the exact loser when its first journal append fails', async () => {
     const lease = await signIn();
     const ownerKey = ownerKeyFor(sessionA);
@@ -614,6 +943,15 @@ describe('owner store fence-awareness', () => {
         winnerBytes({ [noteBId]: note(noteBId, 'future') }, deviceId),
       ) as Record<string, unknown>;
       return JSON.stringify({ ...current, version: 3 });
+    });
+  });
+
+  it('keeps later writes fenced when the authoritative winner has a malformed scalar', async () => {
+    await expectUnreadableWinnerIsFenced((deviceId) => {
+      const current = JSON.parse(
+        winnerBytes({ [noteBId]: note(noteBId, 'malformed') }, deviceId),
+      ) as Record<string, unknown>;
+      return JSON.stringify({ ...current, syncCursor: 42 });
     });
   });
 
