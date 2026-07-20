@@ -20,7 +20,20 @@ import {
   ReplicaRepositoryError,
   type OwnerReplicaRepository,
 } from './replica-repository';
-import { ReplicaRecoveryJournal, type ReplicaRecoveryReason } from './replica-recovery-journal';
+import {
+  ReplicaRecoveryJournal,
+  replicaRecoveryJournalOwnerKey,
+  type ReplicaRecoveryReason,
+} from './replica-recovery-journal';
+
+async function eraseOwnerRoot(repository: OwnerReplicaRepository, ownerKey: string): Promise<void> {
+  if (typeof repository.erase !== 'function') {
+    throw new ReplicaRepositoryError(
+      'Owner replica erase is unavailable on a required storage adapter',
+    );
+  }
+  await repository.erase(ownerKey);
+}
 
 interface ReplicaRoots {
   readonly primaryRaw: string | null;
@@ -101,6 +114,19 @@ export class PromotingOwnerReplicaRepository implements OwnerReplicaRepository {
       return Promise.reject(cause);
     }
     return this.enqueue(ownerKey, () => this.commitVerified(ownerKey, serializedReplica));
+  }
+
+  /**
+   * Confirmed account deletion: erase primary, legacy, and recovery-journal roots for this
+   * owner. Missing erase on a child adapter fails closed rather than claiming a partial wipe.
+   */
+  erase(ownerKey: string): Promise<void> {
+    return this.enqueue(ownerKey, async () => {
+      const journalOwnerKey = replicaRecoveryJournalOwnerKey(ownerKey);
+      await eraseOwnerRoot(this.primary, ownerKey);
+      await eraseOwnerRoot(this.legacy, ownerKey);
+      await eraseOwnerRoot(this.primary, journalOwnerKey);
+    });
   }
 
   private enqueue<Result>(ownerKey: string, task: () => Promise<Result>): Promise<Result> {

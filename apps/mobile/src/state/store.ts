@@ -139,7 +139,7 @@ interface LegacyRecovery {
 interface SessionTombstone {
   version: 2;
   state: 'signed-out';
-  reason: 'sign-out' | 'rejected';
+  reason: 'sign-out' | 'rejected' | 'account-deleted';
   ownerKey: string | null;
   completedAt: string;
 }
@@ -317,7 +317,7 @@ function isSessionTombstone(value: unknown): value is SessionTombstone {
   return (
     v.version === 2 &&
     v.state === 'signed-out' &&
-    (v.reason === 'sign-out' || v.reason === 'rejected') &&
+    (v.reason === 'sign-out' || v.reason === 'rejected' || v.reason === 'account-deleted') &&
     (v.ownerKey === null || typeof v.ownerKey === 'string') &&
     typeof v.completedAt === 'string'
   );
@@ -1631,6 +1631,121 @@ export function adoptSession(next: Session): Promise<void> {
       if (priorReplica) setOwnerPersistenceFailureStatus(priorReplica.ownerKey);
       else store$.status.set('error');
       throw error;
+    } finally {
+      finishSessionTransition();
+    }
+  });
+}
+
+/**
+ * Confirmation that the server has already completed irreversible account erasure.
+ * Local wipe refuses to run without `serverDeleted: true` and an exact owner key match.
+ */
+export interface ConfirmedAccountDeletion {
+  readonly serverDeleted: true;
+  readonly ownerKey: string;
+  readonly userId: string;
+  readonly workspaceId: string;
+}
+
+export interface LocalAccountDeletionEraseResult {
+  readonly erased: true;
+  readonly ownerKey: string;
+  /** True when a durable primary or recovery root was present before erase. */
+  readonly hadLocalData: boolean;
+}
+
+/**
+ * After the server confirms account deletion, erase this owner's local primary replica and
+ * recovery journal so pending drafts cannot silently re-upload as live data under a later
+ * session. Unconfirmed calls fail closed without mutating storage. Does not ship a product
+ * delete-account UI (plan A5 mobile exposure remains human-gated).
+ */
+export function eraseLocalOwnerAfterConfirmedAccountDeletion(
+  confirmation: ConfirmedAccountDeletion,
+): Promise<LocalAccountDeletionEraseResult> {
+  return enqueueSessionTransition(async () => {
+    if (confirmation.serverDeleted !== true) {
+      throw new StatePersistenceError(
+        'Local owner erase requires confirmed server account deletion',
+      );
+    }
+    const expectedOwnerKey = ownerKeyFor({
+      userId: confirmation.userId,
+      workspaceId: confirmation.workspaceId,
+    });
+    if (!confirmation.ownerKey || confirmation.ownerKey !== expectedOwnerKey) {
+      throw new StatePersistenceError(
+        'Local owner erase refused: owner key does not match the confirmed account identity',
+      );
+    }
+
+    const ownerKey = confirmation.ownerKey;
+    const activeSession = store$.session.get();
+    const activeOwner = store$.activeOwnerKey.get();
+    if (activeSession && ownerKeyFor(activeSession) !== ownerKey) {
+      throw new StatePersistenceError(
+        'Local owner erase refused: a different account is currently active',
+      );
+    }
+    if (activeOwner && activeOwner !== ownerKey) {
+      throw new StatePersistenceError(
+        'Local owner erase refused: active owner projection does not match the confirmed account',
+      );
+    }
+
+    beginSessionTransition();
+    try {
+      const repository = ownerReplicaRepository;
+      if (typeof repository.erase !== 'function') {
+        throw new StatePersistenceError(
+          'Local owner erase is unavailable on this storage adapter',
+        );
+      }
+
+      const journalOwnerKey = replicaRecoveryJournalOwnerKey(ownerKey);
+      const [primaryBefore, journalBefore] = await Promise.all([
+        repository.read(ownerKey),
+        repository.read(journalOwnerKey),
+      ]);
+      const hadLocalData = primaryBefore !== null || journalBefore !== null;
+
+      // Credential first: a wiped replica with a live token could still attempt network work
+      // if erase were interrupted after storage clear. Tombstone blocks re-auth as signed-out.
+      await persistSessionValue(sessionTombstone('account-deleted', ownerKey));
+      await repository.erase(ownerKey);
+      // Recovery journal is a separate repository owner key; erase both so private note
+      // snapshots cannot re-enter via Recovery Center after confirmed deletion.
+      await repository.erase(journalOwnerKey);
+
+      // Verify both roots are gone before clearing the in-memory projection.
+      const [primaryAfter, journalAfter] = await Promise.all([
+        repository.read(ownerKey),
+        repository.read(journalOwnerKey),
+      ]);
+      if (primaryAfter !== null || journalAfter !== null) {
+        throw new StatePersistenceError(
+          'Local owner erase could not verify that durable owner roots were cleared',
+        );
+      }
+
+      await closeReplicaAuthority();
+      store$.set(blankState('auth-required'));
+      sessionRejected = false;
+      pendingRejectedTombstone = null;
+      advanceRecoveryEpoch(ownerKey);
+      advanceProjectionEpoch();
+
+      return { erased: true as const, ownerKey, hadLocalData };
+    } catch (error) {
+      // Fail closed: do not claim a partial wipe. Leave any remaining durable bytes for
+      // Recovery Center inspection rather than inventing an empty live replica.
+      sessionRejected = true;
+      store$.set(blankState('error'));
+      if (error instanceof StatePersistenceError) throw error;
+      throw new StatePersistenceError('Local owner erase after account deletion failed', {
+        cause: error,
+      });
     } finally {
       finishSessionTransition();
     }

@@ -1210,6 +1210,48 @@ describe('session-bound sync coordinator', () => {
     expect(port.statuses.get(lease.ownerKey)).toBe('error');
   });
 
+  it('parks on incomplete server receipts instead of treating them as transient 500s', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const pending = mutation('op-incomplete-receipt', 'must-not-double-apply');
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes: { [noteId]: note(workspaceA, 'local draft') },
+      pendingPush: [pending],
+    });
+
+    const h = harness(port, {
+      push: () =>
+        Promise.reject(
+          new ApiRequestError(
+            409,
+            'sync_receipt_incomplete',
+            'Stored sync idempotency outcome is incomplete or invalid',
+            undefined,
+            pending.opId,
+          ),
+        ),
+    });
+
+    await h.sync();
+
+    const replica = port.replicas.get(lease.ownerKey)!;
+    // Terminal hold: exact pending request preserved, no automatic rekey (rekey would risk
+    // double-apply if the original op partially landed server-side).
+    expect(replica.pendingPush).toEqual([pending]);
+    expect(replica.syncIssue).toMatchObject({
+      code: 'sync_receipt_incomplete',
+      recoveryKind: 'retry',
+      affectedOpIds: [pending.opId],
+    });
+    expect(port.statuses.get(lease.ownerKey)).toBe('error');
+
+    const heldCalls = h.calls.length;
+    await h.sync();
+    expect(h.calls).toHaveLength(heldCalls);
+  });
+
   it('persists malformed successful responses and invalid cursors with actionable recovery', async () => {
     const responsePort = new MemoryPort();
     const responseLease = responsePort.adopt('A');

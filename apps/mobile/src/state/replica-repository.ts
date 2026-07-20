@@ -39,6 +39,12 @@ export interface OwnerReplicaRepository {
   read(ownerKey: string): Promise<string | null>;
   /** Serialize replacement commits per owner and verify the exact durable bytes. */
   commit(ownerKey: string, serializedReplica: string): Promise<void>;
+  /**
+   * Permanently remove an owner root after confirmed account deletion.
+   * Absent keys succeed (idempotent). Adapters that cannot erase must omit this
+   * method so callers fail closed instead of claiming a wipe they cannot perform.
+   */
+  erase?(ownerKey: string): Promise<void>;
 }
 
 /** Interim single-record adapter behind the repository contract. */
@@ -78,6 +84,20 @@ export class SerializedKvReplicaRepository implements OwnerReplicaRepository {
     return next;
   }
 
+  erase(ownerKey: string): Promise<void> {
+    if (!ownerKey) {
+      return Promise.reject(new ReplicaRepositoryError('Owner replica erase requires an owner key'));
+    }
+    const previous = this.pending.get(ownerKey) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(() => this.removeAndVerify(ownerKey));
+    this.pending.set(ownerKey, next);
+    void next.then(
+      () => this.release(ownerKey, next),
+      () => this.release(ownerKey, next),
+    );
+    return next;
+  }
+
   private release(ownerKey: string, completed: Promise<void>): void {
     if (this.pending.get(ownerKey) === completed) this.pending.delete(ownerKey);
   }
@@ -101,6 +121,30 @@ export class SerializedKvReplicaRepository implements OwnerReplicaRepository {
     }
     if (observed !== serializedReplica) {
       throw new ReplicaRepositoryError('Owner replica replacement did not reach durable storage', {
+        cause: operationError,
+      });
+    }
+  }
+
+  private async removeAndVerify(ownerKey: string): Promise<void> {
+    const key = this.keyFor(ownerKey);
+    let operationError: unknown;
+    try {
+      await this.backend.remove(key);
+    } catch (error) {
+      operationError = error;
+    }
+
+    let observed: string | null;
+    try {
+      observed = await this.backend.get(key);
+    } catch (cause) {
+      throw new ReplicaRepositoryError('Owner replica erase could not be verified', {
+        cause: operationError ?? cause,
+      });
+    }
+    if (observed !== null) {
+      throw new ReplicaRepositoryError('Owner replica erase did not clear durable storage', {
         cause: operationError,
       });
     }
