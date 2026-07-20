@@ -175,6 +175,25 @@ export class ExpoSqliteTransactionalReplicaStore implements TransactionalReplica
     }
     return result;
   }
+
+  async erase(ownerKey: string): Promise<void> {
+    if (!ownerKey) {
+      throw new ReplicaRepositoryError('SQLite owner replica erase requires an owner key');
+    }
+    await this.ensureSchema();
+    try {
+      await this.db.withExclusiveTransactionAsync(async (txn) => {
+        await txn.runAsync(`DELETE FROM ${TABLE} WHERE owner_key = ?`, ownerKey);
+      });
+    } catch (cause) {
+      throw new ReplicaRepositoryError('SQLite owner replica erase failed', { cause });
+    }
+
+    const remaining = await this.read(ownerKey);
+    if (remaining !== null) {
+      throw new ReplicaRepositoryError('SQLite owner replica erase did not clear durable storage');
+    }
+  }
 }
 
 // The `expo-sqlite`-backed opener lives in `open-expo-sqlite-store.native.ts` (with a web/Node

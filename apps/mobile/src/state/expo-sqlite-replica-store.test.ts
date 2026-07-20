@@ -169,6 +169,21 @@ describe('SQLite transactional replica store', () => {
     expect((await store.read('owner-a'))?.serializedReplica).toBe(serialized('owner-a', 'third'));
   });
 
+  it('erases an owner root and leaves other owners intact', async () => {
+    const store = memoryStore();
+    await store.compareAndSwap('owner-a', 0, serialized('owner-a', 'secret'));
+    await store.compareAndSwap('owner-b', 0, serialized('owner-b', 'keep'));
+
+    await store.erase('owner-a');
+    expect(await store.read('owner-a')).toBeNull();
+    expect((await store.read('owner-b'))?.serializedReplica).toBe(serialized('owner-b', 'keep'));
+    await expect(store.erase('owner-a')).resolves.toBeUndefined();
+
+    const repository = new TransactionalOwnerReplicaRepository(store);
+    await repository.erase('owner-b');
+    expect(await repository.read('owner-b')).toBeNull();
+  });
+
   it('rejects a stored record whose serialized owner does not match its key', async () => {
     const db = connect();
     const store = new ExpoSqliteTransactionalReplicaStore(new NodeSqliteReplicaDatabase(db));

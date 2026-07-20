@@ -199,6 +199,10 @@ class MemoryTransactionalStore implements TransactionalReplicaStore {
     this.records.set(ownerKey, record);
     return { status: 'committed', record };
   }
+
+  async erase(ownerKey: string): Promise<void> {
+    this.records.delete(ownerKey);
+  }
 }
 
 describe('Sync v2 persisted replica', () => {

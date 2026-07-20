@@ -86,6 +86,10 @@ class BarrierTransactionalStore implements TransactionalReplicaStore {
     this.values.set(ownerKey, record);
     return { status: 'committed', record: { ...record } };
   }
+
+  async erase(ownerKey: string): Promise<void> {
+    this.values.delete(ownerKey);
+  }
 }
 
 describe('ReplicaRecoveryJournal', () => {

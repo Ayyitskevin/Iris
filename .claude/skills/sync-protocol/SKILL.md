@@ -219,6 +219,11 @@ To add a synced field: add it to `SyncMutation.note` and `Note` in `schemas.ts`,
   in-flight push cannot interleave partial note writes with tenant wipe. After confirmed
   server deletion, clients must call `eraseLocalOwnerAfterConfirmedAccountDeletion` so
   local pending drafts cannot re-upload; unconfirmed delete mutates nothing.
+- **Durable-storage erase is required on every transactional adapter.** `TransactionalReplicaStore.erase`
+  + `TransactionalOwnerReplicaRepository.erase` clear IndexedDB and SQLite owner roots
+  (including when the writer is fenced). Promoting erase still clears primary, legacy, and
+  the recovery-journal owner key. Adapters without erase must omit the method so callers
+  fail closed rather than claim a wipe.
 - **Workspace lock precedes receipt locks.** Every non-empty push locks/upserts
   `workspace_sync_cursors` before claiming any `opId`. Preserve that order so batches
   with reversed operation ids cannot deadlock.

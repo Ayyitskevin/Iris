@@ -166,6 +166,33 @@ async function indexedDbRecord(page: Page, key: string = ownerKey): Promise<Brow
   );
 }
 
+/**
+ * Wait until the durable owner root stops changing. Leader tabs may stage
+ * `pendingPush` after a local edit (scheduler debounce); snapshotting mid-stage
+ * races follower-click assertions that require bit-exact equality.
+ */
+async function waitForStableIndexedDbRecord(
+  page: Page,
+  options: { stableMs?: number; timeoutMs?: number } = {},
+): Promise<BrowserReplicaRecord> {
+  const stableMs = options.stableMs ?? 700;
+  const timeoutMs = options.timeoutMs ?? 8_000;
+  const deadline = Date.now() + timeoutMs;
+  let last = await indexedDbRecord(page);
+  let lastChangeAt = Date.now();
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(100);
+    const next = await indexedDbRecord(page);
+    if (next.revision === last.revision && next.serializedReplica === last.serializedReplica) {
+      if (Date.now() - lastChangeAt >= stableMs) return next;
+    } else {
+      last = next;
+      lastChangeAt = Date.now();
+    }
+  }
+  return last;
+}
+
 async function legacyReplicaRaw(page: Page): Promise<string | null> {
   return page.evaluate((key) => localStorage.getItem(key), legacyStorageKey);
 }
@@ -456,7 +483,9 @@ test('one tab writes while its follower refreshes, then takes over after a verif
   await title.fill(privateSentinel);
   await expect(follower.getByText(privateSentinel)).toBeVisible();
 
-  const recordBeforeFollowerAttempt = await indexedDbRecord(follower);
+  // Leader may still be staging outbox → pendingPush after the edit. Wait for that
+  // durable write to settle so the follower-click check is not racing the leader.
+  const recordBeforeFollowerAttempt = await waitForStableIndexedDbRecord(leader);
   await followerNew.evaluate((button: HTMLElement) => button.click());
   await follower.waitForTimeout(250);
   expect(await indexedDbRecord(follower)).toEqual(recordBeforeFollowerAttempt);

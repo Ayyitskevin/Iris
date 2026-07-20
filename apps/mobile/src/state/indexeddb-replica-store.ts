@@ -142,6 +142,36 @@ export class IndexedDbTransactionalReplicaStore implements TransactionalReplicaS
     });
   }
 
+  async erase(ownerKey: string): Promise<void> {
+    if (!ownerKey) {
+      throw new ReplicaRepositoryError('IndexedDB owner replica erase requires an owner key');
+    }
+    const database = await this.open();
+    let transaction: IDBTransaction;
+    try {
+      transaction = database.transaction(REPLICA_STORE_NAME, 'readwrite');
+    } catch (cause) {
+      throw transactionError('IndexedDB owner replica erase could not start', cause);
+    }
+    transaction.objectStore(REPLICA_STORE_NAME).delete(ownerKey);
+
+    await new Promise<void>((resolve, reject) => {
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => {
+        reject(transactionError('IndexedDB owner replica erase failed', transaction.error));
+      };
+      transaction.onabort = () => {
+        reject(transactionError('IndexedDB owner replica erase was aborted', transaction.error));
+      };
+    });
+
+    // Verify-after-delete: a partial delete must not be reported as success.
+    const remaining = await this.read(ownerKey);
+    if (remaining !== null) {
+      throw new ReplicaRepositoryError('IndexedDB owner replica erase did not clear durable storage');
+    }
+  }
+
   async close(): Promise<void> {
     const opening = this.opening;
     if (!opening) return;
