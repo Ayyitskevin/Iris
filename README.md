@@ -28,6 +28,10 @@ A thin, end-to-end vertical slice that proves the architecture:
   conflicts retain both versions in a dedicated Review inbox. A strict, note-backed
   generic resource envelope is available additively on `/v2/sync/*` for the future work
   graph while the current mobile coordinator stays on the frozen `/v1` transport.
+  Incomplete/malformed idempotency receipts fail closed as terminal protocol holds (not
+  transient 500s); confirmed account deletion cascade-erases the tenant and pairs with a
+  local owner erase fence so pending drafts cannot re-upload. Recovery paths:
+  [`docs/SYNC_RECOVERY.md`](docs/SYNC_RECOVERY.md).
 - **Agent actors + API** — issue scoped, revocable agent tokens; a REST API that agents
   and the app share; every agent note write lands in an **append-only activity log** and
   creates a version; an **activity feed** where the operator can undo recorded content
