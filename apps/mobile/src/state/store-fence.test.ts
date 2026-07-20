@@ -39,6 +39,8 @@ const repo = vi.hoisted(() => ({
   failCommitKey: null as string | null,
   /** Force mixed-version ambiguity before one source-root commit. */
   authorityNextCommit: new Set<string>(),
+  /** Fail native authority preparation before initial/reload projection publication. */
+  prepareError: null as Error | null,
   /**
    * Builds the real `ReplicaRepositoryStaleWriterError`. Populated at module top level after
    * the imports resolve — the mock factory must not import the transactional module itself,
@@ -112,13 +114,27 @@ vi.mock('./select-owner-replica-repository', () => {
       recoveryRepository: repository,
       mode: 'transactional-native',
       readFollower: (ownerKey: string) => repository.read(ownerKey),
-      prepareOwner: async () => undefined,
+      prepareOwner: async () => {
+        if (repo.prepareError) throw repo.prepareError;
+      },
       verifyBeforeNetwork: async () => undefined,
       authority: {
         async start(ownerKey: string, hooks: OwnerAuthorityHooks) {
           const acquiring = { ownerKey, epoch: 1, role: 'acquiring' as const };
           hooks.onRole(acquiring);
-          await hooks.prepareLeader(acquiring);
+          try {
+            await hooks.prepareLeader(acquiring);
+          } catch {
+            const unavailable = { ownerKey, epoch: 1, role: 'unavailable' as const };
+            hooks.onRole(unavailable);
+            return {
+              snapshot: () => unavailable,
+              publishRefresh: () => {
+                throw new Error('native authority unavailable');
+              },
+              close: async () => undefined,
+            };
+          }
           const leader = { ownerKey, epoch: 2, role: 'leader' as const };
           hooks.onRole(leader);
           return {
@@ -151,6 +167,8 @@ import {
   ownerKeyFor,
   readReplicaRecoveryCatalogForLease,
   recoveryCatalogRevision$,
+  replicaAuthority$,
+  replicaMutationsBlocked,
   ReplicaCommitSupersededError,
   saveState,
   signOutSession,
@@ -314,6 +332,7 @@ beforeEach(async () => {
   repo.failReadKey = null;
   repo.failCommitKey = null;
   repo.authorityNextCommit.clear();
+  repo.prepareError = null;
   repo.reads = [];
   repo.commits = [];
   await loadState();
@@ -1094,6 +1113,98 @@ describe('owner store fence-awareness', () => {
     expect(repo.durable.get(ownerKey)).toBe('{');
   });
 
+  it('reopens an exact recovery branch read-only when native preparation fails on reload', async () => {
+    const ownerKey = ownerKeyFor(sessionA);
+    const recoveryKey = replicaRecoveryJournalOwnerKey(ownerKey);
+    const recoveredNote = note(noteAId, 'visible after native restart divergence');
+    const recoveredRaw = winnerBytes(
+      { [recoveredNote.id]: recoveredNote },
+      'device-native-recovery',
+    );
+    const primaryRaw = '{unreadable-primary';
+    const recoveryRaw = JSON.stringify({
+      version: 1,
+      ownerKey: recoveryKey,
+      sourceOwnerKey: ownerKey,
+      snapshots: [
+        {
+          sequence: 1,
+          capturedAt: '2026-07-19T20:45:00.000Z',
+          reason: 'legacy-divergence',
+          serializedReplica: recoveredRaw,
+        },
+      ],
+    });
+    memory.values.set(stateStorageKeys.session, JSON.stringify(sessionA));
+    repo.durable.set(ownerKey, primaryRaw);
+    repo.durable.set(recoveryKey, recoveryRaw);
+    repo.prepareError = new Error('injected native divergence during preparation');
+    repo.failReadKey = ownerKey;
+    const commitsBefore = [...repo.commits];
+
+    await loadState();
+
+    expect(store$.session.get()).toEqual(sessionA);
+    expect(store$.activeOwnerKey.get()).toBe(ownerKey);
+    expect(store$.status.get()).toBe('recovery-required');
+    expect(store$.notes.get()).toEqual({ [recoveredNote.id]: recoveredNote });
+    expect(store$.deviceId.get()).toBe('device-native-recovery');
+    expect(replicaAuthority$.get()).toBe('unavailable');
+    expect(replicaMutationsBlocked()).toBe(true);
+    expect(openSessionLease()).toBeNull();
+    const inspection = openRecoveryInspectionLease();
+    expect(inspection).not.toBeNull();
+    await expect(readReplicaRecoveryCatalogForLease(inspection!)).resolves.toMatchObject({
+      sourceOwnerKey: ownerKey,
+      inventoryComplete: true,
+      copies: [
+        {
+          persistence: 'journal-verified',
+          matchesDisplayedProjection: true,
+          reason: 'legacy-divergence',
+        },
+      ],
+    });
+    expect(repo.commits).toEqual(commitsBefore);
+    expect(repo.durable.get(ownerKey)).toBe(primaryRaw);
+    expect(repo.durable.get(recoveryKey)).toBe(recoveryRaw);
+
+    await loadState();
+
+    expect(store$.session.get()).toEqual(sessionA);
+    expect(store$.status.get()).toBe('recovery-required');
+    expect(store$.notes.get()).toEqual({ [recoveredNote.id]: recoveredNote });
+    expect(replicaAuthority$.get()).toBe('unavailable');
+    expect(openSessionLease()).toBeNull();
+    expect(repo.commits).toEqual(commitsBefore);
+    expect(repo.durable.get(ownerKey)).toBe(primaryRaw);
+    expect(repo.durable.get(recoveryKey)).toBe(recoveryRaw);
+  });
+
+  it('keeps readable native primary state fenced after preparation fails', async () => {
+    const ownerKey = ownerKeyFor(sessionA);
+    const primaryNote = note(noteAId, 'read-only primary after native preparation failure');
+    const primaryRaw = winnerBytes({ [primaryNote.id]: primaryNote }, 'device-native-primary');
+    memory.values.set(stateStorageKeys.session, JSON.stringify(sessionA));
+    repo.durable.set(ownerKey, primaryRaw);
+    repo.prepareError = new Error('injected native control-journal failure');
+    const commitsBefore = [...repo.commits];
+
+    await loadState();
+
+    expect(store$.session.get()).toEqual(sessionA);
+    expect(store$.activeOwnerKey.get()).toBe(ownerKey);
+    expect(store$.status.get()).toBe('recovery-required');
+    expect(store$.notes.get()).toEqual({ [primaryNote.id]: primaryNote });
+    expect(store$.deviceId.get()).toBe('device-native-primary');
+    expect(replicaAuthority$.get()).toBe('unavailable');
+    expect(replicaMutationsBlocked()).toBe(true);
+    expect(openSessionLease()).toBeNull();
+    await expect(saveState()).resolves.toBe(false);
+    expect(repo.commits).toEqual(commitsBefore);
+    expect(repo.durable.get(ownerKey)).toBe(primaryRaw);
+  });
+
   it('expires the same active credential after recovery invalidates its original lease', async () => {
     const lease = await signIn();
     const ownerKey = ownerKeyFor(sessionA);
@@ -1231,11 +1342,12 @@ describe('owner store fence-awareness', () => {
   });
 
   it('fails closed when an unreadable primary has a malformed recovery journal', async () => {
-    await signIn();
     const ownerKey = ownerKeyFor(sessionA);
     const recoveryKey = replicaRecoveryJournalOwnerKey(ownerKey);
+    memory.values.set(stateStorageKeys.session, JSON.stringify(sessionA));
     repo.durable.set(ownerKey, '{');
     repo.durable.set(recoveryKey, '{');
+    repo.prepareError = new Error('injected native preparation failure');
     const commitsBeforeLoad = [...repo.commits];
 
     await loadState();

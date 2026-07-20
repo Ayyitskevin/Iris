@@ -218,7 +218,11 @@ export default function RecoveryCenter() {
     <Screen>
       <ScrollView contentContainerStyle={styles.content}>
         <View style={styles.back}>
-          <Button label="Back" variant="ghost" onPress={() => router.back()} />
+          <Button
+            label={recoveryRequired ? 'View notes read-only' : 'Back'}
+            variant="ghost"
+            onPress={() => (recoveryRequired ? router.replace('/notes') : router.back())}
+          />
         </View>
         <Title>Recovery Center</Title>
         <Muted>

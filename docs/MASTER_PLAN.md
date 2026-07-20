@@ -17,9 +17,10 @@ Read order for a new session: [`VISION.md`](VISION.md) → [`DECISIONS.md`](DECI
 **Verified locally on 2026-07-19:**
 
 - Current worktree: API **155 tests pass / 2 skipped locally** (the real-Postgres gates run in
-  CI), mobile **365 tests pass**, and the production-bundle Chromium authority journeys pass for
-  both current-runtime leadership and frozen-old-writer divergence. Typecheck, changed-file lint
-  and formatting, and isolated web/Android/iOS Metro exports pass. The
+  CI), mobile **368 tests pass**, and the production-bundle Chromium authority journeys pass for
+  current-runtime leadership, frozen-old-writer divergence, and cold-relaunch Recovery Center
+  routing with zero requests. Typecheck, changed-file lint and formatting, and isolated
+  web/Android/iOS Metro exports pass. The
   workflow adds a dedicated browser job to frozen install, typecheck, lint, both test suites with
   PostgreSQL 16, and web export. Expo's dependency compatibility check remains red on the
   pre-existing Expo/React/TypeScript cohort; SDK alignment remains a separate release-health slice.
@@ -50,9 +51,13 @@ browser tabs, with read-only followers and metadata-only refresh. ADR-023 adds a
 digest-only mixed-version authority journal: it verifies the immutable legacy baseline around
 promotion/commits and every authenticated fetch, preserves exact diverged branches, and fences an
 active projection into read-only recovery before another request. Client-only code still cannot
-prevent an already-loaded old tab from writing its legacy key; initial native reload recovery
-presentation, an enforceable compatibility gate, the recovery resolution lifecycle, and the v2
-pull applier remain open.
+prevent an already-loaded old tab from writing its legacy key. A rejected native startup
+preparation now installs unavailable authority and lets hydration retain a valid owner-matched
+primary fenced/read-only or, when primary read or validation rejects, reopen only the newest
+strict compatible journal snapshot. It retains the signed-in owner and routes the
+recovery-required cold launch directly to Recovery Center without a lease, source write, or
+request. An enforceable compatibility gate, the recovery resolution lifecycle, physical native
+force-quit/reopen acceptance, and the v2 pull applier remain open.
 
 **Still missing for release:** deploy/infra configuration, migration-on-deploy and
 observability; account-deletion mobile UX, export-first confirmation, privacy policy, local
@@ -167,9 +172,17 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
     deferred-cleanup Blob download; native verifies a private
     cache file, retains it for slow share receivers, and attempts to purge files older than 24
     hours on a later launch/export without blocking a new export on cleanup failure. Delivery copy
-    does not claim the user saved a destination. Force-quit recovery
-    still needs real browser/device
-    acceptance. Transactional authority remains default-off. ADR-021 records the boundary.
+    does not claim the user saved a destination. A rejected single-process/native authority
+    preparation now installs an unavailable handle instead of aborting global hydration. A valid
+    owner-matched primary may remain visible fenced/read-only; when primary read or validation
+    rejects, only the newest strict compatible recovery snapshot may replace it. Either path can
+    retain the signed-in owner, publish `recovery-required`, and route cold launch to Recovery
+    Center with notes viewable read-only; invalid primary plus malformed recovery stays blank and
+    unchanged. Unit tests cover repeated native-shaped hydration, and the production web journey
+    proves cold-relaunch routing plus zero requests.
+    Physical native force-quit/reopen still needs device acceptance. Transactional authority
+    remains default-off. ADR-021 records the recovery boundary; ADR-023 records mixed-version
+    containment and startup fencing.
   - **Step 3 — platform store selection + flip production authority**, then port the
     coordinator to `/v2` and freeze the v1 path. Itself staged:
     - **Step 3a — platform-selection factory, opt-in-gated. ✅ SHIPPED.**
@@ -190,17 +203,20 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
       writes/network before another fetch, retains later old-runtime evidence, and exposes
       recovery-required without choosing a winner. Verified non-diverged commit history compacts
       to a CAS-safe transactional checkpoint after 64 entries; preparing/diverged evidence is
-      retained. Unit tests cover crash boundaries and real SQLite; a production-bundle frozen old-writer browser fixture proves exact preservation,
-      digest-only control state, disabled UI, and zero post-drift requests.
+      retained. Unit tests cover crash boundaries and real SQLite; a production-bundle frozen
+      old-writer browser fixture proves exact preservation, digest-only control state, disabled UI,
+      zero post-drift requests, and cold-relaunch Recovery Center presentation. Native-shaped
+      hydration proves preparation failure installs unavailable authority, keeps a valid primary
+      fenced/read-only, and falls back to only compatible recovery when primary read rejects.
       _Remaining DoD:_ before production default-on, approve and implement an enforceable server
       storage-epoch/upgrade-required contract or another explicit old-client invalidation scheme;
-      this protocol/schema decision is human-gated. Recovery choose/restore/import/discard and
-      browser/native lifecycle acceptance remain Step 3c.
+      this protocol/schema decision is human-gated. Recovery choose/restore/import/discard,
+      post-resolution browser reload, and physical native lifecycle acceptance remain Step 3c.
     - **Step 3c — controlled device acceptance, then default-on and Sync v2 cutover.**
-      Prove recovery UX, web reload, native force-quit/reopen, A→B switching, storage exhaustion,
-      SQLite at-rest policy, and unsupported-platform behavior. Only after those gates and the
-      compatibility contract pass may the default flip, the coordinator move to `/v2`, and v1
-      freeze.
+      Prove recovery resolution UX, post-resolution web reload, native force-quit/reopen, A→B
+      switching, storage exhaustion, SQLite at-rest policy, and unsupported-platform behavior.
+      Only after those gates and the compatibility contract pass may the default flip, the
+      coordinator move to `/v2`, and v1 freeze.
   - _DoD:_ mobile suite green on the wired path; real-device A→B switch, lost response, and
     restart scenarios pass (device-acceptance gated).
 - **A4 · 🟣 Opus (design) → 🔵 Sonnet (implement) · One-command deploy + secrets.**
@@ -315,9 +331,10 @@ Each slice must leave a rollback point and prove the exact transition it claims.
    invalidation mechanism before production cutover.
 2. **Transactional authority acceptance + recovery UX.** Enable the flag only in test channels
    while retaining the v1 coordinator. Integrate diverged/quarantined roots into the Recovery
-   Center and add choose/restore/import/discard handling, then prove web reload, native force-quit/reopen, A→B switching,
-   storage exhaustion, SQLite at-rest policy, and unsupported-platform fallback. Only after the
-   compatibility contract and these gates pass may the default flip.
+   Center and add choose/restore/import/discard handling, then prove post-resolution web reload,
+   native force-quit/reopen, A→B switching, storage exhaustion, SQLite at-rest policy, and
+   unsupported-platform fallback. Only after the compatibility contract and these gates pass may
+   the default flip.
 3. **Sync v2 runtime cutover.** Add the missing pull-v2 applier, bind the v3 root through
    `SyncPort`, stage/dispatch/apply the exact durable envelope, restart safely after every
    boundary, and freeze v1 only after mixed-version replay evidence.

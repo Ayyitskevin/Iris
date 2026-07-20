@@ -389,7 +389,10 @@ function usesCoordinatedWebAuthority(): boolean {
 }
 
 function authorityStateFor(snapshot: OwnerAuthoritySnapshot): ReplicaAuthorityState {
-  return usesCoordinatedWebAuthority() ? snapshot.role : 'local';
+  // Legacy/native authority is normally exposed as the simpler `local` state. A native
+  // preparation failure is different: its installed unavailable handle must remain visible so
+  // the scheduler and UI cannot mistake a read-only recovery projection for writable authority.
+  return usesCoordinatedWebAuthority() || snapshot.role === 'unavailable' ? snapshot.role : 'local';
 }
 
 function isCurrentAuthorityBinding(binding: ReplicaAuthorityBinding): boolean {
@@ -401,8 +404,16 @@ function isCurrentAuthorityBinding(binding: ReplicaAuthorityBinding): boolean {
 }
 
 function isOwnerReplicaWritable(ownerKey: string): boolean {
-  if (!usesCoordinatedWebAuthority()) return true;
   const binding = replicaAuthorityBinding;
+  if (
+    binding &&
+    isCurrentAuthorityBinding(binding) &&
+    binding.ownerKey === ownerKey &&
+    binding.handle?.snapshot().role === 'unavailable'
+  ) {
+    return false;
+  }
+  if (!usesCoordinatedWebAuthority()) return true;
   return Boolean(
     binding &&
     isCurrentAuthorityBinding(binding) &&

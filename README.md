@@ -169,12 +169,18 @@ rechecks the immutable exact legacy baseline around each commit and immediately 
 authenticated fetch; drift preserves valid primary, legacy, and optimistic branches in the
 token-free Recovery Center journal, invalidates active leases, and sends no later request. A
 CAS-safe transactional checkpoint bounds routine completed control history after 64 entries while
-retaining preparing/diverged evidence. A production-bundle frozen old-writer Chromium journey
-proves that containment without importing current lock code. The flag is still not cutover-safe or default-on: client-only code detects but
-cannot stop an already-loaded old tab/version from writing the legacy copy. An enforceable
+retaining preparing/diverged evidence. If native authority preparation rejects during hydration,
+Iris installs an explicit unavailable authority and preserves the signed-in owner. A valid
+owner-matched primary may remain visible fenced and read-only; if primary read or validation
+rejects, hydration can use only the newest strict compatible recovery snapshot. A
+recovery-required cold launch goes directly to Recovery Center, where notes remain viewable
+read-only; invalid primary plus invalid recovery still ends in blank error state without changing
+source bytes. Production-bundle Chromium journeys prove frozen-old-writer containment and
+cold-relaunch Recovery Center routing with no later request. The flag is still not cutover-safe or
+default-on: client-only code detects but cannot stop an already-loaded old tab/version from writing
+the legacy copy. An enforceable
 human-approved server compatibility gate, recovery choose/restore/import/discard controls, the v2
-pull applier, at-rest policy, and native lifecycle acceptance—including initial reload recovery
-presentation—remain open. See
+pull applier, at-rest policy, and physical native force-quit/reopen acceptance remain open. See
 `docs/MASTER_PLAN.md` for the ordered release gates.
 GitHub Actions run `29506816638` passed the PostgreSQL 16
 independent-connection commit-order and concurrent device-gate gate for commit

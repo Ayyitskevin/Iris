@@ -652,4 +652,28 @@ test('a frozen old writer preserves both roots and fences the current runtime be
   expect(await legacyReplicaRaw(current)).toBe(legacyDivergedRaw);
   expect(await indexedDbRecord(current, divergenceOwnerKey)).toEqual(controlRecord);
   await expect(current.getByRole('button', { name: /New note/ })).toBeDisabled();
+
+  // A cold current-runtime launch must not collapse authority preparation failure into sign-in
+  // or a generic blank error. It installs unavailable authority, keeps the session owner, opens
+  // the Recovery Center with the compatible primary projection, and still performs no network.
+  const recoveryRecordBeforeRestart = await indexedDbRecord(current, recoveryOwnerKey);
+  await current.close();
+  const relaunched = await context.newPage();
+  await relaunched.goto('/');
+  await expect(relaunched).toHaveURL(/\/recovery$/);
+  await expect(relaunched.getByText('Recovery Center', { exact: true })).toBeVisible();
+  await expect(relaunched.getByText('Local recovery mode')).toBeVisible();
+  await expect(relaunched.getByText('3 local branches shown')).toBeVisible();
+  await relaunched.getByRole('button', { name: 'View notes read-only' }).click();
+  await expect(relaunched).toHaveURL(/\/notes$/);
+  await expect(relaunched.getByText(mixedVersionPrimarySentinel)).toBeVisible();
+  await expect(relaunched.getByRole('button', { name: /New note/ })).toBeDisabled();
+  await relaunched.getByRole('tab', { name: 'Settings' }).click();
+  await expect(relaunched.getByRole('button', { name: 'Sign out' })).toBeEnabled();
+  await relaunched.waitForTimeout(8_250);
+  expect(await fetchCount(relaunched)).toBe(0);
+  expect(await indexedDbRecord(relaunched)).toEqual(primaryBeforeDrift);
+  expect(await legacyReplicaRaw(relaunched)).toBe(legacyDivergedRaw);
+  expect(await indexedDbRecord(relaunched, divergenceOwnerKey)).toEqual(controlRecord);
+  expect(await indexedDbRecord(relaunched, recoveryOwnerKey)).toEqual(recoveryRecordBeforeRestart);
 });

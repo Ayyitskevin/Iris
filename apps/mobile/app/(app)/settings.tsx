@@ -23,6 +23,7 @@ export default function Settings() {
   const recoveryRequired = useObs(() => store$.status.get() === 'recovery-required');
   const authorityBlocked = useObs(replicaMutationsBlocked);
   const actionsBlocked = recoveryRequired || authorityBlocked;
+  const signOutBlocked = authorityBlocked && !recoveryRequired;
   const recoveryCatalogRevision = useObs(() => recoveryCatalogRevision$.get());
   const [billing, setBilling] = useState<BillingStatus | null>(null);
   const [tokens, setTokens] = useState<AgentToken[]>([]);
@@ -198,9 +199,9 @@ export default function Settings() {
           <Text style={styles.cardTitle}>Sync plan</Text>
           {actionsBlocked ? (
             <Muted>
-              {authorityBlocked
-                ? 'Billing and device sync controls are available only in the active Iris tab.'
-                : 'Billing and device sync are unavailable while local recovery is active.'}
+              {recoveryRequired
+                ? 'Billing and device sync are unavailable while local recovery is active.'
+                : 'Billing and device sync controls are available only in the active Iris tab.'}
             </Muted>
           ) : billing ? (
             <>
@@ -258,9 +259,9 @@ export default function Settings() {
           <View style={{ height: theme.space(2) }} />
           {actionsBlocked ? (
             <Muted>
-              {authorityBlocked
-                ? 'Agent status and controls are available only in the active Iris tab.'
-                : 'Agent status and controls are paused during local recovery.'}
+              {recoveryRequired
+                ? 'Agent status and controls are paused during local recovery.'
+                : 'Agent status and controls are available only in the active Iris tab.'}
             </Muted>
           ) : tokens.length === 0 ? (
             <Muted>No agents yet.</Muted>
@@ -348,9 +349,9 @@ export default function Settings() {
           label="Sign out"
           variant="danger"
           loading={signingOut}
-          disabled={authorityBlocked}
+          disabled={signOutBlocked}
           onPress={async () => {
-            if (authorityBlocked) return;
+            if (signOutBlocked) return;
             setSigningOut(true);
             setSignOutError(false);
             try {

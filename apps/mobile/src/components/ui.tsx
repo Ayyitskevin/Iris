@@ -82,7 +82,7 @@ export function ReplicaAuthorityNotice() {
       </Text>
       <Text style={styles.authorityText}>
         {unavailable
-          ? 'Iris could not verify exclusive browser authority. Your notes remain visible, but this tab will not edit or sync.'
+          ? 'Iris could not verify local write authority. Your notes remain visible, but this app instance will not edit or sync.'
           : authority === 'acquiring'
             ? 'Iris is rereading the verified local replica before enabling edits or sync.'
             : 'Another Iris tab is active. This tab refreshes after verified local changes. Close the active tab to take over.'}

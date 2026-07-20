@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   AlwaysWritableOwnerAuthorityDriver,
+  OwnerAuthorityError,
   parseOwnerAuthorityRefreshNotice,
   WebOwnerAuthorityDriver,
   type BroadcastChannelPort,
@@ -282,6 +283,18 @@ describe('authority notice parser and local authority', () => {
     expect(handle.snapshot().role).toBe('leader');
     expect(observed.roles).toEqual(['acquiring', 'leader']);
     handle.publishRefresh();
+    await handle.close();
+  });
+
+  it('installs unavailable native authority when leader preparation fails', async () => {
+    const cause = new Error('injected native divergence');
+    const observed = hooks({ prepare: async () => Promise.reject(cause) });
+
+    const handle = await new AlwaysWritableOwnerAuthorityDriver().start('owner-a', observed.hooks);
+
+    expect(handle.snapshot()).toEqual({ ownerKey: 'owner-a', epoch: 1, role: 'unavailable' });
+    expect(observed.roles).toEqual(['acquiring', 'unavailable']);
+    expect(() => handle.publishRefresh()).toThrow(OwnerAuthorityError);
     await handle.close();
   });
 });

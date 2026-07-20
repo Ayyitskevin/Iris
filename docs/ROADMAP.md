@@ -176,9 +176,16 @@ These were named as out of scope and are staying out until the foundation is pro
   CAS-safe checkpoint; preparing/diverged evidence is never compacted. Production-bundle Chromium adds a frozen
   same-origin old writer with no current authority code and proves exact branch preservation,
   digest-only control metadata, disabled UI, and no post-drift request. This contains ambiguity;
-  it cannot exclude old code. The flag remains off pending a human-approved enforceable server
-  compatibility contract, recovery resolution, and browser/native lifecycle acceptance. Initial
-  native reload recovery presentation is explicitly part of that remaining acceptance gate.
+  it cannot exclude old code. A rejected single-process/native preparation now installs an
+  explicit unavailable authority. Hydration may show a valid owner-matched primary fenced and
+  read-only; when primary read or validation rejects, it may use only the newest strict compatible
+  recovery snapshot. The signed-in owner holds no session lease and is routed to Recovery Center
+  on cold launch with read-only notes available. Invalid primary plus invalid recovery stays blank
+  and leaves every source record untouched. Unit coverage proves repeated native-shaped hydration,
+  while the production browser gate proves the cold-relaunch route and zero requests through the
+  full observation interval. The flag remains off pending a human-approved enforceable server
+  compatibility contract, recovery resolution, post-resolution browser reload, and physical
+  native force-quit/reopen acceptance.
 - **Phase 2.13 — server launch hardening, partial**: user-only device deregistration and
   account deletion endpoints, runtime non-superuser RLS tests, production Stripe-key
   guards, and a coarse per-IP rate limiter are shipped. Client device/deletion UX,
@@ -194,9 +201,9 @@ These were named as out of scope and are staying out until the foundation is pro
 2. **Controlled transactional-authority acceptance + recovery resolution UX.** Keep `/v1`
    networking while integrating diverged and quarantined roots into the shipped local Recovery
    Center and adding choose-winner, restore/import, and discard controls, then test
-   IndexedDB reload, native SQLite force-quit/reopen, A→B switching, unsupported-platform
-   fallback, and the explicit at-rest policy. Flip the default only after the compatibility
-   contract and these gates pass.
+   post-resolution IndexedDB reload, native SQLite force-quit/reopen, A→B switching,
+   unsupported-platform fallback, and the explicit at-rest policy. Flip the default only after the
+   compatibility contract and these gates pass.
 3. **Sync v2 runtime cutover.** Build the missing pull applier and bind the v3 owner root,
    exact durable envelope, lease/device dispatch, correlator, restart boundaries, and v1
    retirement through the production `SyncPort`.

@@ -984,9 +984,14 @@ recovery fence before returning the exact error. It invalidates operation leases
 API guard reasserts the fixed-token lease around the async authority check and dispatches zero
 fetches when verification rejects, including the direct server-export response path. Followers
 remain observational: they never promote or write journals. A failed leader preparation cannot be
-cleared merely because a read-only primary happens to parse successfully. Initial/reload native
-recovery presentation remains Step 3c lifecycle debt; startup ambiguity currently fails closed
-without claiming the browser's active-session Recovery Center proof.
+cleared merely because a read-only primary happens to parse successfully. On the single-process
+native authority path, rejected preparation installs an explicit unavailable handle rather than
+rejecting global hydration. Hydration may show a valid owner-matched primary fenced/read-only; if
+primary read or validation rejects, it may use only the newest strict compatible recovery
+snapshot. Both successful read-only paths retain the signed-in owner with `recovery-required`, no
+session lease, and no source write; invalid primary plus malformed or unavailable recovery remains
+blank `error`. A recovery-required cold launch routes directly to Recovery Center, whose explicit
+action can open notes read-only. This does not claim physical native force-quit/reopen acceptance.
 
 Deterministic tests cover the strict SHA-256 adapter contract, semantic idempotency independent of
 object key order, stale-CAS retry, owner isolation, real-SQLite promotion, initial branch
@@ -998,7 +1003,10 @@ two-tab leadership journey and a frozen same-origin old-writer fixture that impo
 authority code. That fixture changes the exact legacy root after promotion and proves both source
 roots remain exact, recovery contains both branches, the control journal contains no replica or
 credential sentinel, the UI becomes read-only recovery mode, and no later authenticated request
-is sent.
+is sent. It then cold-relaunches through the root route, proves Recovery Center presentation and
+read-only note access, and continues proving zero requests with all source/control/recovery records
+byte-identical. Deterministic store tests cover repeated native-shaped hydration with both a valid
+read-only primary and primary-read rejection, including the invalid-recovery blank-error case.
 
 This is detection and preservation, not old-client exclusion. There is still a race after any
 client-side check, and old code can continue writing its own key. `EXPO_PUBLIC_DURABLE_STORAGE`

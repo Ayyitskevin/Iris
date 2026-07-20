@@ -94,12 +94,21 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
 }
 
-/** Single-process/native/legacy authority: no lock or channel is opened. */
+/** Single-process/native/legacy authority: no lock or channel is opened; preparation still gates it. */
 export class AlwaysWritableOwnerAuthorityDriver implements OwnerAuthorityDriver {
   async start(ownerKey: string, hooks: OwnerAuthorityHooks): Promise<OwnerAuthorityHandle> {
     const acquiring = Object.freeze({ ownerKey, epoch: 1, role: 'acquiring' as const });
     hooks.onRole(acquiring);
-    await hooks.prepareLeader(acquiring);
+    try {
+      await hooks.prepareLeader(acquiring);
+    } catch (cause) {
+      // Native transactional startup has no follower process that can keep a usable projection
+      // alive when preparation discovers divergence. Return an installed fail-closed handle just
+      // like the web driver so hydration can retain a valid primary fenced/read-only or open a
+      // separately verified recovery snapshot instead of erasing the session behind the global
+      // error boundary.
+      return failedHandle(ownerKey, hooks, cause);
+    }
     const leader = Object.freeze({ ownerKey, epoch: 2, role: 'leader' as const });
     hooks.onRole(leader);
     return {

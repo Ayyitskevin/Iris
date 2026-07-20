@@ -187,8 +187,13 @@ null`; route keys include the owner so component state cannot survive an account
   transactional store on first read. ADR-023 wraps that copy and every later primary commit in a
   strict digest-only write-ahead journal. It verifies the exact legacy baseline before/after
   commits and immediately before authenticated fetches; drift preserves exact valid branches and
-  fences an active projection into visible read-only recovery before another request. Initial
-  native reload presentation remains an acceptance gate. `store.ts` is **fence-aware**: stale
+  fences an active projection into visible read-only recovery before another request. A rejected
+  single-process/native preparation installs an explicit unavailable handle. Hydration may display
+  a valid owner-matched primary fenced/read-only; if primary read or validation rejects, it may use
+  only the newest strict compatible recovery snapshot. Either path retains the signed-in owner and
+  routes a recovery-required cold launch to Recovery Center; a readable primary never restores
+  authority. Physical native force-quit/reopen remains an acceptance gate. `store.ts` is
+  **fence-aware**: stale
   recovery is single-flight per owner, stages every exact losing root, and synchronously blocks reducers.
   The final barrier publishes a valid winner only after all participants reach the strict
   credential-free append-only journal. Failed appends remain only for same-process retry while
@@ -241,7 +246,8 @@ null`; route keys include the owner so component state cannot survive an account
     The recovery sink follows the same split so `expo-file-system` and `expo-sharing` stay on
     native while the base file remains the browser implementation.
   - Remaining CUTOVER: approve and implement an enforceable old-client compatibility gate, add
-    choose/restore/import/discard controls, and complete browser/native lifecycle acceptance.
+    choose/restore/import/discard controls, and complete post-resolution browser reload plus
+    physical native force-quit/reopen acceptance.
     Only then flip the default and port the coordinator to `/v2`.
     Writes are verified and non-fence failures set `error`; staging failure prevents dispatch.
 - **Everything is workspace-scoped by a fixed-token lease.** The client never sends a
