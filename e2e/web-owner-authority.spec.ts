@@ -137,6 +137,8 @@ interface BrowserReplicaNote {
 
 interface BrowserReplica {
   readonly notes: Record<string, BrowserReplicaNote>;
+  readonly outbox?: readonly unknown[];
+  readonly pendingPush?: readonly unknown[] | null;
   readonly [key: string]: unknown;
 }
 
@@ -167,24 +169,40 @@ async function indexedDbRecord(page: Page, key: string = ownerKey): Promise<Brow
 }
 
 /**
- * Wait until the durable owner root stops changing. Leader tabs may stage
- * `pendingPush` after a local edit (scheduler debounce); snapshotting mid-stage
- * races follower-click assertions that require bit-exact equality.
+ * After a local edit the leader's 1.5s network debounce stages outbox → pendingPush.
+ * A short "stable window" can end *before* that stage and flaky-fail bit-exact
+ * follower-click checks. Wait for the post-edit durable stage explicitly, then a
+ * short quiet period so no further leader writes race the assertion.
  */
-async function waitForStableIndexedDbRecord(
+async function waitForLeaderEditFullyStaged(
   page: Page,
-  options: { stableMs?: number; timeoutMs?: number } = {},
+  options: { quietMs?: number; timeoutMs?: number } = {},
 ): Promise<BrowserReplicaRecord> {
-  const stableMs = options.stableMs ?? 700;
-  const timeoutMs = options.timeoutMs ?? 8_000;
-  const deadline = Date.now() + timeoutMs;
+  const quietMs = options.quietMs ?? 400;
+  const timeoutMs = options.timeoutMs ?? 10_000;
+
+  await expect
+    .poll(
+      async () => {
+        const record = await indexedDbRecord(page);
+        const replica = JSON.parse(record.serializedReplica) as BrowserReplica;
+        const outbox = replica.outbox ?? [];
+        const pending = replica.pendingPush ?? null;
+        // Staged: durable request exists and the outbox slice was moved into it.
+        return pending !== null && pending.length > 0 && outbox.length === 0;
+      },
+      { timeout: timeoutMs, intervals: [100, 200, 250] },
+    )
+    .toBe(true);
+
   let last = await indexedDbRecord(page);
   let lastChangeAt = Date.now();
+  const deadline = Date.now() + quietMs + 2_000;
   while (Date.now() < deadline) {
     await page.waitForTimeout(100);
     const next = await indexedDbRecord(page);
     if (next.revision === last.revision && next.serializedReplica === last.serializedReplica) {
-      if (Date.now() - lastChangeAt >= stableMs) return next;
+      if (Date.now() - lastChangeAt >= quietMs) return next;
     } else {
       last = next;
       lastChangeAt = Date.now();
@@ -483,9 +501,9 @@ test('one tab writes while its follower refreshes, then takes over after a verif
   await title.fill(privateSentinel);
   await expect(follower.getByText(privateSentinel)).toBeVisible();
 
-  // Leader may still be staging outbox → pendingPush after the edit. Wait for that
-  // durable write to settle so the follower-click check is not racing the leader.
-  const recordBeforeFollowerAttempt = await waitForStableIndexedDbRecord(leader);
+  // Wait past the 1.5s edit debounce until outbox → pendingPush is durably staged,
+  // then assert a disabled follower click does not mutate authority.
+  const recordBeforeFollowerAttempt = await waitForLeaderEditFullyStaged(leader);
   await followerNew.evaluate((button: HTMLElement) => button.click());
   await follower.waitForTimeout(250);
   expect(await indexedDbRecord(follower)).toEqual(recordBeforeFollowerAttempt);
