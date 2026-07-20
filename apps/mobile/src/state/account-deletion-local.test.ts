@@ -254,4 +254,66 @@ describe('eraseLocalOwnerAfterConfirmedAccountDeletion', () => {
 
     expect(store$.session.get()?.userId).toBe(sessionB.userId);
   });
+
+  it('5 — after confirmed erase, cold load cannot rehydrate pending notes as live authority', async () => {
+    await adoptSession(sessionA);
+    const ownerKey = ownerKeyFor(sessionA);
+    const privateBody = 'must-not-rehydrate-after-delete';
+    const privateNote = note(noteAId, workspaceA, privateBody);
+    store$.notes.set({ [privateNote.id]: privateNote });
+    store$.pendingPush.set([mutation(noteAId, 'op-inflight-delete', privateBody)]);
+    store$.outbox.set([mutation(noteAId, 'op-queued-delete', privateBody)]);
+    await saveState();
+
+    const journalKey = stateStorageKeys.replica(replicaRecoveryJournalOwnerKey(ownerKey));
+    memory.values.set(
+      journalKey,
+      JSON.stringify({
+        version: 2,
+        ownerKey: replicaRecoveryJournalOwnerKey(ownerKey),
+        userId: sessionA.userId,
+        workspaceId: sessionA.workspaceId,
+        notes: { [privateNote.id]: privateNote },
+        syncCursor: '',
+        deviceId: 'device-a',
+        outbox: [],
+        pendingPush: store$.pendingPush.get(),
+        syncIssue: null,
+        conflicts: {},
+      }),
+    );
+
+    await eraseLocalOwnerAfterConfirmedAccountDeletion({
+      serverDeleted: true,
+      ownerKey,
+      userId: sessionA.userId,
+      workspaceId: sessionA.workspaceId,
+    });
+
+    store$.set({
+      session: null,
+      activeOwnerKey: null,
+      notes: {},
+      syncCursor: '',
+      deviceId: '',
+      outbox: [],
+      pendingPush: null,
+      syncIssue: null,
+      conflicts: {},
+      status: 'idle',
+      syncGated: false,
+    });
+    await loadState();
+
+    expect(store$.session.get()).toBeNull();
+    expect(store$.notes.get()).toEqual({});
+    expect(store$.pendingPush.get()).toBeNull();
+    expect(store$.outbox.get()).toEqual([]);
+    expect(memory.values.get(stateStorageKeys.replica(ownerKey))).toBeUndefined();
+    expect(memory.values.get(journalKey)).toBeUndefined();
+    for (const value of memory.values.values()) {
+      expect(value).not.toContain(privateBody);
+      expect(value).not.toContain(sessionA.token);
+    }
+  });
 });

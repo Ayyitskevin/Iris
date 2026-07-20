@@ -40,8 +40,37 @@ event name, boolean flags.
 Forbidden: bearer tokens, passwords, note titles/bodies, full email addresses, raw Stripe
 secrets, recovery bundle contents.
 
+## Authority survival matrix (Prompt 2)
+
+Deterministic interleavings (no fixed sleeps as correctness). Observable signals are
+durable `pendingPush` / replica notes / lease generation / terminal `syncIssue` / empty
+storage after erase.
+
+| # | Interleaving | Invariant | Recovery |
+| --- | --- | --- | --- |
+| 1 | Leader crashes after durable `pendingPush`, before network receipt | Exact `opId` + payload retained; restart replays same batch | Automatic coordinator retry of exact pending; server receipt prevents double-apply |
+| 2 | Leader crashes after server apply, before local reconcile persist | Local `pendingPush` remains until reconcile commits | Retry same pending; server returns frozen receipt outcome |
+| 3 | Follower takes over after lease expiry | Old generation returns `stale`; new generation may push exact pending once | Owner root is generation-fenced; no transfer of in-flight A work to wrong generation as “done” |
+| 4 | Stale leader wakes after takeover | Writes/pushes for old generation fail closed | Drop stale process; continue under current lease only |
+| 5 | Account deletion races pending local work | Server cascade + `eraseLocalOwnerAfterConfirmedAccountDeletion` clear primary + journal; cold load cannot rehydrate private pending | Fail closed if erase cannot verify; export Recovery Center only if roots remain |
+| 6 | Terminal stored incomplete receipt | Client parks `sync_receipt_incomplete` with `recoveryKind: retry`; no automatic network while held | Operator playbook (incomplete receipt row above); never rekey blindly |
+
+Commands (in-repo proofs):
+
+```bash
+pnpm --filter @iris/mobile exec vitest run \
+  src/sync/authority-survival-matrix.test.ts \
+  src/sync/adversarial-sync-integrity.test.ts \
+  src/state/account-deletion-local.test.ts
+pnpm --filter @iris/api exec vitest run test/adversarial-sync-integrity.test.ts
+```
+
+Residual limitations: physical multi-device force-quit, human-gated Stripe cancel
+reconciliation row, and Recovery Center choose/restore remain open (not part of this matrix).
+
 ## Related tests
 
 - `apps/api/test/adversarial-sync-integrity.test.ts` — server wire + deletion proofs
 - `apps/mobile/src/sync/adversarial-sync-integrity.test.ts` — coordinator fault injection
-- `apps/mobile/src/state/account-deletion-local.test.ts` — local erase fence
+- `apps/mobile/src/sync/authority-survival-matrix.test.ts` — Prompt 2 crash/takeover/fence matrix
+- `apps/mobile/src/state/account-deletion-local.test.ts` — local erase fence + no rehydrate

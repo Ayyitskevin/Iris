@@ -42,17 +42,31 @@ type DiagnosticSink = (event: AccountDeletionDiagnostic) => void;
 
 const diagnosticListeners: DiagnosticSink[] = [];
 
-/** Test/operator hook: observe privacy-safe deletion diagnostics without reading logs. */
+/**
+ * Test/operator hook: observe privacy-safe deletion diagnostics without reading logs.
+ * Returns an idempotent unsubscribe so long-lived processes and tests cannot accumulate
+ * duplicate listeners when cleanup runs more than once.
+ */
 export function onAccountDeletionDiagnostic(listener: DiagnosticSink): () => void {
   diagnosticListeners.push(listener);
+  let active = true;
   return () => {
+    if (!active) return;
+    active = false;
     const index = diagnosticListeners.indexOf(listener);
     if (index >= 0) diagnosticListeners.splice(index, 1);
   };
 }
 
+/** Test-only: number of active diagnostic subscribers (no event payloads). */
+export function accountDeletionDiagnosticSubscriberCount(): number {
+  return diagnosticListeners.length;
+}
+
 export function emitAccountDeletionDiagnostic(event: AccountDeletionDiagnostic): void {
-  for (const listener of diagnosticListeners) {
+  // Snapshot so a listener that unsubscribes mid-emit cannot skip later listeners.
+  const snapshot = diagnosticListeners.slice();
+  for (const listener of snapshot) {
     try {
       listener(event);
     } catch {
