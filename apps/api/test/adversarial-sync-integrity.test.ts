@@ -14,6 +14,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  accountDeletionDiagnosticSubscriberCount,
   emitAccountDeletionDiagnostic,
   onAccountDeletionDiagnostic,
   type AccountDeletionDiagnostic,
@@ -421,5 +422,24 @@ describe('adversarial sync integrity', () => {
       'userId',
       'workspaceId',
     ]);
+  });
+
+  it('diagnostic subscriptions unsubscribe idempotently without accumulating listeners', () => {
+    const before = accountDeletionDiagnosticSubscriberCount();
+    const hits: number[] = [];
+    const stop = onAccountDeletionDiagnostic(() => {
+      hits.push(1);
+    });
+    expect(accountDeletionDiagnosticSubscriberCount()).toBe(before + 1);
+    stop();
+    stop(); // second call must not throw or remove someone else
+    expect(accountDeletionDiagnosticSubscriberCount()).toBe(before);
+    emitAccountDeletionDiagnostic({
+      event: 'account_deletion_completed',
+      workspaceId: 'ws-id',
+      userId: 'user-id',
+      stripeSubscriptionPresent: false,
+    });
+    expect(hits).toEqual([]);
   });
 });

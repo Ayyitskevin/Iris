@@ -83,6 +83,8 @@ all automatic network work until the user invokes its explicit recovery action.
 - `apps/mobile/src/sync/adversarial-sync-integrity.test.ts` +
   `apps/mobile/src/state/account-deletion-local.test.ts` — client fault injection and
   post-deletion local erase fence.
+- `apps/mobile/src/sync/authority-survival-matrix.test.ts` — crash/takeover/stale-leader/
+  terminal-receipt interleavings (observable durable state, no fixed sleeps as correctness).
 - `docs/SYNC_RECOVERY.md` — recovery path per failure state.
 
 ## Playbook
