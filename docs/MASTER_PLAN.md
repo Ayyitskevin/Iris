@@ -17,10 +17,10 @@ Read order for a new session: [`VISION.md`](VISION.md) → [`DECISIONS.md`](DECI
 **Verified locally on 2026-07-19:**
 
 - Current worktree: API **155 tests pass / 2 skipped locally** (the real-Postgres gates run in
-  CI), mobile **368 tests pass**, and the production-bundle Chromium authority journeys pass for
-  current-runtime leadership, frozen-old-writer divergence, and cold-relaunch Recovery Center
-  routing with zero requests. Typecheck, changed-file lint and formatting, and isolated
-  web/Android/iOS Metro exports pass. The
+  CI), mobile **401 tests pass**, and all **3 production-bundle Chromium journeys pass** for
+  current-runtime leadership, synthetic Page Visibility scheduling, frozen-old-writer divergence,
+  and cold-relaunch Recovery Center routing with zero requests. Typecheck, root and changed-file
+  lint, formatting, and isolated web/Android/iOS Metro exports pass. The
   workflow adds a dedicated browser job to frozen install, typecheck, lint, both test suites with
   PostgreSQL 16, and web export. Expo's dependency compatibility check remains red on the
   pre-existing Expo/React/TypeScript cohort; SDK alignment remains a separate release-health slice.
@@ -56,8 +56,12 @@ preparation now installs unavailable authority and lets hydration retain a valid
 primary fenced/read-only or, when primary read or validation rejects, reopen only the newest
 strict compatible journal snapshot. It retains the signed-in owner and routes the
 recovery-required cold launch directly to Recovery Center without a lease, source write, or
-request. An enforceable compatibility gate, the recovery resolution lifecycle, physical native
-force-quit/reopen acceptance, and the v2 pull applier remain open.
+request. ADR-024 also replaces the fixed 8-second network poll with generation-fenced foreground
+scheduling: local edits remain immediate and durable, network work debounces, transient failures
+back off with jitter, hidden/background states pause timers, and successful device registration is
+cached only for the exact session generation. An enforceable compatibility gate, the recovery
+resolution lifecycle, physical native scheduler/force-quit acceptance, and the v2 pull applier
+remain open.
 
 **Still missing for release:** deploy/infra configuration, migration-on-deploy and
 observability; account-deletion mobile UX, export-first confirmation, privacy policy, local
@@ -76,7 +80,7 @@ are independent of feature count and independent of the Sync v2 machinery being 
 | #       | Blocker                                   | Why it blocks launch                                                                                                                                                                                                                                                                                                                                   | Evidence                                                                                                                                                                          |
 | ------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **B-1** | **Durable-authority cutover**             | SQLite/IndexedDB, current-runtime leadership, and exact mixed-version divergence preservation exist default-off. Client-only checks cannot exclude an already-loaded old version, so production still lacks an enforceable server compatibility fence, recovery-resolution lifecycle, and browser/native device acceptance.                            | ADR-023; `promoting-replica-repository.ts`; A3b/c                                                                                                                                 |
-| **B-2** | **Deploy + secrets + observability**      | There is no staging/deploy path, migration-on-deploy contract, readiness signal, or error telemetry. Production can still select PGlite, accept a weak JWT value, and retain the development Stripe price id.                                                                                                                                          | no Docker/Fly/Render config; no Sentry/otel; `index.ts`; `env.ts`                                                                                                                 |
+| **B-2** | **Deploy + secrets + observability**      | There is no staging/deploy path, migration-on-deploy contract, readiness integration, or error telemetry. The `/ready` database probe exists but is not wired into deploy gating/monitoring. Production can still select PGlite, accept a weak JWT value, and retain the development Stripe price id.                                                  | no Docker/Fly/Render config; no Sentry/otel; `app.ts`; `index.ts`; `env.ts`                                                                                                       |
 | **B-3** | **Safe account erasure + privacy UX**     | The API erase route exists, but Stripe cancellation failure is swallowed before its only reconciliation identifiers are deleted. Mobile has no export-first deletion flow, privacy policy/link, or local-replica erasure.                                                                                                                              | `services/account.ts`; `settings.tsx`; no `docs/PRIVACY.md`                                                                                                                       |
 | **B-4** | **Store billing/distribution compliance** | Native settings opens Stripe Checkout to unlock paid cloud sync. Apple and Google generally require approved billing paths for in-app digital functionality, subject to storefront and enrolled-program exceptions. Human/legal approval must choose StoreKit/Play Billing, an eligible alternative-billing/link program, or a consumption-only model. | `settings.tsx`; [Apple §3.1](https://developer.apple.com/app-store/review/guidelines/); [Google Payments](https://support.google.com/googleplay/android-developer/answer/9858738) |
 
@@ -266,10 +270,16 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
   principal/workspace, sync push/pull, and agent-token budgets; distributed storage; documented
   windows; note-count caps; and proxy-safe client identity. `TRUST_PROXY=true` currently trusts
   the entire forwarded chain and needs a deployment-specific threat model.
-- **B8 · 🔵 Sonnet · Battery/network sync scheduling.** Replace the fixed 8 s poll: debounce
-  editor-triggered sync (~1–2 s after last keystroke), exponential backoff + jitter on
-  offline/429/5xx, `AppState`/visibility pause, `registerDevice` once per session not per
-  cycle. _Fixes the mass-market-unfit finding_ (`app/_layout.tsx:23-27`, `coordinator.ts`).
+- **B8 · 🔵 Sonnet · Battery/network sync scheduling — IMPLEMENTED; LIFECYCLE ACCEPTANCE OPEN.**
+  The fixed network poll is gone. Editor work uses a 1.5 s trailing debounce; successful
+  foreground pulls use a 30 s cadence; transport/408/425/429/5xx outcomes use bounded equal-jitter
+  exponential backoff; `AppState`/web Page Visibility pauses timers; web online restoration probes
+  network failures; and successful `registerDevice` is cached for one exact session generation.
+  Durable holds, 401, 402, authority/recovery fences, and local persistence errors schedule no
+  timed retry. Deterministic tests and production Chromium with synthetic Page Visibility
+  transitions cover the runtime policy; real browser throttling and physical iOS/Android
+  background/foreground acceptance remain before release. (`scheduler.ts`, `app/_layout.tsx`,
+  `auth/session.ts`, `coordinator.ts`; ADR-024.)
 - **B9 · 🔵 Sonnet · Head-of-line sync fix + tombstone compaction.** Skip an
   oversized/invalid outbox mutation with a per-note (non-terminal) issue so one bad note
   can't halt workspace-wide sync (`coordinator.ts:98-148`); drop acknowledged remote
@@ -343,9 +353,9 @@ Each slice must leave a rollback point and prove the exact transition it claims.
    resolve the human-approved store commerce model; add EAS/store assets; and run the
    install→offline note→web sync→agent write/feed/undo→export→$5-sync acceptance path from
    `VISION.md`.
-5. **Mass-market operating hardening.** Replace fixed polling with lifecycle-aware backoff,
+5. **Mass-market operating hardening.** Prove ADR-024 on physical iOS/Android lifecycle transitions,
    close device reclamation and account-erasure UX, add principal-level abuse budgets, and prove
-   the browser/native/security acceptance matrix before store submission.
+   the remaining native/security acceptance matrix before store submission.
 
 **Human-gated parallel release tracks:** redesign A5 so Stripe cancellation failure leaves a
 durable reconciliation record before any account identifiers are erased, and decide A5b's
@@ -361,26 +371,27 @@ Phase C begins only after the launch flow is coherent and observable in staging.
 Live-state adversarial review completed 2026-07-18 at `6a443ad`, then rechecked against
 the current CAS diff. Closed findings stay visible so regressions do not re-enter the plan.
 
-| Sev         | State       | Finding                                                                                             | Evidence                            | Next          |
-| ----------- | ----------- | --------------------------------------------------------------------------------------------------- | ----------------------------------- | ------------- |
-| **blocker** | human-gated | Client detection cannot exclude an already-loaded old legacy writer; server compatibility is open   | ADR-023; compatibility decision     | A3b           |
-| high        | human-gated | Stripe cancel failure is swallowed before account identifiers are erased                            | `services/account.ts`               | A5            |
-| high        | human-gated | Native Stripe Checkout lacks an approved App Store/Play commerce model                              | `settings.tsx`; store policies      | A5b/B10       |
-| high        | open        | Production may select PGlite, weak JWT text, or the dev Stripe price id                             | `index.ts`, `env.ts`                | A4/B10        |
-| high        | fixed here  | CAS recovery was not exact-commit, single-flight, or safe from reducer re-entry                     | `store.ts`, `store-fence.test.ts`   | keep tests    |
-| high        | open        | Fixed 8 s polling lacks backoff, jitter, and lifecycle pause                                        | `app/_layout.tsx`, `coordinator.ts` | B8            |
-| high        | open        | `sync_idempotency` retains full payloads forever                                                    | `schema.ts`, `sync.ts`              | B5            |
-| medium      | partial     | Coarse per-IP limiter lacks principal/sync/agent budgets and proxy proof                            | `app.ts`, `rate-limit.test.ts`      | B7            |
-| medium      | API only    | Device reclamation has no client settings/recovery flow                                             | `devices.ts`, `settings.tsx`        | B4            |
-| medium      | partial     | Recovery inventory + local export ship; choose/restore/import/discard is open                       | `recovery.tsx`; ADR-021             | A3b/c         |
-| medium      | partial     | CI has a real two-tab browser gate; format, root-build, coverage, security, and native gates remain | `.github/workflows/ci.yml`          | CI/acceptance |
-| low         | open        | `Math.random` remains a UUID/device-id fallback                                                     | `manager.ts`, `store.ts`            | B12           |
+| Sev         | State       | Finding                                                                                             | Evidence                          | Next          |
+| ----------- | ----------- | --------------------------------------------------------------------------------------------------- | --------------------------------- | ------------- |
+| **blocker** | human-gated | Client detection cannot exclude an already-loaded old legacy writer; server compatibility is open   | ADR-023; compatibility decision   | A3b           |
+| high        | human-gated | Stripe cancel failure is swallowed before account identifiers are erased                            | `services/account.ts`             | A5            |
+| high        | human-gated | Native Stripe Checkout lacks an approved App Store/Play commerce model                              | `settings.tsx`; store policies    | A5b/B10       |
+| high        | open        | Production may select PGlite, weak JWT text, or the dev Stripe price id                             | `index.ts`, `env.ts`              | A4/B10        |
+| high        | fixed here  | CAS recovery was not exact-commit, single-flight, or safe from reducer re-entry                     | `store.ts`, `store-fence.test.ts` | keep tests    |
+| high        | fixed here  | Fixed polling lacked debounce, backoff, jitter, lifecycle pause, and registration reuse             | ADR-024; `scheduler.ts`           | native accept |
+| high        | open        | `sync_idempotency` retains full payloads forever                                                    | `schema.ts`, `sync.ts`            | B5            |
+| medium      | partial     | Coarse per-IP limiter lacks principal/sync/agent budgets and proxy proof                            | `app.ts`, `rate-limit.test.ts`    | B7            |
+| medium      | API only    | Device reclamation has no client settings/recovery flow                                             | `devices.ts`, `settings.tsx`      | B4            |
+| medium      | partial     | Recovery inventory + local export ship; choose/restore/import/discard is open                       | `recovery.tsx`; ADR-021           | A3b/c         |
+| medium      | partial     | CI has a real two-tab browser gate; format, root-build, coverage, security, and native gates remain | `.github/workflows/ci.yml`        | CI/acceptance |
+| low         | open        | `Math.random` remains a UUID/device-id fallback                                                     | `manager.ts`, `store.ts`          | B12           |
 
 **Verification debt:** real PostgreSQL tests run only in CI; most IndexedDB contract tests use
-`fake-indexeddb`; SQLite tests use Node SQLite. Production-bundle Chromium now proves both
-current-runtime leadership/transfer and frozen-old-writer divergence with zero later request.
-iOS/Android force-quit/reopen and recovery-resolution evidence do not exist. Treat that remainder
-as release debt, not a passing footnote.
+`fake-indexeddb`; SQLite tests use Node SQLite. Production-bundle Chromium now proves
+current-runtime leadership/transfer and frozen-old-writer divergence. Synthetic Page Visibility
+transitions also cover scheduler event handling, but genuine browser throttling, physical
+iOS/Android lifecycle, force-quit/reopen, and recovery-resolution evidence do not exist. Treat that
+remainder as release debt, not a passing footnote.
 
 ---
 

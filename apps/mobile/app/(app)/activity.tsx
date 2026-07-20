@@ -19,7 +19,7 @@ import {
   store$,
   updateReplicaForLease,
 } from '../../src/state/store';
-import { sync } from '../../src/sync/manager';
+import { scheduleSync } from '../../src/sync/manager';
 import { theme } from '../../src/theme';
 
 const ACTION_LABEL: Record<string, string> = {
@@ -164,7 +164,7 @@ export default function Activity() {
         authoritativeApplied = merged !== current;
         return merged;
       });
-      void sync();
+      scheduleSync('immediate');
       assertCurrentSession(lease);
       if (
         !requestStillCurrent(
@@ -194,7 +194,7 @@ export default function Activity() {
           setUndoNotice(
             "This action is no longer the note's latest change, so Iris left the newer note untouched.",
           );
-          void sync();
+          scheduleSync('immediate');
         } else if (
           failureKind === 'confirmed-rejection' &&
           error instanceof ApiRequestError &&
@@ -210,7 +210,7 @@ export default function Activity() {
             'Iris could not confirm whether the undo completed. Refresh activity before retrying.',
           );
           void load();
-          void sync();
+          scheduleSync('immediate');
         }
       }
     } finally {

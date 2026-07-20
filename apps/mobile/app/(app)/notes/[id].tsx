@@ -16,7 +16,7 @@ import {
 import {
   deleteNoteLocal,
   keepLocalConflict,
-  sync,
+  scheduleSync,
   updateNoteLocal,
   useServerConflict,
 } from '../../../src/sync/manager';
@@ -74,7 +74,7 @@ export default function NoteEditor() {
 
   useEffect(() => {
     // Best-effort: pull the latest server state for this note when opening.
-    if (!actionsBlocked) void sync();
+    if (!actionsBlocked) scheduleSync('immediate');
   }, [id, actionsBlocked]);
 
   // Seed the tags input once the note is available (keyed on note id, not tags, so
@@ -148,7 +148,7 @@ export default function NoteEditor() {
         value.restoreProtocolVersion === RESTORE_PROTOCOL_VERSION &&
         store$.notes[id].get()?.version !== value.headVersion
       ) {
-        void sync();
+        scheduleSync('immediate');
       }
     } catch {
       if (
@@ -209,7 +209,7 @@ export default function NoteEditor() {
         authoritativeApplied = merged !== current;
         return merged;
       });
-      void sync();
+      scheduleSync('immediate');
       assertCurrentSession(lease);
       if (
         !requestStillCurrent(pendingRequest, routeIdentityRef.current, restoreRequestRef.current)
@@ -241,14 +241,14 @@ export default function NoteEditor() {
           setHistoryBaseVersion(null);
           setRestoreProtocolVersion(null);
           setHistoryError('This note changed after history was loaded. Sync and reopen history.');
-          void sync();
+          scheduleSync('immediate');
         } else if (failureKind === 'confirmed-rejection') {
           setHistoryError('The server rejected that restore. The note was not changed.');
         } else {
           setHistoryError(
             'Iris could not confirm whether the restore completed. Sync before editing or retrying.',
           );
-          void sync();
+          scheduleSync('immediate');
         }
       }
     } finally {

@@ -512,7 +512,7 @@ describe('session-bound sync coordinator', () => {
     expect(h.calls.filter((call) => call.method === 'push')).toHaveLength(
       SYNC_PUSH_CHUNK_LIMIT + 1,
     );
-    expect(h.calls.filter((call) => call.method === 'register')).toHaveLength(2);
+    expect(h.calls.filter((call) => call.method === 'register')).toHaveLength(1);
     expect(port.replicas.get(lease.ownerKey)?.outbox).toEqual([]);
   });
 
@@ -1063,10 +1063,44 @@ describe('session-bound sync coordinator', () => {
 
     const leaseB = port.adopt('B');
     push.reject(new ApiRequestError(401, 'unauthorized', 'Expired A token'));
-    await running;
+    await expect(running).resolves.toEqual({ kind: 'stale' });
 
     expect(port.current?.ownerKey).toBe(leaseB.ownerKey);
     expect(port.expired).toEqual([]);
+  });
+
+  it('reports auth-required when expiry fail-closes before a persistence error', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    port.expireSession = async (rejectedLease) => {
+      port.expired.push(rejectedLease.token);
+      port.signOut();
+      throw new Error('rejected credential tombstone needs local retry');
+    };
+    const h = harness(port, {
+      register: () =>
+        Promise.reject(new ApiRequestError(401, 'unauthorized', 'Authentication required')),
+    });
+
+    await expect(h.sync()).resolves.toEqual({ kind: 'auth-required' });
+    expect(port.current).toBeNull();
+    expect(port.expired).toEqual([lease.token]);
+  });
+
+  it('returns stale when the owner changes during a terminal-issue commit', async () => {
+    const port = new MemoryPort();
+    port.adopt('A');
+    port.afterNextApply = () => {
+      port.adopt('B');
+    };
+    const h = harness(port, {
+      register: () =>
+        Promise.reject(new ApiRequestError(409, 'terminal_conflict', 'Manual recovery required')),
+    });
+
+    await expect(h.sync()).resolves.toEqual({ kind: 'stale' });
+    expect(port.current?.workspaceId).toBe(workspaceB);
+    expect(port.statuses.get(port.current!.ownerKey)).toBeUndefined();
   });
 
   it('never sends A outbox data with B token', async () => {
@@ -1218,7 +1252,7 @@ describe('session-bound sync coordinator', () => {
     const payment = harness(paymentPort, {
       register: () => Promise.reject(new ApiRequestError(402, 'payment_required', 'Device limit')),
     });
-    await payment.sync();
+    expect(await payment.sync()).toEqual({ kind: 'sync-gated' });
     expect(paymentPort.current?.ownerKey).toBe(paymentLease.ownerKey);
     expect(paymentPort.gated.get(paymentLease.ownerKey)).toBe(true);
     expect(paymentPort.statuses.get(paymentLease.ownerKey)).toBe('idle');
@@ -1228,7 +1262,7 @@ describe('session-bound sync coordinator', () => {
     const offline = harness(offlinePort, {
       register: () => Promise.reject(new TypeError('network down')),
     });
-    await offline.sync();
+    expect(await offline.sync()).toEqual({ kind: 'transient', reason: 'network' });
     expect(offlinePort.current?.ownerKey).toBe(offlineLease.ownerKey);
     expect(offlinePort.statuses.get(offlineLease.ownerKey)).toBe('offline');
     expect(offlinePort.expired).toEqual([]);
@@ -1246,12 +1280,123 @@ describe('session-bound sync coordinator', () => {
       },
     });
 
-    await h.sync();
+    expect(await h.sync()).toEqual({ kind: 'transient', reason: 'rate-limit' });
     expect(port.statuses.get(lease.ownerKey)).toBe('offline');
     expect(port.replicas.get(lease.ownerKey)?.syncIssue).toBeNull();
 
-    await h.sync();
+    expect(await h.sync()).toEqual({ kind: 'success', hasPendingWork: false });
     expect(attempts).toBe(2);
     expect(port.statuses.get(lease.ownerKey)).toBe('idle');
+  });
+
+  it.each([
+    [408, 'timeout'],
+    [425, 'timeout'],
+    [429, 'rate-limit'],
+    [500, 'server'],
+    [503, 'server'],
+  ] as const)('classifies HTTP %s as a typed %s transient outcome', async (status, reason) => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const h = harness(port, {
+      register: () => Promise.reject(new ApiRequestError(status, 'temporary', 'Try later')),
+    });
+
+    expect(await h.sync()).toEqual({ kind: 'transient', reason });
+    expect(port.statuses.get(lease.ownerKey)).toBe('offline');
+    expect(port.replicas.get(lease.ownerKey)?.syncIssue).toBeNull();
+  });
+
+  it('parks unknown programming errors instead of retrying them as network failures', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const h = harness(port, {
+      register: () => Promise.reject(new Error('unexpected coordinator defect')),
+    });
+
+    expect(await h.sync()).toEqual({ kind: 'local-error' });
+    expect(port.statuses.get(lease.ownerKey)).toBe('error');
+  });
+
+  it('does not misclassify a local staging TypeError as a transport outage', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const queued = mutation('op-local-type-error', 'local');
+    port.replicas.set(lease.ownerKey, {
+      ...emptyReplica(),
+      deviceId: lease.deviceId,
+      notes: { [noteId]: note(workspaceA, 'local') },
+      outbox: [queued],
+    });
+    port.nextUpdateError = new TypeError('local storage implementation defect');
+    const h = harness(port);
+
+    expect(await h.sync()).toEqual({ kind: 'local-error' });
+    expect(h.calls).toEqual([]);
+    expect(port.statuses.get(lease.ownerKey)).toBe('error');
+  });
+
+  it('caches registration only after success and only for the exact session generation', async () => {
+    const port = new MemoryPort();
+    const firstA = port.adopt('A');
+    const h = harness(port);
+
+    await h.sync();
+    await h.sync();
+    expect(h.calls.filter((call) => call.method === 'register').map((call) => call.token)).toEqual([
+      firstA.token,
+    ]);
+
+    port.adopt('A', 'token-A-replaced');
+    await h.sync();
+    expect(h.calls.filter((call) => call.method === 'register').map((call) => call.token)).toEqual([
+      firstA.token,
+      'token-A-replaced',
+    ]);
+  });
+
+  it('lets explicit recovery invalidate a successful registration cache', async () => {
+    const port = new MemoryPort();
+    const lease = port.adopt('A');
+    const h = harness(port);
+
+    await h.sync();
+    h.invalidateRegistration(lease);
+    await h.sync();
+
+    expect(h.calls.filter((call) => call.method === 'register')).toHaveLength(2);
+  });
+
+  it('does not run the coalesced repeat immediately after a transient failure', async () => {
+    const port = new MemoryPort();
+    port.adopt('A');
+    const registration = deferred<{ activeDevices: number }>();
+    const h = harness(port, { register: () => registration.promise });
+
+    const first = h.sync();
+    await vi.waitFor(() => expect(h.calls).toHaveLength(1));
+    const coalesced = h.sync();
+    registration.reject(new ApiRequestError(503, 'unavailable', 'Try later'));
+
+    await expect(first).resolves.toEqual({ kind: 'transient', reason: 'server' });
+    await expect(coalesced).resolves.toEqual({ kind: 'transient', reason: 'server' });
+    expect(h.calls.filter((call) => call.method === 'register')).toHaveLength(1);
+  });
+
+  it('shares a successful active flight without an immediate coordinator repeat', async () => {
+    const port = new MemoryPort();
+    port.adopt('A');
+    const registration = deferred<{ activeDevices: number }>();
+    const h = harness(port, { register: () => registration.promise });
+
+    const first = h.sync();
+    await vi.waitFor(() => expect(h.calls).toHaveLength(1));
+    const coalesced = h.sync();
+    expect(coalesced).toBe(first);
+    registration.resolve({ activeDevices: 1 });
+
+    await expect(first).resolves.toEqual({ kind: 'success', hasPendingWork: false });
+    await expect(coalesced).resolves.toEqual({ kind: 'success', hasPendingWork: false });
+    expect(h.calls.map((call) => call.method)).toEqual(['register', 'changes']);
   });
 });

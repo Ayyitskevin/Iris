@@ -1018,6 +1018,56 @@ erasure coverage. This ADR does not choose a branch, merge, restore, import, dis
 
 ---
 
+## ADR-024 — Generation-fenced foreground Sync scheduling
+
+**Accepted in the client runtime; real browser throttling and physical iOS/Android lifecycle
+acceptance remain open.**
+
+Local-first publication and network timing are separate responsibilities. Note create/update/delete
+still synchronously publishes one coherent note/outbox projection after registering its durable
+save. The manager then sends only a credential-free scheduling intent. One Root-owned scheduler
+uses a 1.5-second trailing debounce for editor bursts, a 30-second successful foreground pull
+cadence, and a 50-millisecond yield when the coordinator's finite 16-chunk cycle reports remaining
+work. There is one scheduler timer and at most one coordinator flight per session generation;
+triggers during a flight coalesce, and a transient result cannot enter the coordinator's old
+immediate `again` loop.
+
+Every timer captures the exact session generation, owner key, and device id. The callback rereads
+`openSessionLease` immediately before dispatch and refuses to retarget an A timer to B, sign-out, a
+replacement credential, a follower, unavailable authority, or recovery-fenced projection. Tokens
+never enter timer state. `AppState` treats only `active` as runnable on native; react-native-web maps
+the same API to Page Visibility. Background/hidden cancels future timers but does not abort an
+already-dispatched durable/idempotent cycle. Foreground schedules one eligible catch-up while
+preserving an existing backoff deadline. Browser online restoration may pull forward only a
+network-failure retry; it does not reset the failure counter.
+
+The coordinator returns a typed outcome rather than asking the scheduler to infer policy from UI
+status. Transport rejection, 408, 425, 429, and 5xx use equal-jitter exponential delay from a
+2-second base up to 5 minutes. Success resets the counter. 401 expires the exact bearer, 402 parks
+the billing gate, durable response/protocol/workspace/other-4xx failures retain an owner-local
+`syncIssue`, and local persistence/integrity/unknown errors fail loud; none receives a timed retry.
+The existing local-only 8-second rejected-credential tombstone retry remains separate because it
+must run even without a session lease and sends no network request.
+
+`registerDevice` is cached only after a received success and only for the exact generation/owner/
+device tuple. A failed or 402 registration is not cached; replacement generations register again.
+Explicit durable-issue recovery invalidates the cache before retry, so a remotely deregistered
+device can re-register without turning generic 403 responses into an automatic loop. Push/pull
+remain `/v1`, preserve exact durable requests, and continue refreshing device `lastSeenAt` server
+side. No server route, schema, storage authority, billing rule, or default flag changes here.
+
+Deterministic tests cover debounce, idle/yield timing, bounded jitter, lifecycle and connectivity
+pause/resume, in-flight coalescing, transient parking, exact-generation replacement, typed error
+classes, and registration reuse/invalidation. A production Expo Chromium journey uses synthetic
+Page Visibility transitions, starts hidden, proves zero requests, then proves at least one network
+request after each visible transition; authority/recovery journeys prove those transitions still
+dispatch no network work without a lease. This ADR does not add background execution, push
+notifications, `Retry-After` parsing, or an independent request timeout. Genuine browser
+background throttling and physical iOS/Android background/foreground and force-quit acceptance
+remain release gates.
+
+---
+
 ## Summary: the shape these decisions produce
 
 One TypeScript monorepo → one Fastify service → one Postgres (PGlite locally). Auth,

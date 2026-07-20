@@ -74,6 +74,7 @@ const legacyDivergedRaw = JSON.stringify(legacyDivergedReplica);
 type InstrumentedWindow = Window & {
   __irisAuthorityMessages: unknown[];
   __irisFetches: string[];
+  __irisVisibilityState?: DocumentVisibilityState;
 };
 
 interface BrowserReplicaRecord {
@@ -238,6 +239,21 @@ async function installFrozenOldWriter(context: BrowserContext): Promise<void> {
 
 async function fetchCount(page: Page): Promise<number> {
   return page.evaluate(() => (window as InstrumentedWindow).__irisFetches.length);
+}
+
+async function setSyntheticVisibility(
+  page: Page,
+  visibilityState: DocumentVisibilityState,
+): Promise<void> {
+  await page.evaluate((state) => {
+    const target = window as InstrumentedWindow;
+    target.__irisVisibilityState = state;
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => target.__irisVisibilityState,
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, visibilityState);
 }
 
 /** Simulate a verified primary commit whose post-commit refresh notice was lost with the leader. */
@@ -446,8 +462,10 @@ test('one tab writes while its follower refreshes, then takes over after a verif
   expect(await indexedDbRecord(follower)).toEqual(recordBeforeFollowerAttempt);
   expect(await follower.evaluate(() => (window as InstrumentedWindow).__irisFetches)).toEqual([]);
 
-  // Exercise the actual 8 s app sync interval while the tab is a follower.
-  await follower.waitForTimeout(8_250);
+  // Page Visibility pause/resume must not let a read-only follower acquire a network lease.
+  await setSyntheticVisibility(follower, 'hidden');
+  await setSyntheticVisibility(follower, 'visible');
+  await follower.waitForTimeout(250);
   expect(await follower.evaluate(() => (window as InstrumentedWindow).__irisFetches)).toEqual([]);
 
   const leaderMessages = await leader.evaluate(
@@ -495,6 +513,37 @@ test('one tab writes while its follower refreshes, then takes over after a verif
   );
 });
 
+test('hidden launch pauses sync and each foreground transition schedules eligible work', async ({
+  context,
+}) => {
+  await seedAndInstrument(context);
+  await context.addInitScript(() => {
+    const target = window as InstrumentedWindow;
+    target.__irisVisibilityState = 'hidden';
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => target.__irisVisibilityState,
+    });
+  });
+
+  const page = await context.newPage();
+  await page.goto('/');
+  await expect(page.getByText('Initial local note')).toBeVisible();
+  await page.waitForTimeout(2_100);
+  expect(await fetchCount(page)).toBe(0);
+
+  await setSyntheticVisibility(page, 'visible');
+  await expect.poll(() => fetchCount(page)).toBeGreaterThan(0);
+  const firstForegroundCount = await fetchCount(page);
+
+  await setSyntheticVisibility(page, 'hidden');
+  await page.waitForTimeout(2_250);
+  expect(await fetchCount(page)).toBe(firstForegroundCount);
+
+  await setSyntheticVisibility(page, 'visible');
+  await expect.poll(() => fetchCount(page)).toBeGreaterThan(firstForegroundCount);
+});
+
 test('a frozen old writer preserves both roots and fences the current runtime before network', async ({
   context,
 }) => {
@@ -514,6 +563,11 @@ test('a frozen old writer preserves both roots and fences the current runtime be
     })
     .toBe('transactional');
 
+  // Keep scheduler timing out of this authority test. Local commits must remain available while
+  // hidden, and the explicit Search boundary below must be the operation that observes drift.
+  await setSyntheticVisibility(current, 'hidden');
+  const requestsBeforeHiddenEdit = await fetchCount(current);
+
   // Give the current runtime a branch that is distinct from the immutable legacy baseline.
   await current.getByRole('button', { name: /New note/ }).click();
   const currentTitle = current.getByPlaceholder('Title');
@@ -529,9 +583,10 @@ test('a frozen old writer preserves both roots and fences the current runtime be
   await current.getByRole('link', { name: 'Notes, back' }).click();
   await expect(current.getByPlaceholder('Search notes…')).toBeVisible();
 
-  // Let the current mutation's immediate sync attempt settle before defining the drift boundary.
-  await current.waitForTimeout(500);
+  // A hidden app keeps the exact local branch without dispatching its debounced network work.
+  await current.waitForTimeout(1_750);
   const requestsBeforeDrift = await fetchCount(current);
+  expect(requestsBeforeDrift).toBe(requestsBeforeHiddenEdit);
 
   // This same-origin page is a frozen pre-cutover runtime: no app bundle, Web Lock, channel, or
   // current repository code. It can still write the shipped legacy localStorage key exactly.
@@ -644,9 +699,11 @@ test('a frozen old writer preserves both roots and fences the current runtime be
     ]),
   );
 
-  // Exercise the real 8 s background interval after the absorbing state. It must neither send,
-  // resume writes, alter either exact root, nor append a contradictory control transition.
-  await current.waitForTimeout(8_250);
+  // Visibility pause/resume after the absorbing state must neither send, resume writes, alter
+  // either exact root, nor append a contradictory control transition.
+  await setSyntheticVisibility(current, 'hidden');
+  await setSyntheticVisibility(current, 'visible');
+  await current.waitForTimeout(250);
   expect(await fetchCount(current)).toBe(requestsBeforeDrift);
   expect(await indexedDbRecord(current)).toEqual(primaryBeforeDrift);
   expect(await legacyReplicaRaw(current)).toBe(legacyDivergedRaw);
@@ -670,7 +727,9 @@ test('a frozen old writer preserves both roots and fences the current runtime be
   await expect(relaunched.getByRole('button', { name: /New note/ })).toBeDisabled();
   await relaunched.getByRole('tab', { name: 'Settings' }).click();
   await expect(relaunched.getByRole('button', { name: 'Sign out' })).toBeEnabled();
-  await relaunched.waitForTimeout(8_250);
+  await setSyntheticVisibility(relaunched, 'hidden');
+  await setSyntheticVisibility(relaunched, 'visible');
+  await relaunched.waitForTimeout(250);
   expect(await fetchCount(relaunched)).toBe(0);
   expect(await indexedDbRecord(relaunched)).toEqual(primaryBeforeDrift);
   expect(await legacyReplicaRaw(relaunched)).toBe(legacyDivergedRaw);

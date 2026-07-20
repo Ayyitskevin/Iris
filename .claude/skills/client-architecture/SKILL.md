@@ -157,9 +157,13 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
   remainder waits for the next cycle. Before sending a batch that was already pending
   when a cycle began, queue an identity replica commit: memory can reflect a failed save
   when a concurrent edit made rollback unsafe.
-- **`sync()` is single-flight per session generation.** The coordinator's `activeRuns`
-  map owns repeat scheduling. It fires from the root interval, enqueue, and note-open
-  effect; do not add another interval.
+- **Sync has one lifecycle-owned scheduler and one coordinator flight per session generation.**
+  Local writes enter the durable queue synchronously, then `scheduleSync('debounced')` resets one
+  1.5-second trailing timer. Root owns foreground/visibility, online restoration, 30-second idle
+  pulls, and bounded transient backoff. Timers capture the exact credential-free
+  generation/owner/device key and never retarget A work to B. Use immediate scheduling for routine
+  consistency and explicit-recovery triggers; reserve direct `sync()` for tests and coordinator
+  diagnostics. Do not add another interval or component-owned network timer.
 - **Credentials and replicas are separate.** The owner replica persists notes, cursor,
   device id, outbox, pending request, conflicts, and any terminal `syncIssue`.
   `status` and `syncGated` are ephemeral. Never put the bearer token in a replica or
@@ -167,12 +171,15 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 - **Pull preserves pending edits and conflicts.** It skips current outbox note ids and
   refreshes a retained conflict's server side without discarding its local mutation.
 - **A durable `syncIssue` is a full network stop.** Hydration preserves it, and every
-  automatic `sync()` returns before registration, push, or pull until the user chooses
+  automatic schedule parks before registration, push, or pull until the user chooses
   the visible recovery action. `rekey` changes only affected operation ids,
   `reset-cursor` replays pull from the canonical start, `restage` discards only an
   invalid pre-dispatch pending snapshot so the current outbox can be staged, and
   `retry` preserves the exact pending request.
-- **402 = the multi-device billing gate** (ADR-007), raised at `registerDevice`. `sync()` sets `store$.syncGated = true` and returns early — **local editing still works**, only sync stops. Surface it (banner in `notes/index.tsx`); do not treat it as a hard error.
+- **402 = the multi-device billing gate** (ADR-007), raised at `registerDevice`. The coordinator
+  sets `store$.syncGated = true`; the scheduler parks with no timed retry — **local editing still
+  works**, only sync stops. Foreground return after checkout is an explicit probe. Surface the gate
+  (banner in `notes/index.tsx`); do not treat it as a hard error or cache failed registration.
 - **Two auth gates, both owner-reset.** Root and app layouts redirect on `session ===
 null`; route keys include the owner so component state cannot survive an account
   switch. Sign-out must first commit its token-free tombstone.

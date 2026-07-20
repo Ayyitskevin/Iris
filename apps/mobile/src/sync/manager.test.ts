@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Note, SyncMutation, SyncPushRequest, SyncPushResponse } from '@iris/shared';
 
 const memory = vi.hoisted(() => ({
@@ -80,6 +80,9 @@ import {
   deleteNoteLocal,
   keepLocalConflict,
   recoverSyncIssue,
+  setSyncLifecycleActive,
+  startSyncScheduling,
+  stopSyncScheduling,
   sync,
   updateNoteLocal,
   useServerConflict,
@@ -156,6 +159,11 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function enableForegroundSyncScheduling(): void {
+  startSyncScheduling({ active: false, online: true });
+  setSyncLifecycleActive(true);
+}
+
 async function installConflict(session: Session, opId = 'op-local'): Promise<void> {
   const server = note(session.workspaceId, 'server');
   const local = localMutation('local draft', opId);
@@ -180,6 +188,11 @@ beforeEach(async () => {
   await loadState();
   await adoptSession(sessionA);
   await installConflict(sessionA);
+});
+
+afterEach(() => {
+  stopSyncScheduling();
+  vi.useRealTimers();
 });
 
 describe('owner-fenced conflict decisions', () => {
@@ -508,6 +521,37 @@ describe('local replica transactions', () => {
   });
 });
 
+describe('production edit scheduling', () => {
+  it('persists local edits immediately and waits for the trailing network debounce', async () => {
+    const original = note(workspaceA, 'original');
+    store$.notes.set({ [noteId]: original });
+    store$.outbox.set([]);
+    store$.pendingPush.set(null);
+    store$.conflicts.set({});
+    store$.syncIssue.set(null);
+    expect(await saveState()).toBe(true);
+
+    vi.useFakeTimers();
+    startSyncScheduling({ active: false, online: true });
+    setSyncLifecycleActive(true);
+    await vi.advanceTimersByTimeAsync(0);
+    apiMock.calls = [];
+
+    expect(updateNoteLocal(noteId, { bodyMd: 'durable before network' })).toBe(true);
+    await updateReplicaForLease(openSessionLease()!, (current) => current);
+    const persisted = JSON.parse(
+      memory.values.get(stateStorageKeys.replica(ownerKeyFor(sessionA)))!,
+    ) as { notes: Record<string, Note>; outbox: SyncMutation[] };
+    expect(persisted.notes[noteId]?.bodyMd).toBe('durable before network');
+    expect(persisted.outbox[0]?.note.bodyMd).toBe('durable before network');
+
+    await vi.advanceTimersByTimeAsync(1_499);
+    expect(apiMock.calls).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(apiMock.calls.some((call) => call.method === 'push')).toBe(true));
+  });
+});
+
 describe('authoritative direct-mutation commit fence', () => {
   it('retains a post-dispatch draft and collapses the next edit without losing fields', async () => {
     const original = note(workspaceA, 'Original body');
@@ -604,6 +648,7 @@ describe('manual durable sync recovery', () => {
     expect(await saveState()).toBe(true);
     const push = deferred<SyncPushResponse>();
     apiMock.pushPromise = push.promise;
+    enableForegroundSyncScheduling();
 
     expect(await recoverSyncIssue()).toBe(true);
     await vi.waitFor(() => expect(apiMock.calls.some((call) => call.method === 'push')).toBe(true));
@@ -642,6 +687,7 @@ describe('manual durable sync recovery', () => {
     expect(await saveState()).toBe(true);
     const push = deferred<SyncPushResponse>();
     apiMock.pushPromise = push.promise;
+    enableForegroundSyncScheduling();
 
     expect(await recoverSyncIssue()).toBe(true);
     await vi.waitFor(() => expect(apiMock.calls.some((call) => call.method === 'push')).toBe(true));
@@ -689,6 +735,7 @@ describe('manual durable sync recovery', () => {
     expect(await saveState()).toBe(true);
     const push = deferred<SyncPushResponse>();
     apiMock.pushPromise = push.promise;
+    enableForegroundSyncScheduling();
 
     expect(await recoverSyncIssue()).toBe(true);
     await vi.waitFor(() => expect(apiMock.calls.some((call) => call.method === 'push')).toBe(true));
@@ -718,6 +765,7 @@ describe('manual durable sync recovery', () => {
     expect(await saveState()).toBe(true);
     const push = deferred<SyncPushResponse>();
     apiMock.pushPromise = push.promise;
+    enableForegroundSyncScheduling();
 
     expect(await recoverSyncIssue()).toBe(true);
     await vi.waitFor(() => expect(apiMock.calls.some((call) => call.method === 'push')).toBe(true));

@@ -191,6 +191,16 @@ These were named as out of scope and are staying out until the foundation is pro
   guards, and a coarse per-IP rate limiter are shipped. Client device/deletion UX,
   durable Stripe-cancellation reconciliation, production database/JWT/price validation,
   proxy/principal abuse budgets, privacy, and local-replica erasure remain open.
+- **Phase 2.14 — lifecycle-aware Sync scheduling** (ADR-024): local note writes remain synchronous
+  and enter the durable save queue before one Root-owned network scheduler applies a 1.5-second
+  trailing edit debounce, 30-second foreground pull cadence, and bounded equal-jitter exponential
+  backoff for transport/408/425/429/5xx outcomes. `AppState` pauses background/hidden timers,
+  web online restoration can probe a network failure, every timer is bound to the exact
+  generation/owner/device, and successful device registration is cached only for that generation.
+  Auth expiry, billing gate, durable issue, authority/recovery fence, and local persistence failure
+  park without a timed retry. Unit tests and production Chromium with synthetic Page Visibility
+  transitions prove event handling; real browser throttling and physical iOS/Android
+  background/foreground acceptance remain open.
 
 ## Near-term follow-ups (ordered)
 
@@ -207,9 +217,10 @@ These were named as out of scope and are staying out until the foundation is pro
 3. **Sync v2 runtime cutover.** Build the missing pull applier and bind the v3 owner root,
    exact durable envelope, lease/device dispatch, correlator, restart boundaries, and v1
    retirement through the production `SyncPort`.
-4. **Launch operations.** Add staging deploy, migrations-on-deploy, `/ready`, secret
-   documentation, production DB/JWT/Stripe-price validation, PII-scrubbed observability, and
-   the remaining format/root-build/coverage/native/security CI gates.
+4. **Launch operations.** Add staging deploy and migrations-on-deploy; wire the existing `/ready`
+   database probe into deploy gating and monitoring; document secrets; enforce production
+   DB/JWT/Stripe-price validation and PII-scrubbed observability; and add the remaining
+   format/root-build/coverage/native/security CI gates.
 5. **Safe account erasure + privacy (human-gated).** Make Stripe cancellation confirmed or
    durably reconcilable before deleting identifiers; prove old-token 401; add export-first
    mobile confirmation, privacy policy/link, and legacy/IndexedDB/SQLite replica erasure.
@@ -218,8 +229,8 @@ These were named as out of scope and are staying out until the foundation is pro
    builds; then prove purchase/restore and entitlement mapping for every supported channel.
 7. **Managed auth provider.** Wire Clerk or Supabase, password reset, OAuth, and email
    verification behind the existing seam.
-8. **Mass-market hardening.** Replace fixed polling with lifecycle-aware debounce/backoff;
-   add principal/sync/agent abuse budgets and proxy proof; then finish Stripe portal,
+8. **Mass-market hardening.** Prove ADR-024 on physical iOS/Android lifecycle transitions; add
+   principal/sync/agent abuse budgets and proxy proof; then finish Stripe portal,
    proration/dunning/tax.
 9. **EAS + store submission.** Add build profiles, OTA channels, assets, permission copy, and
    a preview build after the owner supplies Apple/Google account access and approves item 6.

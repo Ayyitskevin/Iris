@@ -27,6 +27,13 @@ type SyncApi = Pick<ApiClient, 'registerDevice' | 'syncPush' | 'syncChanges'>;
  */
 export const SYNC_PUSH_CHUNK_LIMIT = 16;
 
+export type SyncTransientReason = 'network' | 'timeout' | 'rate-limit' | 'server';
+
+export type SyncOutcome =
+  | { kind: 'success'; hasPendingWork: boolean }
+  | { kind: 'transient'; reason: SyncTransientReason }
+  | { kind: 'auth-required' | 'sync-gated' | 'held' | 'local-error' | 'stale' };
+
 export interface SyncPort {
   captureLease(): SessionLease | null;
   isCurrent(lease: SessionLease): boolean;
@@ -52,6 +59,13 @@ class StaleSyncCycleError extends Error {
   constructor() {
     super('Sync cycle no longer owns the active session');
     this.name = 'StaleSyncCycleError';
+  }
+}
+
+class SyncTransportError extends Error {
+  constructor(cause: TypeError) {
+    super('Sync request could not reach the service', { cause });
+    this.name = 'SyncTransportError';
   }
 }
 
@@ -203,10 +217,37 @@ function terminalIssueFor(error: unknown, replica: ReplicaState): SyncIssue | nu
   return null;
 }
 
+function transientReasonFor(error: unknown): SyncTransientReason | null {
+  if (error instanceof ApiRequestError) {
+    if (error.status === 408 || error.status === 425) return 'timeout';
+    if (error.status === 429) return 'rate-limit';
+    if (error.status >= 500 && error.status < 600) return 'server';
+    return null;
+  }
+  return error instanceof SyncTransportError ? 'network' : null;
+}
+
+interface RegisteredSession {
+  readonly generation: number;
+  readonly ownerKey: string;
+  readonly deviceId: string;
+}
+
+function registrationMatches(registered: RegisteredSession | null, lease: SessionLease): boolean {
+  return Boolean(
+    registered &&
+    registered.generation === lease.generation &&
+    registered.ownerKey === lease.ownerKey &&
+    registered.deviceId === lease.deviceId,
+  );
+}
+
 export function createSyncCoordinator(deps: SyncCoordinatorDependencies): {
-  sync(): Promise<void>;
+  sync(): Promise<SyncOutcome>;
+  invalidateRegistration(lease: SessionLease): void;
 } {
-  const activeRuns = new Map<number, { again: boolean; promise: Promise<void> }>();
+  const activeRuns = new Map<number, Promise<SyncOutcome>>();
+  let registeredSession: RegisteredSession | null = null;
 
   function ensureCurrent(lease: SessionLease): void {
     if (!deps.port.isCurrent(lease)) throw new StaleSyncCycleError();
@@ -222,6 +263,9 @@ export function createSyncCoordinator(deps: SyncCoordinatorDependencies): {
       // A 401 belongs to the exact bearer used for this request. Let the expiry boundary compare
       // that credential even when recovery invalidated the operation lease in the meantime.
       if (!(error instanceof ApiRequestError && error.status === 401)) ensureCurrent(lease);
+      // Fetch rejects transport failures with TypeError in browsers and React Native. Wrap it
+      // only at the API request boundary so a TypeError from local staging cannot look offline.
+      if (error instanceof TypeError) throw new SyncTransportError(error);
       throw error;
     }
   }
@@ -280,29 +324,36 @@ export function createSyncCoordinator(deps: SyncCoordinatorDependencies): {
     return replica;
   }
 
-  async function runCycle(lease: SessionLease): Promise<void> {
+  async function runCycle(lease: SessionLease): Promise<SyncOutcome> {
     const api = deps.apiForLease(lease);
     try {
       const initialReplica = deps.port.readReplica(lease);
       if (initialReplica.syncIssue) {
         deps.port.setStatus(lease, 'error');
-        return;
+        return { kind: 'held' };
       }
       deps.port.setStatus(lease, 'syncing');
 
       let beforePush = await preparePendingPush(lease, true);
       if (beforePush.syncIssue) {
         deps.port.setStatus(lease, 'error');
-        return;
+        return { kind: 'held' };
       }
 
-      await request(lease, () =>
-        api.registerDevice({
-          id: lease.deviceId,
-          name: deps.deviceName,
-          platform: deps.platform,
-        }),
-      );
+      if (!registrationMatches(registeredSession, lease)) {
+        await request(lease, () =>
+          api.registerDevice({
+            id: lease.deviceId,
+            name: deps.deviceName,
+            platform: deps.platform,
+          }),
+        );
+        registeredSession = {
+          generation: lease.generation,
+          ownerKey: lease.ownerKey,
+          deviceId: lease.deviceId,
+        };
+      }
       deps.port.setSyncGated(lease, false);
 
       for (let chunkIndex = 0; chunkIndex < SYNC_PUSH_CHUNK_LIMIT; chunkIndex += 1) {
@@ -312,7 +363,7 @@ export function createSyncCoordinator(deps: SyncCoordinatorDependencies): {
           beforePush = await preparePendingPush(lease, false);
           if (beforePush.syncIssue) {
             deps.port.setStatus(lease, 'error');
-            return;
+            return { kind: 'held' };
           }
         }
 
@@ -357,40 +408,52 @@ export function createSyncCoordinator(deps: SyncCoordinatorDependencies): {
 
       ensureCurrent(lease);
       deps.port.setStatus(lease, 'idle');
+      const finalReplica = deps.port.readReplica(lease);
+      return {
+        kind: 'success',
+        hasPendingWork: Boolean(finalReplica.pendingPush || finalReplica.outbox.length > 0),
+      };
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) {
         try {
-          await deps.port.expireSession(lease);
+          const expired = await deps.port.expireSession(lease);
+          return { kind: expired ? 'auth-required' : 'stale' };
         } catch {
-          // The store is already fail-closed and owns durable retry scheduling.
+          // Production expiry throws only after fail-closing the rejected credential. The store
+          // owns its local tombstone retry, while network scheduling must remain parked.
+          return { kind: 'auth-required' };
         }
-        return;
       }
-      if (!deps.port.isCurrent(lease) || error instanceof StaleSyncCycleError) return;
+      if (!deps.port.isCurrent(lease) || error instanceof StaleSyncCycleError) {
+        return { kind: 'stale' };
+      }
       if (error instanceof ApiRequestError && error.isPaymentRequired) {
         deps.port.setSyncGated(lease, true);
         deps.port.setStatus(lease, 'idle');
-        return;
+        return { kind: 'sync-gated' };
       }
       let currentReplica: ReplicaState;
       try {
         currentReplica = deps.port.readReplica(lease);
       } catch {
         deps.port.setStatus(lease, 'error');
-        return;
+        return { kind: 'local-error' };
       }
       const terminalIssue = terminalIssueFor(error, currentReplica);
       if (terminalIssue) {
+        let heldDurably = false;
         try {
           await commit(lease, (current) => ({
             ...current,
             syncIssue: current.syncIssue ?? terminalIssue,
           }));
+          heldDurably = true;
         } catch {
-          // Durable storage failures remain retryable; do not claim a hold was saved.
+          // Do not claim a hold was saved when durable storage rejected it.
         }
+        if (!deps.port.isCurrent(lease)) return { kind: 'stale' };
         deps.port.setStatus(lease, 'error');
-        return;
+        return { kind: heldDurably ? 'held' : 'local-error' };
       }
       if (
         error instanceof Error &&
@@ -399,37 +462,36 @@ export function createSyncCoordinator(deps: SyncCoordinatorDependencies): {
         )
       ) {
         deps.port.setStatus(lease, 'error');
-        return;
+        return { kind: 'local-error' };
       }
-      deps.port.setStatus(lease, 'offline');
+      const transientReason = transientReasonFor(error);
+      if (transientReason) {
+        deps.port.setStatus(lease, 'offline');
+        return { kind: 'transient', reason: transientReason };
+      }
+      deps.port.setStatus(lease, 'error');
+      return { kind: 'local-error' };
     }
   }
 
-  function sync(): Promise<void> {
+  function sync(): Promise<SyncOutcome> {
     const firstLease = deps.port.captureLease();
-    if (!firstLease) return Promise.resolve();
+    if (!firstLease) return Promise.resolve({ kind: 'stale' });
     const existing = activeRuns.get(firstLease.generation);
-    if (existing) {
-      existing.again = true;
-      return existing.promise;
-    }
+    if (existing) return existing;
 
-    const run = { again: false, promise: Promise.resolve() };
-    run.promise = (async () => {
-      do {
-        run.again = false;
-        const lease = deps.port.captureLease();
-        if (!lease || lease.generation !== firstLease.generation) return;
-        await runCycle(lease);
-      } while (run.again && deps.port.isCurrent(firstLease));
-    })().finally(() => {
+    const run = runCycle(firstLease).finally(() => {
       if (activeRuns.get(firstLease.generation) === run) {
         activeRuns.delete(firstLease.generation);
       }
     });
     activeRuns.set(firstLease.generation, run);
-    return run.promise;
+    return run;
   }
 
-  return { sync };
+  function invalidateRegistration(lease: SessionLease): void {
+    if (registrationMatches(registeredSession, lease)) registeredSession = null;
+  }
+
+  return { sync, invalidateRegistration };
 }

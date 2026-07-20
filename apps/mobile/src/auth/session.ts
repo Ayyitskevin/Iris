@@ -1,7 +1,7 @@
 import type { AuthResponse } from '@iris/shared';
 import { publicApi } from '../api';
 import { adoptSession, signOutSession } from '../state/store';
-import { sync } from '../sync/manager';
+import { scheduleSync } from '../sync/manager';
 
 async function adopt(res: AuthResponse): Promise<void> {
   await adoptSession({
@@ -11,7 +11,7 @@ async function adopt(res: AuthResponse): Promise<void> {
     email: res.user.email,
     displayName: res.user.displayName,
   });
-  void sync();
+  scheduleSync('immediate');
 }
 
 export async function signIn(email: string, password: string): Promise<void> {

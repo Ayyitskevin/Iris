@@ -19,7 +19,12 @@ import {
   type ReplicaState,
   type SessionLease,
 } from '../state/store';
-import { createSyncCoordinator } from './coordinator';
+import { createSyncCoordinator, type SyncOutcome } from './coordinator';
+import {
+  createSyncScheduler,
+  type SyncRequestPriority,
+  type SyncSchedulingContext,
+} from './scheduler';
 
 function uuid(): string {
   const g = globalThis as { crypto?: { randomUUID?: () => string } };
@@ -73,8 +78,53 @@ const coordinator = createSyncCoordinator({
   now: nowIso,
 });
 
-export function sync(): Promise<void> {
+function schedulingContext(): SyncSchedulingContext | null {
+  const lease = openSessionLease();
+  if (!lease) return null;
+  return {
+    key: `${lease.generation}:${lease.ownerKey}:${lease.deviceId}`,
+    runnable: store$.syncIssue.get() === null,
+  };
+}
+
+async function runScheduledSync(expectedKey: string): Promise<SyncOutcome> {
+  const before = schedulingContext();
+  if (!before?.runnable || before.key !== expectedKey) return { kind: 'stale' };
   return coordinator.sync();
+}
+
+const scheduler = createSyncScheduler({
+  readContext: schedulingContext,
+  run: runScheduledSync,
+});
+
+/** Direct coordinator seam for tests and diagnostics. Production triggers use `scheduleSync`. */
+export function sync(): Promise<SyncOutcome> {
+  return coordinator.sync();
+}
+
+export function startSyncScheduling(options: { active: boolean; online: boolean }): void {
+  scheduler.start(options);
+}
+
+export function stopSyncScheduling(): void {
+  scheduler.stop();
+}
+
+export function scheduleSync(priority: SyncRequestPriority = 'immediate'): void {
+  scheduler.request(priority);
+}
+
+export function notifySyncContextChanged(): void {
+  scheduler.contextChanged();
+}
+
+export function setSyncLifecycleActive(active: boolean): void {
+  scheduler.setActive(active);
+}
+
+export function setSyncNetworkOnline(online: boolean): void {
+  scheduler.setOnline(online);
 }
 
 /**
@@ -128,7 +178,8 @@ export async function recoverSyncIssue(): Promise<boolean> {
         syncIssue: null,
       };
     });
-    void sync();
+    coordinator.invalidateRegistration(lease);
+    scheduleSync('immediate');
     return true;
   } catch {
     if (isCurrentSession(lease)) setStatusForLease(lease, 'error');
@@ -160,7 +211,7 @@ function applyLocalChange<Result>(
   void applied.durable.catch(() => {
     if (isCurrentSession(lease)) setStatusForLease(lease, 'error');
   });
-  void sync();
+  scheduleSync('debounced');
   return applied.result;
 }
 
@@ -317,7 +368,7 @@ export async function keepLocalConflict(
         conflicts,
       };
     });
-    void sync();
+    scheduleSync('immediate');
     return true;
   } catch {
     if (isCurrentSession(lease)) setStatusForLease(lease, 'error');

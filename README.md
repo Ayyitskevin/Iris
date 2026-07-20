@@ -128,6 +128,18 @@ Retries are bound to actor + explicitly user-registered, workspace-composite dev
 payload + frozen receipt version; cursors bind a commit-serialized sequence to one
 workspace. Terminal protocol failures persist an owner-local hold and require a visible
 manual recovery action before networking resumes.
+ADR-024 replaces the fixed 8-second network poll with one owner-fenced foreground scheduler.
+Local note mutations still publish and enter the durable save queue synchronously, while editor
+bursts reset a 1.5-second network debounce. Successful foreground cycles pull every 30 seconds;
+transport, 408/425, 429, and 5xx outcomes use bounded equal-jitter exponential backoff. React
+Native `AppState` pauses iOS/Android background work and maps to Page Visibility on web; a web
+network-restoration event can probe one network failure early. Every timer captures a
+credential-free session-generation/owner/device key, never retargets A work to B, and parks on
+401, 402, durable sync holds, authority loss, or local persistence errors. A successful device
+registration is reused only for that exact session generation. Production-bundle Chromium with
+synthetic Page Visibility transitions proves hidden-launch suppression and foreground event
+handling; genuinely backgrounded/throttled browser tabs and physical iOS/Android lifecycle
+acceptance remain release debt.
 A checksummed migration ledger adopts only recognized legacy postconditions and verifies
 every applied additive safety signature, including Sync v2 and organizational-history
 artifacts, on later runs. Focused tests cover transport bounds, lost
