@@ -976,7 +976,11 @@ describe('local-first sync', () => {
         ],
       },
     });
-    expect(rejected.status).toBe(500);
+    // Incomplete/unsupported receipts are terminal protocol holds (409), not transient 500s —
+    // a 500 would cause clients to retry forever without parking.
+    expect(rejected.status).toBe(409);
+    expect(rejected.json.error.code).toBe('sync_receipt_incomplete');
+    expect(rejected.json.error.operationId).toBe(opId);
     const absent = await call(t.app, 'GET', `/v1/notes/${noteId}`, { token: u.token });
     expect(absent.status).toBe(404);
   });

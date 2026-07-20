@@ -18,7 +18,7 @@ import {
 } from '@iris/shared';
 import { notes, syncIdempotency, workspaceSyncCursors, type NoteRow } from '../db/schema';
 import type { Ctx } from '../context';
-import { badRequest, idempotencyKeyReused } from '../lib/errors';
+import { badRequest, idempotencyKeyReused, syncReceiptIncomplete } from '../lib/errors';
 import { serializeNote } from '../serialize';
 import { loadNote, recordVersionAndActivity } from './note-write';
 import { requireRegisteredDevice } from './devices';
@@ -175,16 +175,35 @@ function requestFingerprint(
   mutation: SyncMutation,
 ): string {
   if (receiptVersion === 1) return requestFingerprintV1(ctx, deviceId, mutation);
-  throw new Error(`Unsupported sync receipt version ${receiptVersion}`);
+  // Unknown versions must not be fingerprinted as current-v1 — that would silently
+  // mis-bind a future envelope. Callers treat this as a terminal receipt failure.
+  throw syncReceiptIncomplete(
+    mutation.opId,
+    `Unsupported sync receipt version ${receiptVersion}`,
+  );
 }
 
-function parseStoredOutcome(receiptVersion: number, outcome: unknown): ApplyResult {
+function parseStoredOutcome(
+  receiptVersion: number,
+  outcome: unknown,
+  operationId: string,
+): ApplyResult {
   if (receiptVersion !== 1) {
-    throw new Error(`Unsupported sync receipt version ${receiptVersion}`);
+    // Fail closed: never re-apply against an unknown durable envelope.
+    throw syncReceiptIncomplete(
+      operationId,
+      `Unsupported sync receipt version ${receiptVersion}`,
+    );
   }
+  // A claimed receipt with null/malformed outcome is incomplete persistence — not a
+  // signal to re-run the mutation. Re-apply would risk double-write if the original
+  // side effects partially landed outside the receipt row.
   const replay = StoredApplyResultV1.safeParse(outcome);
   if (!replay.success) {
-    throw new Error('Stored sync idempotency outcome is incomplete or invalid');
+    throw syncReceiptIncomplete(
+      operationId,
+      'Stored sync idempotency outcome is incomplete or invalid',
+    );
   }
   return replay.data;
 }
@@ -233,7 +252,7 @@ async function applyIdempotently(
     if (receipt.requestFingerprint !== expectedFingerprint) {
       throw idempotencyKeyReused(mutation.opId);
     }
-    return parseStoredOutcome(receipt.receiptVersion, receipt.outcome);
+    return parseStoredOutcome(receipt.receiptVersion, receipt.outcome, mutation.opId);
   }
 
   let result: ApplyResult;

@@ -31,6 +31,19 @@ export const idempotencyKeyReused = (operationId: string) =>
     undefined,
     operationId,
   );
+/**
+ * A durable receipt exists but cannot be safely replayed (null/malformed outcome or
+ * unsupported version). Fail closed without re-applying the mutation — clients must
+ * park with a terminal hold rather than treat this as a transient 500.
+ */
+export const syncReceiptIncomplete = (operationId: string, detail: string) =>
+  new HttpError(
+    409,
+    'sync_receipt_incomplete',
+    detail,
+    undefined,
+    operationId,
+  );
 /** Version conflict: carries the authoritative server note so the client can reconcile. */
 export const conflict = (msg: string, serverNote: Note) =>
   new HttpError(409, 'version_conflict', msg, serverNote);
