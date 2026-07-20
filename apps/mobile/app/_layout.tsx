@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ActivityIndicator, AppState, Platform, View } from 'react-native';
+import { ActivityIndicator, AppState, View } from 'react-native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -12,6 +12,7 @@ import {
   store$,
 } from '../src/state/store';
 import { bindAppLifecycle } from '../src/sync/lifecycle';
+import { bindNetworkConnectivity } from '../src/sync/connectivity';
 import {
   notifySyncContextChanged,
   setSyncLifecycleActive,
@@ -19,15 +20,10 @@ import {
   startSyncScheduling,
   stopSyncScheduling,
 } from '../src/sync/manager';
+import { bindSyncRuntime } from '../src/sync/runtime';
 import { theme } from '../src/theme';
 
 const REJECTED_SESSION_RETRY_MS = 8_000;
-
-interface BrowserNetworkTarget {
-  readonly navigator?: { readonly onLine?: boolean };
-  addEventListener?(type: 'online' | 'offline', listener: () => void): void;
-  removeEventListener?(type: 'online' | 'offline', listener: () => void): void;
-}
 
 export default function RootLayout() {
   const [ready, setReady] = useState(false);
@@ -42,23 +38,25 @@ export default function RootLayout() {
     });
   }, []);
 
-  // One lifecycle-owned scheduler replaces the fixed network interval. AppState also maps to
-  // Page Visibility in react-native-web, so hidden tabs and backgrounded native apps pause alike.
+  // One runtime binding samples connectivity before AppState can activate the scheduler.
+  // Native NetInfo is refreshed on every foreground transition because iOS may miss network
+  // changes while backgrounded; web retains Page Visibility plus online/offline events.
   useEffect(() => {
     if (!ready) return;
 
-    const networkTarget =
-      Platform.OS === 'web' ? (globalThis as unknown as BrowserNetworkTarget) : null;
-    const onOnline = () => setSyncNetworkOnline(true);
-    const onOffline = () => setSyncNetworkOnline(false);
-    networkTarget?.addEventListener?.('online', onOnline);
-    networkTarget?.addEventListener?.('offline', onOffline);
-
-    startSyncScheduling({
-      active: false,
-      online: networkTarget?.navigator?.onLine !== false,
+    const unbindSyncRuntime = bindSyncRuntime({
+      bindConnectivity: bindNetworkConnectivity,
+      bindLifecycle: (listener) => bindAppLifecycle(AppState, listener),
+      port: {
+        start: startSyncScheduling,
+        stop: stopSyncScheduling,
+        setActive: setSyncLifecycleActive,
+        setOnline: setSyncNetworkOnline,
+      },
+      onError: (error) => {
+        console.warn('Could not bind the sync runtime; using request-level retry signals', error);
+      },
     });
-    const unbindLifecycle = bindAppLifecycle(AppState, setSyncLifecycleActive);
 
     // This is local credential-safety maintenance, not a network poll. Preserve its existing
     // liveness independently of whether any writable session lease exists.
@@ -68,11 +66,8 @@ export default function RootLayout() {
     }, REJECTED_SESSION_RETRY_MS);
 
     return () => {
-      unbindLifecycle();
-      networkTarget?.removeEventListener?.('online', onOnline);
-      networkTarget?.removeEventListener?.('offline', onOffline);
       clearInterval(persistenceRetry);
-      stopSyncScheduling();
+      unbindSyncRuntime();
     };
   }, [ready]);
 

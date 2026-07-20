@@ -58,10 +58,11 @@ strict compatible journal snapshot. It retains the signed-in owner and routes th
 recovery-required cold launch directly to Recovery Center without a lease, source write, or
 request. ADR-024 also replaces the fixed 8-second network poll with generation-fenced foreground
 scheduling: local edits remain immediate and durable, network work debounces, transient failures
-back off with jitter, hidden/background states pause timers, and successful device registration is
-cached only for the exact session generation. An enforceable compatibility gate, the recovery
-resolution lifecycle, physical native scheduler/force-quit acceptance, and the v2 pull applier
-remain open.
+back off with jitter, hidden/background states pause timers, browser events and native NetInfo
+drive one connectivity gate, native state force-refreshes before foreground activation, and
+successful device registration is cached only for the exact session generation. An enforceable
+compatibility gate, the recovery resolution lifecycle, physical native
+scheduler/connectivity/force-quit acceptance, and the v2 pull applier remain open.
 
 **Still missing for release:** deploy/infra configuration, migration-on-deploy and
 observability; account-deletion mobile UX, export-first confirmation, privacy policy, local
@@ -270,16 +271,22 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
   principal/workspace, sync push/pull, and agent-token budgets; distributed storage; documented
   windows; note-count caps; and proxy-safe client identity. `TRUST_PROXY=true` currently trusts
   the entire forwarded chain and needs a deployment-specific threat model.
-- **B8 · 🔵 Sonnet · Battery/network sync scheduling — IMPLEMENTED; LIFECYCLE ACCEPTANCE OPEN.**
+- **B8 · 🔵 Sonnet · Battery/network sync scheduling — IMPLEMENTED; NATIVE
+  LIFECYCLE/CONNECTIVITY ACCEPTANCE OPEN.**
   The fixed network poll is gone. Editor work uses a 1.5 s trailing debounce; successful
   foreground pulls use a 30 s cadence; transport/408/425/429/5xx outcomes use bounded equal-jitter
-  exponential backoff; `AppState`/web Page Visibility pauses timers; web online restoration probes
-  network failures; and successful `registerDevice` is cached for one exact session generation.
-  Durable holds, 401, 402, authority/recovery fences, and local persistence errors schedule no
-  timed retry. Deterministic tests and production Chromium with synthetic Page Visibility
-  transitions cover the runtime policy; real browser throttling and physical iOS/Android
-  background/foreground acceptance remain before release. (`scheduler.ts`, `app/_layout.tsx`,
-  `auth/session.ts`, `coordinator.ts`; ADR-024.)
+  exponential backoff; `AppState`/web Page Visibility pauses timers; browser events and native
+  NetInfo drive the connectivity gate; and native state force-refreshes before foreground
+  activation. Definite negative readings pause scheduling, later unknown state preserves the last
+  known eligibility, and initially unknown sensing or warned sensor failure falls back to request
+  outcomes. Successful `registerDevice` is cached for one exact session generation. Durable holds,
+  401, 402,
+  authority/recovery fences, and local persistence errors schedule no timed retry. Deterministic
+  tests and production Chromium with synthetic Page Visibility transitions cover the in-repo
+  runtime policy; real browser throttling and physical iOS/Android background/foreground,
+  connectivity-transition, and force-quit acceptance remain before release. (`scheduler.ts`,
+  `runtime.ts`, `connectivity.native.ts`, `app/_layout.tsx`, `auth/session.ts`, `coordinator.ts`;
+  ADR-024.)
 - **B9 · 🔵 Sonnet · Head-of-line sync fix + tombstone compaction.** Skip an
   oversized/invalid outbox mutation with a per-note (non-terminal) issue so one bad note
   can't halt workspace-wide sync (`coordinator.ts:98-148`); drop acknowledged remote

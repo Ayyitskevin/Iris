@@ -1020,8 +1020,8 @@ erasure coverage. This ADR does not choose a branch, merge, restore, import, dis
 
 ## ADR-024 — Generation-fenced foreground Sync scheduling
 
-**Accepted in the client runtime; real browser throttling and physical iOS/Android lifecycle
-acceptance remain open.**
+**Accepted in the client runtime; real browser throttling and physical iOS/Android
+lifecycle/connectivity acceptance remain open.**
 
 Local-first publication and network timing are separate responsibilities. Note create/update/delete
 still synchronously publishes one coherent note/outbox projection after registering its durable
@@ -1038,8 +1038,14 @@ replacement credential, a follower, unavailable authority, or recovery-fenced pr
 never enter timer state. `AppState` treats only `active` as runnable on native; react-native-web maps
 the same API to Page Visibility. Background/hidden cancels future timers but does not abort an
 already-dispatched durable/idempotent cycle. Foreground schedules one eligible catch-up while
-preserving an existing backoff deadline. Browser online restoration may pull forward only a
-network-failure retry; it does not reset the failure counter.
+preserving an existing backoff deadline. Browser online/offline events and native NetInfo feed one
+connectivity gate. Native subscribes before the initial sample, and every foreground transition
+force-refreshes NetInfo before lifecycle activation because iOS may not deliver background Wi-Fi
+changes. A definite disconnected or unreachable reading pauses scheduling; an unknown reading
+preserves the last known eligibility only after one exists. Initially unknown sensing and warned
+sensor setup/sample failure explicitly fall back to ordinary request outcomes, so the bounded
+scheduler backoff remains authoritative. Online
+restoration may pull forward only a network-failure retry; it does not reset the failure counter.
 
 The coordinator returns a typed outcome rather than asking the scheduler to infer policy from UI
 status. Transport rejection, 408, 425, 429, and 5xx use equal-jitter exponential delay from a
@@ -1057,14 +1063,15 @@ remain `/v1`, preserve exact durable requests, and continue refreshing device `l
 side. No server route, schema, storage authority, billing rule, or default flag changes here.
 
 Deterministic tests cover debounce, idle/yield timing, bounded jitter, lifecycle and connectivity
-pause/resume, in-flight coalescing, transient parking, exact-generation replacement, typed error
-classes, and registration reuse/invalidation. A production Expo Chromium journey uses synthetic
-Page Visibility transitions, starts hidden, proves zero requests, then proves at least one network
-request after each visible transition; authority/recovery journeys prove those transitions still
-dispatch no network work without a lease. This ADR does not add background execution, push
-notifications, `Retry-After` parsing, or an independent request timeout. Genuine browser
-background throttling and physical iOS/Android background/foreground and force-quit acceptance
-remain release gates.
+pause/resume, subscribe/sample races, foreground force-refresh ordering, stale refresh
+cancellation, adapter cleanup, sensor fallback, in-flight coalescing, transient parking,
+exact-generation replacement, typed error classes, and registration reuse/invalidation. A
+production Expo Chromium journey uses synthetic Page Visibility transitions, starts hidden,
+proves zero requests, then proves at least one network request after each visible transition;
+authority/recovery journeys prove those transitions still dispatch no network work without a
+lease. This ADR does not add background execution, push notifications, `Retry-After` parsing, or
+an independent request timeout. Genuine browser background throttling and physical iOS/Android
+background/foreground, connectivity transitions, and force-quit acceptance remain release gates.
 
 ---
 

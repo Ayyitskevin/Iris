@@ -25,7 +25,9 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 
 ## Key files
 
-- `app/_layout.tsx` — hydrates before routing, retries rejected-session tombstones, and runs the 8-second sync loop.
+- `app/_layout.tsx` — hydrates before routing, keeps the local-only 8-second
+  rejected-session tombstone retry separate, and binds one lifecycle/connectivity-owned sync
+  runtime. Native connectivity uses NetInfo; web uses browser online/offline events.
 - `app/index.tsx` — the root gate: `useObs(() => store$.session.get() !== null)` → `<Redirect href={signedIn ? '/notes' : '/sign-in'} />`.
 - `app/(auth)/_layout.tsx` — `<Stack>` for `sign-in` / `sign-up`. `(auth)` group is not in the URL.
 - `app/(app)/_layout.tsx` — `<Tabs>` for the signed-in app. Second gate: `if (!signedIn) return <Redirect href="/sign-in" />`. Declares **four** visible tabs via `<Tabs.Screen>`: `notes` (Notes), `conflicts` (title **Review**, with a `tabBarBadge` of the live `conflictCount`), `activity` (Activity), and `settings` (Settings), plus the hidden `recovery` route. The tabs are keyed by `ownerKey` so route and component state reset across an account switch.
@@ -55,6 +57,11 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 - `src/state/storage.ts` — `storage: KVStore`. Web `localStorage`; native `expo-secure-store` (~2KB/key cap).
 - `src/sync/manager.ts` — optimistic mutations/conflict choices and deliberate
   `recoverSyncIssue` actions; delegates network work.
+- `src/sync/runtime.ts` + `connectivity-core.ts` + `connectivity.ts` / `.native.ts` —
+  orders initial connectivity before lifecycle activation, force-refreshes native connectivity
+  before every foreground resume, and owns adapter cleanup. Later unknown sensor state preserves
+  the last known eligibility; initially unknown state and warned sensor failure fall back to
+  request/backoff outcomes.
 - `src/sync/coordinator.ts` + `reconcile.ts` — lease-bound staged push, pure
   reconciliation, validation, and complete paged pull.
 - `src/api.ts` — unauthenticated `publicApi` plus fixed-token, abortable
@@ -124,7 +131,8 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 
    Each call uses `applyReplicaForLease`: it coalesces `store$.outbox`, registers the exact
    durability promise before synchronously publishing `store$`, reports persistence failure,
-   and triggers `sync()`. The list re-renders because it reads `store$.notes` via `useObs`.
+   and triggers `scheduleSync('debounced')`. The list re-renders because it reads
+   `store$.notes` via `useObs`.
 
 5. **Authenticated component requests** use `authenticatedRequest`. It captures one
    immutable lease and returns it with the value; assert that lease immediately before
@@ -159,8 +167,10 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
   when a concurrent edit made rollback unsafe.
 - **Sync has one lifecycle-owned scheduler and one coordinator flight per session generation.**
   Local writes enter the durable queue synchronously, then `scheduleSync('debounced')` resets one
-  1.5-second trailing timer. Root owns foreground/visibility, online restoration, 30-second idle
-  pulls, and bounded transient backoff. Timers capture the exact credential-free
+  1.5-second trailing timer. Root owns foreground/visibility, web and native online restoration,
+  30-second idle pulls, and bounded transient backoff. Native subscribes to NetInfo before its
+  initial sample and force-refreshes before foreground activation because iOS can miss changes
+  while backgrounded. Timers capture the exact credential-free
   generation/owner/device key and never retarget A work to B. Use immediate scheduling for routine
   consistency and explicit-recovery triggers; reserve direct `sync()` for tests and coordinator
   diagnostics. Do not add another interval or component-owned network timer.

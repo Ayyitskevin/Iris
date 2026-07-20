@@ -132,13 +132,18 @@ ADR-024 replaces the fixed 8-second network poll with one owner-fenced foregroun
 Local note mutations still publish and enter the durable save queue synchronously, while editor
 bursts reset a 1.5-second network debounce. Successful foreground cycles pull every 30 seconds;
 transport, 408/425, 429, and 5xx outcomes use bounded equal-jitter exponential backoff. React
-Native `AppState` pauses iOS/Android background work and maps to Page Visibility on web; a web
-network-restoration event can probe one network failure early. Every timer captures a
-credential-free session-generation/owner/device key, never retargets A work to B, and parks on
-401, 402, durable sync holds, authority loss, or local persistence errors. A successful device
-registration is reused only for that exact session generation. Production-bundle Chromium with
-synthetic Page Visibility transitions proves hidden-launch suppression and foreground event
-handling; genuinely backgrounded/throttled browser tabs and physical iOS/Android lifecycle
+Native `AppState` pauses iOS/Android background work and maps to Page Visibility on web. Browser
+online/offline events and native NetInfo drive the same eligibility gate; native subscribes before
+its initial sample and force-refreshes before every foreground activation because iOS can miss
+network changes while backgrounded. A definite disconnected or unreachable state pauses
+scheduling. Later unknown readings preserve the last known eligibility; initially unknown sensing
+and warned sensor failure fall back to ordinary request outcomes and bounded backoff. Every timer
+captures a credential-free
+session-generation/owner/device key, never retargets A work to B, and parks on 401, 402, durable
+sync holds, authority loss, or local persistence errors. A successful device registration is
+reused only for that exact session generation. Deterministic adapter/runtime tests and
+production-bundle Chromium with synthetic Page Visibility transitions prove the in-repo policy;
+genuinely backgrounded/throttled browser tabs and physical iOS/Android lifecycle/connectivity
 acceptance remain release debt.
 A checksummed migration ledger adopts only recognized legacy postconditions and verifies
 every applied additive safety signature, including Sync v2 and organizational-history

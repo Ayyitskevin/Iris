@@ -195,12 +195,16 @@ These were named as out of scope and are staying out until the foundation is pro
   and enter the durable save queue before one Root-owned network scheduler applies a 1.5-second
   trailing edit debounce, 30-second foreground pull cadence, and bounded equal-jitter exponential
   backoff for transport/408/425/429/5xx outcomes. `AppState` pauses background/hidden timers,
-  web online restoration can probe a network failure, every timer is bound to the exact
-  generation/owner/device, and successful device registration is cached only for that generation.
+  browser online/offline events and native NetInfo drive one connectivity gate, and native state
+  force-refreshes before every foreground activation. Definite negative readings pause
+  scheduling; later unknown state preserves the last known eligibility; initially unknown sensing
+  and warned sensor failure fall back to request outcomes and bounded backoff. Every timer is bound
+  to the exact generation/owner/device, and successful device registration is cached only for that
+  generation.
   Auth expiry, billing gate, durable issue, authority/recovery fence, and local persistence failure
   park without a timed retry. Unit tests and production Chromium with synthetic Page Visibility
-  transitions prove event handling; real browser throttling and physical iOS/Android
-  background/foreground acceptance remain open.
+  transitions prove the in-repo policy; real browser throttling and physical iOS/Android
+  background/foreground, connectivity-transition, and force-quit acceptance remain open.
 
 ## Near-term follow-ups (ordered)
 
