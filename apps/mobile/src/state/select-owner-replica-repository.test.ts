@@ -148,12 +148,16 @@ describe('LazyTransactionalReplicaStore', () => {
 
   it('opens the backing store lazily and only once, then forwards operations', async () => {
     let opens = 0;
+    const erased: string[] = [];
     const inner: TransactionalReplicaStore = {
       read: async (ownerKey) => record(ownerKey),
       compareAndSwap: async (): Promise<CompareAndSwapResult> => ({
         status: 'committed',
         record: record('owner-a'),
       }),
+      erase: async (ownerKey) => {
+        erased.push(ownerKey);
+      },
     };
     const store = new LazyTransactionalReplicaStore(async () => {
       opens += 1;
@@ -163,6 +167,8 @@ describe('LazyTransactionalReplicaStore', () => {
     expect(opens).toBe(0); // construction does not open
     expect(await store.read('owner-a')).toEqual(record('owner-a'));
     expect((await store.compareAndSwap('owner-a', 0, '{}')).status).toBe('committed');
+    await store.erase('owner-a');
+    expect(erased).toEqual(['owner-a']);
     expect(opens).toBe(1); // opened once, reused for the second call
   });
 
@@ -174,6 +180,7 @@ describe('LazyTransactionalReplicaStore', () => {
         status: 'conflict',
         record: null,
       }),
+      erase: async () => undefined,
     };
     const store = new LazyTransactionalReplicaStore(async () => {
       attempts += 1;

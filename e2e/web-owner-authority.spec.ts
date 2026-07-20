@@ -137,7 +137,31 @@ interface BrowserReplicaNote {
 
 interface BrowserReplica {
   readonly notes: Record<string, BrowserReplicaNote>;
+  readonly deviceId?: string;
+  readonly outbox?: readonly unknown[];
+  readonly pendingPush?: readonly unknown[] | null;
   readonly [key: string]: unknown;
+}
+
+/** Note-authority fingerprint a follower must not invent or delete. */
+interface DurableNoteAuthoritySnapshot {
+  readonly noteIds: string[];
+  readonly noteTitles: Record<string, string>;
+  readonly deviceId: string | undefined;
+}
+
+function parseReplica(record: BrowserReplicaRecord): BrowserReplica {
+  return JSON.parse(record.serializedReplica) as BrowserReplica;
+}
+
+function noteAuthoritySnapshot(record: BrowserReplicaRecord): DurableNoteAuthoritySnapshot {
+  const replica = parseReplica(record);
+  const noteIds = Object.keys(replica.notes).sort();
+  const noteTitles: Record<string, string> = {};
+  for (const id of noteIds) {
+    noteTitles[id] = replica.notes[id]!.title;
+  }
+  return { noteIds, noteTitles, deviceId: replica.deviceId };
 }
 
 async function indexedDbRecord(page: Page, key: string = ownerKey): Promise<BrowserReplicaRecord> {
@@ -164,6 +188,34 @@ async function indexedDbRecord(page: Page, key: string = ownerKey): Promise<Brow
       }),
     { databaseName, storeName, key },
   );
+}
+
+/**
+ * Wait until the leader's local edit is durable in IndexedDB (observable note title).
+ *
+ * Do NOT wait for `pendingPush`: that is a network-path staging step that may never run
+ * when the browser suite points API at a dead host, parks the scheduler, or is mid-backoff.
+ * Bit-exact revision equality is also wrong: the leader may still stage outbox/pendingPush
+ * after the follower UI has already observed the note.
+ */
+async function waitForDurableNoteTitle(
+  page: Page,
+  title: string,
+  options: { timeoutMs?: number } = {},
+): Promise<BrowserReplicaRecord> {
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  let last: BrowserReplicaRecord | null = null;
+  await expect
+    .poll(
+      async () => {
+        last = await indexedDbRecord(page);
+        return serializedReplicaContainsTitle(last, title);
+      },
+      { timeout: timeoutMs, intervals: [50, 100, 200] },
+    )
+    .toBe(true);
+  if (!last) throw new Error('Durable note title wait completed without a record');
+  return last;
 }
 
 async function legacyReplicaRaw(page: Page): Promise<string | null> {
@@ -456,11 +508,25 @@ test('one tab writes while its follower refreshes, then takes over after a verif
   await title.fill(privateSentinel);
   await expect(follower.getByText(privateSentinel)).toBeVisible();
 
-  const recordBeforeFollowerAttempt = await indexedDbRecord(follower);
+  // Observable: leader's edit is durable. Then prove a disabled follower click cannot
+  // invent notes, drop notes, or retarget deviceId — even if the leader later stages
+  // outbox/pendingPush (revision may advance; note authority must not).
+  await waitForDurableNoteTitle(leader, privateSentinel);
+  const authorityBefore = noteAuthoritySnapshot(await indexedDbRecord(follower));
+  expect(Object.values(authorityBefore.noteTitles)).toContain(privateSentinel);
+
   await followerNew.evaluate((button: HTMLElement) => button.click());
-  await follower.waitForTimeout(250);
-  expect(await indexedDbRecord(follower)).toEqual(recordBeforeFollowerAttempt);
+  await expect
+    .poll(async () => noteAuthoritySnapshot(await indexedDbRecord(follower)), {
+      timeout: 3_000,
+      intervals: [50, 100, 200],
+    })
+    .toEqual(authorityBefore);
   expect(await follower.evaluate(() => (window as InstrumentedWindow).__irisFetches)).toEqual([]);
+  // Private note still present after the attempted follower write.
+  expect(
+    serializedReplicaContainsTitle(await indexedDbRecord(follower), privateSentinel),
+  ).toBe(true);
 
   // Page Visibility pause/resume must not let a read-only follower acquire a network lease.
   await setSyntheticVisibility(follower, 'hidden');

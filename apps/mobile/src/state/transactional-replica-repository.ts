@@ -32,6 +32,11 @@ export interface TransactionalReplicaStore {
     expectedRevision: number,
     serializedReplica: string,
   ): Promise<CompareAndSwapResult>;
+  /**
+   * Permanently remove an owner root. Absent keys succeed (idempotent).
+   * Used after confirmed account deletion so durable authority cannot re-upload.
+   */
+  erase(ownerKey: string): Promise<void>;
 }
 
 export class ReplicaRepositoryStaleWriterError extends ReplicaRepositoryError {
@@ -120,8 +125,51 @@ export class TransactionalOwnerReplicaRepository implements OwnerReplicaReposito
     return next;
   }
 
+  erase(ownerKey: string): Promise<void> {
+    if (!ownerKey) {
+      return Promise.reject(new ReplicaRepositoryError('Owner replica erase requires an owner key'));
+    }
+    const previous = this.pending.get(ownerKey) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(() => this.removeAndVerify(ownerKey));
+    this.pending.set(ownerKey, next);
+    void next.then(
+      () => this.release(ownerKey, next),
+      () => this.release(ownerKey, next),
+    );
+    return next;
+  }
+
   private release(ownerKey: string, completed: Promise<void>): void {
     if (this.pending.get(ownerKey) === completed) this.pending.delete(ownerKey);
+  }
+
+  private async removeAndVerify(ownerKey: string): Promise<void> {
+    // Erase is allowed even when fenced: confirmed account deletion must clear bytes the
+    // operator has already authorized gone, not wait for a rehydrate cycle.
+    let operationError: unknown;
+    try {
+      await this.store.erase(ownerKey);
+    } catch (error) {
+      operationError = error;
+    }
+
+    let observed: TransactionalReplicaRecord | null;
+    try {
+      observed = await this.store.read(ownerKey);
+      if (observed) assertTransactionalReplicaRecord(ownerKey, observed);
+    } catch (cause) {
+      throw new ReplicaRepositoryError('Transactional owner replica erase could not be verified', {
+        cause: operationError ?? cause,
+      });
+    }
+    if (observed !== null) {
+      throw new ReplicaRepositoryError(
+        'Transactional owner replica erase did not clear durable storage',
+        { cause: operationError },
+      );
+    }
+    this.observedRevisions.set(ownerKey, 0);
+    this.fencedOwners.delete(ownerKey);
   }
 
   private async replaceAndVerify(ownerKey: string, serializedReplica: string): Promise<void> {

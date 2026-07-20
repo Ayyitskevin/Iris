@@ -67,6 +67,10 @@ export class LazyTransactionalReplicaStore implements TransactionalReplicaStore 
   ): Promise<CompareAndSwapResult> {
     return (await this.store()).compareAndSwap(ownerKey, expectedRevision, serializedReplica);
   }
+
+  async erase(ownerKey: string): Promise<void> {
+    return (await this.store()).erase(ownerKey);
+  }
 }
 
 export interface ReplicaEnvironment {

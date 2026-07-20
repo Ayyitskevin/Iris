@@ -165,4 +165,22 @@ describe('IndexedDB transactional replica store', () => {
       'IndexedDB owner replica record is invalid',
     );
   });
+
+  it('erases an owner root and leaves other owners intact', async () => {
+    const { store } = createStore();
+    const secret = serialized('owner-a', 'account-deleted-secret');
+    await store.compareAndSwap('owner-a', 0, secret);
+    await store.compareAndSwap('owner-b', 0, serialized('owner-b', 'keep'));
+
+    await store.erase('owner-a');
+    expect(await store.read('owner-a')).toBeNull();
+    expect((await store.read('owner-b'))?.serializedReplica).toBe(serialized('owner-b', 'keep'));
+
+    // Idempotent: second erase does not throw.
+    await expect(store.erase('owner-a')).resolves.toBeUndefined();
+
+    const repository = new TransactionalOwnerReplicaRepository(store);
+    await repository.erase('owner-b');
+    expect(await repository.read('owner-b')).toBeNull();
+  });
 });

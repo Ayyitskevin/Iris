@@ -75,8 +75,15 @@ all automatic network work until the user invokes its explicit recovery action.
   device ids without allocating state.
 - `apps/api/test/sync.test.ts` + `sync-migration.test.ts` — replay/collision,
   cursor, atomic rollback, and upgrade-with-data executable specs.
+- `apps/api/test/adversarial-sync-integrity.test.ts` — fault harness: lost response,
+  duplicate/reordered ops, incomplete/malformed/unsupported receipts, account deletion
+  × pending sync, unconfirmed no-op, privacy-safe diagnostics.
 - Mobile coordinator/store/reconcile tests cover lost responses, restart, newer edits,
   persistence failure, stale sessions, and conflict retention.
+- `apps/mobile/src/sync/adversarial-sync-integrity.test.ts` +
+  `apps/mobile/src/state/account-deletion-local.test.ts` — client fault injection and
+  post-deletion local erase fence.
+- `docs/SYNC_RECOVERY.md` — recovery path per failure state.
 
 ## Playbook
 
@@ -203,6 +210,20 @@ To add a synced field: add it to `SyncMutation.note` and `Note` in `schemas.ts`,
 - **`opId` is permanent.** The server stores applied/conflict outcomes under a frozen
   receipt version. A retry must preserve actor, device, parsed payload, and its versioned
   fingerprint; changing any of them is a loud 409, and unknown versions fail closed.
+- **Incomplete receipts fail closed as 409 `sync_receipt_incomplete`.** A claimed row with
+  null/malformed `outcome` or an unsupported `receipt_version` must **not** re-run the
+  mutation and must **not** surface as a transient 500 (clients would retry forever). The
+  client parks a terminal hold with `recoveryKind: retry` (preserve exact pending; do not
+  rekey — rekey risks double-apply). Recovery playbook: `docs/SYNC_RECOVERY.md`.
+- **Account deletion serializes on the workspace sync lock** before cascade erase so an
+  in-flight push cannot interleave partial note writes with tenant wipe. After confirmed
+  server deletion, clients must call `eraseLocalOwnerAfterConfirmedAccountDeletion` so
+  local pending drafts cannot re-upload; unconfirmed delete mutates nothing.
+- **Durable-storage erase is required on every transactional adapter.** `TransactionalReplicaStore.erase`
+  + `TransactionalOwnerReplicaRepository.erase` clear IndexedDB and SQLite owner roots
+  (including when the writer is fenced). Promoting erase still clears primary, legacy, and
+  the recovery-journal owner key. Adapters without erase must omit the method so callers
+  fail closed rather than claim a wipe.
 - **Workspace lock precedes receipt locks.** Every non-empty push locks/upserts
   `workspace_sync_cursors` before claiming any `opId`. Preserve that order so batches
   with reversed operation ids cannot deadlock.

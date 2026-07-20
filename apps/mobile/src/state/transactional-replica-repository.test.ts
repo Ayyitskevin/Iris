@@ -73,6 +73,10 @@ class MemoryTransactionalStore implements TransactionalReplicaStore {
     }
     return { status: 'committed', record };
   }
+
+  async erase(ownerKey: string): Promise<void> {
+    this.records.delete(ownerKey);
+  }
 }
 
 describe('transactional owner replica repository', () => {
@@ -262,5 +266,41 @@ describe('transactional owner replica repository', () => {
     await expect(second.commit('owner-a', identical)).resolves.toBeUndefined();
     expect(await second.read('owner-a')).toBe(identical);
     expect(store.records.get('owner-a')?.revision).toBe(1);
+  });
+
+  it('erases durable bytes and resets observed revision so a later create can succeed', async () => {
+    const store = new MemoryTransactionalStore();
+    const repository = new TransactionalOwnerReplicaRepository(store);
+    const privateBody = serialized('owner-a', 'must-not-survive-deletion');
+    await repository.commit('owner-a', privateBody);
+    expect(store.records.has('owner-a')).toBe(true);
+
+    await repository.erase('owner-a');
+    expect(store.records.has('owner-a')).toBe(false);
+    expect(await repository.read('owner-a')).toBeNull();
+
+    // Absent erase is idempotent.
+    await expect(repository.erase('owner-a')).resolves.toBeUndefined();
+
+    // After erase, a fresh create is allowed (revision 0).
+    const reborn = serialized('owner-a', 'new-account-same-device');
+    await expect(repository.commit('owner-a', reborn)).resolves.toBeUndefined();
+    expect(await repository.read('owner-a')).toBe(reborn);
+  });
+
+  it('erases even when the owner is fenced after a stale write', async () => {
+    const store = new MemoryTransactionalStore();
+    const winner = new TransactionalOwnerReplicaRepository(store);
+    const stale = new TransactionalOwnerReplicaRepository(store);
+    await Promise.all([winner.read('owner-a'), stale.read('owner-a')]);
+    await winner.commit('owner-a', serialized('owner-a', 'winner'));
+    await expect(stale.commit('owner-a', serialized('owner-a', 'stale'))).rejects.toBeInstanceOf(
+      ReplicaRepositoryStaleWriterError,
+    );
+
+    // Confirmed account deletion must clear bytes without requiring rehydrate first.
+    await expect(stale.erase('owner-a')).resolves.toBeUndefined();
+    expect(store.records.has('owner-a')).toBe(false);
+    expect(await stale.read('owner-a')).toBeNull();
   });
 });
