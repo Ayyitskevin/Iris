@@ -152,8 +152,9 @@ These were named as out of scope and are staying out until the foundation is pro
   root or calling the API. Exact displayed bytes are embedded when no byte-identical journal root
   exists. Web requests a deferred-cleanup Blob download; native verifies a private cache file,
   retains it across share handoff, and later attempts to purge expired files without blocking a
-  new export on cleanup failure. Choose/restore/import/discard
-  and force-quit browser/device acceptance remain open.
+  new export on cleanup failure. While recovery is required, Recovery Center can show one journal
+  snapshot or the untouched stored primary without writing either source root or leaving the fence.
+  Import, discard, and writable resolution remain open, as does force-quit browser/device acceptance.
 - **Phase 2.12 — current-runtime web authority, default-off** (ADR-022): when the durable
   flag is explicitly enabled, one owner-scoped Web Lock grants commit/sync authority. Other tabs
   are visibly read-only, hold no operation leases, perform no sync requests, and refresh by
@@ -213,11 +214,10 @@ These were named as out of scope and are staying out until the foundation is pro
    request, but client-only code cannot prevent the old write. Approve and implement a server
    storage epoch, upgrade-required response, or explicit old-client invalidation before cutover.
 2. **Controlled transactional-authority acceptance + recovery resolution UX.** Keep `/v1`
-   networking while integrating diverged and quarantined roots into the shipped local Recovery
-   Center and adding choose-winner, restore/import, and discard controls, then test
-   post-resolution IndexedDB reload, native SQLite force-quit/reopen, A→B switching,
-   unsupported-platform fallback, and the explicit at-rest policy. Flip the default only after the
-   compatibility contract and these gates pass.
+   networking. Read-only view selection is shipped. Still add import and discard, then a writable
+   winner only after the compatibility contract. Test post-resolution IndexedDB reload, native
+   SQLite force-quit/reopen, A→B switching, unsupported-platform fallback, and the explicit at-rest
+   policy before flipping the default.
 3. **Sync v2 runtime cutover.** Build the missing pull applier and bind the v3 owner root,
    exact durable envelope, lease/device dispatch, correlator, restart boundaries, and v1
    retirement through the production `SyncPort`.

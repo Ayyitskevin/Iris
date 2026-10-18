@@ -37,8 +37,9 @@ Routing is **Expo Router** (file = route). `app/index.tsx` is the gate that redi
 - `app/(app)/notes/[id].tsx` — editor. `useLocalSearchParams<{id}>()`, `useObs(() => store$.notes[id].get())`, edits call `updateNoteLocal`/`deleteNoteLocal`. History/restore hit `api` directly.
 - `app/(app)/recovery.tsx` — owner-reset Recovery Center. It inventories journal,
   memory-only, and distinct displayed branches through a credential-free inspection lease,
-  renders bounded previews, and requests the strict local all-branch export. It has no
-  choose/restore/import/merge/discard controls.
+  renders bounded previews, and requests the strict local all-branch export. While
+  `recovery-required`, it can show one journal snapshot or the untouched stored primary.
+  That view stays read-only: no merge, import, discard, or writable winner.
 - `src/state/store.ts` — owner-keyed replicas, separate session/tombstone storage,
   legacy `iris:state:v1` recovery quarantine, generation leases, verified writes, an
   append-only stale-CAS recovery journal, read-only recovery mode, credential-free recovery

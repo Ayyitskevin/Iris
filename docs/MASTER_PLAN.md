@@ -173,7 +173,10 @@ Each item: **owner tier · dependency · definition of done (how to verify).**
     bounded previews; a journal read failure still surfaces an explicitly partial memory inventory.
     Local export verifies every staged branch in the journal, preserves exact journal and displayed
     bytes in a strict token-free v1 bundle, reparses before handoff, rechecks its projection/recovery
-    epoch through delivery, and never commits the primary root or calls the API. Web uses a
+    epoch through delivery, and never commits the primary root or calls the API. While
+    recovery-required, the operator can show one verified journal snapshot or the untouched stored
+    primary. That selection is a fenced projection: it does not discard journal bytes, clear the
+    fence, or resume sync. Import, discard, and writable resolution remain open. Web uses a
     deferred-cleanup Blob download; native verifies a private
     cache file, retains it for slow share receivers, and attempts to purge files older than 24
     hours on a later launch/export without blocking a new export on cleanup failure. Delivery copy
@@ -347,11 +350,11 @@ Each slice must leave a rollback point and prove the exact transition it claims.
    Human-review and implement a server storage epoch/upgrade response or another explicit
    invalidation mechanism before production cutover.
 2. **Transactional authority acceptance + recovery UX.** Enable the flag only in test channels
-   while retaining the v1 coordinator. Integrate diverged/quarantined roots into the Recovery
-   Center and add choose/restore/import/discard handling, then prove post-resolution web reload,
-   native force-quit/reopen, A→B switching, storage exhaustion, SQLite at-rest policy, and
-   unsupported-platform fallback. Only after the compatibility contract and these gates pass may
-   the default flip.
+   while retaining the v1 coordinator. Read-only view selection can show a journal snapshot or the
+   untouched primary without clearing the fence. Import, discard, and a writable winner are still
+   open. Prove post-resolution web reload, native force-quit/reopen, A→B switching, storage
+   exhaustion, SQLite at-rest policy, and unsupported-platform fallback. Only after the
+   compatibility contract and these gates pass may the default flip.
 3. **Sync v2 runtime cutover.** Add the missing pull-v2 applier, bind the v3 root through
    `SyncPort`, stage/dispatch/apply the exact durable envelope, restart safely after every
    boundary, and freeze v1 only after mixed-version replay evidence.
@@ -389,7 +392,7 @@ the current CAS diff. Closed findings stay visible so regressions do not re-ente
 | high        | open        | `sync_idempotency` retains full payloads forever                                                    | `schema.ts`, `sync.ts`            | B5            |
 | medium      | partial     | Coarse per-IP limiter lacks principal/sync/agent budgets and proxy proof                            | `app.ts`, `rate-limit.test.ts`    | B7            |
 | medium      | API only    | Device reclamation has no client settings/recovery flow                                             | `devices.ts`, `settings.tsx`      | B4            |
-| medium      | partial     | Recovery inventory + local export ship; choose/restore/import/discard is open                       | `recovery.tsx`; ADR-021           | A3b/c         |
+| medium      | partial     | Recovery view selection ships read-only; import, discard, and writable resolution stay open         | `recovery.tsx`; ADR-021           | A3b/c         |
 | medium      | partial     | CI has a real two-tab browser gate; format, root-build, coverage, security, and native gates remain | `.github/workflows/ci.yml`        | CI/acceptance |
 | low         | open        | `Math.random` remains a UUID/device-id fallback                                                     | `manager.ts`, `store.ts`          | B12           |
 

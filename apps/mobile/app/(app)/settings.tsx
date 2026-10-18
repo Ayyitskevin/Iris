@@ -82,13 +82,13 @@ export default function Settings() {
       return;
     }
     try {
-      const catalog = await readReplicaRecoveryCatalogForLease(lease);
+      const inspection = await readReplicaRecoveryCatalogForLease(lease);
       if (recoveryRequest.current !== request || !isCurrentRecoveryInspectionLease(lease)) {
         return;
       }
-      setRecoveryCount(catalog?.preservedCount ?? 0);
-      setRecoveryInventoryComplete(catalog?.inventoryComplete ?? true);
-      setRecoveryMemoryOnlyCount(catalog?.memoryOnlyCount ?? 0);
+      setRecoveryCount(inspection.catalog?.preservedCount ?? 0);
+      setRecoveryInventoryComplete(inspection.catalog?.inventoryComplete ?? true);
+      setRecoveryMemoryOnlyCount(inspection.catalog?.memoryOnlyCount ?? 0);
     } catch {
       if (recoveryRequest.current === request && store$.activeOwnerKey.get() === ownerKey) {
         setRecoveryLoadError(true);

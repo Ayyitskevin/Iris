@@ -152,6 +152,7 @@ import {
   parseReplicaRecoveryEnvelope,
   replicaRecoveryJournalOwnerKey,
 } from './replica-recovery-journal';
+import { replicaRecoveryViewOwnerKey } from './replica-recovery-selection';
 import { ReplicaRepositoryAuthorityError } from './promoting-replica-repository';
 import { parseReplicaRecoveryExport } from '../recovery/export';
 import { ReplicaRepositoryStaleWriterError } from './transactional-replica-repository';
@@ -444,7 +445,7 @@ describe('owner store fence-awareness', () => {
     repo.reads = [];
     const inspection = recoveryInspectionLease();
 
-    const catalog = await readReplicaRecoveryCatalogForLease(inspection);
+    const catalog = (await readReplicaRecoveryCatalogForLease(inspection)).catalog;
     expect(catalog!.preservedCount).toBe(1);
     expect(catalog!.copies.map((copy) => copy.persistence)).toEqual([
       'journal-verified',
@@ -469,7 +470,9 @@ describe('owner store fence-awareness', () => {
     expect(repo.commits).toEqual(commitsBeforeInspection);
     expect(repo.durable.get(ownerKey)).toBe(winnerRaw);
     expect(repo.durable.get(recoveryKey)).toBe(journalRaw);
-    expect(new Set(repo.reads)).toEqual(new Set([recoveryKey]));
+    expect(new Set(repo.reads)).toEqual(
+      new Set([recoveryKey, replicaRecoveryViewOwnerKey(ownerKey)]),
+    );
   });
 
   it('lists every distinct loser in capture sequence during read-only recovery', async () => {
@@ -499,7 +502,7 @@ describe('owner store fence-awareness', () => {
 
     expect(store$.status.get()).toBe('recovery-required');
     expect(openSessionLease()).toBeNull();
-    const catalog = await readReplicaRecoveryCatalogForLease(recoveryInspectionLease());
+    const catalog = (await readReplicaRecoveryCatalogForLease(recoveryInspectionLease())).catalog;
     expect(catalog!.copies.map((copy) => copy.sequence)).toEqual([1, 2]);
     expect(catalog!.copies.map((copy) => copy.liveNoteCount)).toEqual([1, 2]);
     expect(catalog!.copies.map((copy) => copy.matchesDisplayedProjection)).toEqual([false, true]);
@@ -525,7 +528,7 @@ describe('owner store fence-awareness', () => {
     expect(await saveState()).toBe(false);
     expect(store$.status.get()).toBe('recovery-required');
     const inspection = recoveryInspectionLease();
-    const pendingCatalog = await readReplicaRecoveryCatalogForLease(inspection);
+    const pendingCatalog = (await readReplicaRecoveryCatalogForLease(inspection)).catalog;
     expect(pendingCatalog).toMatchObject({
       preservedCount: 1,
       journalVerifiedCount: 0,
@@ -587,10 +590,12 @@ describe('owner store fence-awareness', () => {
     gate.unblock();
 
     await expect(delayedCatalog).resolves.toMatchObject({
-      inventoryComplete: true,
-      preservedCount: 1,
-      journalVerifiedCount: 1,
-      memoryOnlyCount: 0,
+      catalog: {
+        inventoryComplete: true,
+        preservedCount: 1,
+        journalVerifiedCount: 1,
+        memoryOnlyCount: 0,
+      },
     });
     expect(
       parseReplicaRecoveryExport(artifact.serializedExport, ownerKey).snapshots[0]!
@@ -615,7 +620,7 @@ describe('owner store fence-awareness', () => {
     expect(await saveState()).toBe(false);
     repo.failReadKey = recoveryKey;
 
-    const catalog = await readReplicaRecoveryCatalogForLease(recoveryInspectionLease());
+    const catalog = (await readReplicaRecoveryCatalogForLease(recoveryInspectionLease())).catalog;
 
     expect(catalog).toMatchObject({
       inventoryComplete: false,
@@ -1155,15 +1160,17 @@ describe('owner store fence-awareness', () => {
     const inspection = openRecoveryInspectionLease();
     expect(inspection).not.toBeNull();
     await expect(readReplicaRecoveryCatalogForLease(inspection!)).resolves.toMatchObject({
-      sourceOwnerKey: ownerKey,
-      inventoryComplete: true,
-      copies: [
-        {
-          persistence: 'journal-verified',
-          matchesDisplayedProjection: true,
-          reason: 'legacy-divergence',
-        },
-      ],
+      catalog: {
+        sourceOwnerKey: ownerKey,
+        inventoryComplete: true,
+        copies: [
+          {
+            persistence: 'journal-verified',
+            matchesDisplayedProjection: true,
+            reason: 'legacy-divergence',
+          },
+        ],
+      },
     });
     expect(repo.commits).toEqual(commitsBefore);
     expect(repo.durable.get(ownerKey)).toBe(primaryRaw);

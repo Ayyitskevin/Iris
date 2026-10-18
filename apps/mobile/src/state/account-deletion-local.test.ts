@@ -36,6 +36,10 @@ import {
   type Session,
 } from './store';
 import { replicaRecoveryJournalOwnerKey } from './replica-recovery-journal';
+import {
+  replicaRecoveryViewOwnerKey,
+  serializeReplicaRecoveryView,
+} from './replica-recovery-selection';
 
 const workspaceA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const workspaceB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -164,6 +168,17 @@ describe('eraseLocalOwnerAfterConfirmedAccountDeletion', () => {
       }),
     );
 
+    const viewKey = stateStorageKeys.replica(replicaRecoveryViewOwnerKey(ownerKey));
+    memory.values.set(
+      viewKey,
+      serializeReplicaRecoveryView({
+        sourceOwnerKey: ownerKey,
+        sequence: 1,
+        serializedReplica: memory.values.get(replicaKey)!,
+      }),
+    );
+    expect(memory.values.get(viewKey)).toContain(privateBody);
+
     const result = await eraseLocalOwnerAfterConfirmedAccountDeletion({
       serverDeleted: true,
       ownerKey,
@@ -181,6 +196,7 @@ describe('eraseLocalOwnerAfterConfirmedAccountDeletion', () => {
 
     expect(memory.values.get(replicaKey)).toBeUndefined();
     expect(memory.values.get(journalKey)).toBeUndefined();
+    expect(memory.values.get(viewKey)).toBeUndefined();
 
     const sessionRaw = memory.values.get(stateStorageKeys.session)!;
     expect(sessionRaw).not.toContain(sessionA.token);

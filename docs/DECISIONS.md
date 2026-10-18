@@ -876,8 +876,13 @@ are retained. A cleanup failure is surfaced but does not block a separately name
 click and native share-sheet completion are requests, not proof that a user retained a destination,
 and the UI says so.
 
-There is still no automatic deletion, winner selection, merge, restore, import, or discard, and a
-valid authoritative winner may remain the live projection after its losers are journaled.
+A fenced recovery view may name one existing journal snapshot and project those exact bytes
+into memory. That selection lives under `iris.recovery-view.v1.<owner>` on the recovery
+repository. It does not write the primary, the legacy root, or the journal, and it does not
+clear `recovery-required`. Show stored primary erases that selection and projects the
+untouched primary while the fence stays. There is still no automatic deletion, winner
+selection, merge, import, or discard, and a valid authoritative winner may remain the live
+projection after its losers are journaled.
 Recovery data and retained local export files duplicate private note content, so the native
 at-rest policy and eventual local-account erasure must cover primary, synthetic, and Iris-owned
 cache paths.
@@ -1012,8 +1017,9 @@ This is detection and preservation, not old-client exclusion. There is still a r
 client-side check, and old code can continue writing its own key. `EXPO_PUBLIC_DURABLE_STORAGE`
 therefore remains off by default. Production requires a separately approved and implemented
 server storage epoch, upgrade-required response, or other enforceable old-client invalidation
-contract, plus recovery resolution, web/native lifecycle acceptance, at-rest policy, and local
-erasure coverage. This ADR does not choose a branch, merge, restore, import, discard, change the
+contract, plus writable recovery resolution, web/native lifecycle acceptance, at-rest policy, and local
+erasure coverage. A later view-selection slice can project a chosen journal snapshot while the
+owner stays fenced. This ADR does not choose a writable branch, merge, import, discard, change the
 `/v1` coordinator, or flip authority.
 
 ---
