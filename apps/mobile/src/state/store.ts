@@ -21,7 +21,14 @@ import {
   ReplicaRecoveryJournal,
   type ReplicaRecoveryEnvelope,
   type ReplicaRecoveryReason,
+  type ReplicaRecoverySnapshot,
 } from './replica-recovery-journal';
+import {
+  parseReplicaRecoveryView,
+  replicaRecoveryViewOwnerKey,
+  serializeReplicaRecoveryView,
+  type ReplicaRecoveryViewSelection,
+} from './replica-recovery-selection';
 import {
   buildReplicaRecoveryCatalog,
   type PendingReplicaRecovery,
@@ -99,6 +106,14 @@ export interface RecoveryInspectionLease {
 export interface RecoveryInspectionVersion {
   readonly projection: number;
   readonly recovery: number;
+}
+
+export type ReplicaRecoveryViewSource = 'recovery-selection' | 'stored-primary' | 'unselected';
+
+export interface ReplicaRecoveryInspection {
+  catalog: ReplicaRecoveryCatalog | null;
+  viewSource: ReplicaRecoveryViewSource;
+  selectedSequence: number | null;
 }
 
 export interface ReplicaRecoveryExportArtifact {
@@ -182,6 +197,8 @@ let generation = 0;
 let generationController = new AbortController();
 let projectionEpoch = 0;
 const recoveryEpochs = new Map<string, number>();
+const recoveryViewOrigins = new Map<string, ReplicaRecoveryViewSource>();
+const RECOVERY_VIEW_COMMIT_ATTEMPTS = 8;
 
 function notifyRecoveryCatalogChanged(): void {
   recoveryCatalogRevision$.set(recoveryCatalogRevision$.get() + 1);
@@ -959,6 +976,12 @@ async function loadReplica(session: Session, allowCreate: boolean): Promise<Pers
     await flushPendingReplicaRecoveries(ownerKey);
   }
 
+  const selectedReplica = await selectedRecoveryReplica(session);
+  if (selectedReplica) {
+    setRecoveryViewOrigin(ownerKey, 'recovery-selection');
+    return selectedReplica;
+  }
+
   let raw: string | null;
   const followerBinding = replicaAuthorityBinding;
   const followerRefreshVersion = followerBinding?.refreshVersion ?? 0;
@@ -989,7 +1012,10 @@ async function loadReplica(session: Session, allowCreate: boolean): Promise<Pers
     // still inspect the separately keyed journal instead of stopping before the fallback.
     try {
       const recovered = await compatibleRecoveryReplica(session);
-      if (recovered) return recovered;
+      if (recovered) {
+        setRecoveryViewOrigin(ownerKey, 'unselected');
+        return recovered;
+      }
     } catch (recoveryCause) {
       throw new StatePersistenceError(
         'Could not read the owner replica or a compatible recovery snapshot',
@@ -1002,7 +1028,10 @@ async function loadReplica(session: Session, allowCreate: boolean): Promise<Pers
     try {
       if (hadPendingRecovery) {
         const recovered = await compatibleRecoveryReplica(session);
-        if (recovered) return recovered;
+        if (recovered) {
+          setRecoveryViewOrigin(ownerKey, 'unselected');
+          return recovered;
+        }
       }
       const replica = parseReplica(raw, session);
       // A healthy writable authority may clear an earlier stale-CAS fence after validating the
@@ -1010,17 +1039,26 @@ async function loadReplica(session: Session, allowCreate: boolean): Promise<Pers
       // merely because its read-only primary bytes are individually well formed.
       if (isOwnerReplicaWritable(ownerKey)) {
         authoritativeRecoveryFencedOwners.delete(ownerKey);
+        setRecoveryViewOrigin(ownerKey, 'unselected');
+      } else {
+        setRecoveryViewOrigin(ownerKey, 'stored-primary');
       }
       return replica;
     } catch (cause) {
       const recovered = await compatibleRecoveryReplica(session);
-      if (recovered) return recovered;
+      if (recovered) {
+        setRecoveryViewOrigin(ownerKey, 'unselected');
+        return recovered;
+      }
       throw cause;
     }
   }
 
   const recovered = await compatibleRecoveryReplica(session);
-  if (recovered) return recovered;
+  if (recovered) {
+    setRecoveryViewOrigin(ownerKey, 'unselected');
+    return recovered;
+  }
   if (!allowCreate) {
     throw new StatePersistenceError(
       'Persisted session has no owner replica; refusing to create an empty replacement',
@@ -1033,6 +1071,7 @@ async function loadReplica(session: Session, allowCreate: boolean): Promise<Pers
   }
 
   authoritativeRecoveryFencedOwners.delete(ownerKey);
+  setRecoveryViewOrigin(ownerKey, 'unselected');
   const replica = emptyReplica(session);
   try {
     await enqueueReplicaSave(replica);
@@ -1698,17 +1737,18 @@ export function eraseLocalOwnerAfterConfirmedAccountDeletion(
     try {
       const repository = ownerReplicaRepository;
       if (typeof repository.erase !== 'function') {
-        throw new StatePersistenceError(
-          'Local owner erase is unavailable on this storage adapter',
-        );
+        throw new StatePersistenceError('Local owner erase is unavailable on this storage adapter');
       }
 
       const journalOwnerKey = replicaRecoveryJournalOwnerKey(ownerKey);
-      const [primaryBefore, journalBefore] = await Promise.all([
+      const viewOwnerKey = replicaRecoveryViewOwnerKey(ownerKey);
+      const recoveryRepository = ownerReplicaRuntime.recoveryRepository;
+      const [primaryBefore, journalBefore, viewBefore] = await Promise.all([
         repository.read(ownerKey),
         repository.read(journalOwnerKey),
+        recoveryRepository.read(viewOwnerKey),
       ]);
-      const hadLocalData = primaryBefore !== null || journalBefore !== null;
+      const hadLocalData = primaryBefore !== null || journalBefore !== null || viewBefore !== null;
 
       // Credential first: a wiped replica with a live token could still attempt network work
       // if erase were interrupted after storage clear. Tombstone blocks re-auth as signed-out.
@@ -1717,17 +1757,23 @@ export function eraseLocalOwnerAfterConfirmedAccountDeletion(
       // Recovery journal is a separate repository owner key; erase both so private note
       // snapshots cannot re-enter via Recovery Center after confirmed deletion.
       await repository.erase(journalOwnerKey);
+      if (typeof recoveryRepository.erase !== 'function') {
+        throw new StatePersistenceError('Recovery view selection erase is unavailable');
+      }
+      await recoveryRepository.erase(viewOwnerKey);
 
-      // Verify both roots are gone before clearing the in-memory projection.
-      const [primaryAfter, journalAfter] = await Promise.all([
+      // Verify the roots are gone before clearing the in-memory projection.
+      const [primaryAfter, journalAfter, viewAfter] = await Promise.all([
         repository.read(ownerKey),
         repository.read(journalOwnerKey),
+        recoveryRepository.read(viewOwnerKey),
       ]);
-      if (primaryAfter !== null || journalAfter !== null) {
+      if (primaryAfter !== null || journalAfter !== null || viewAfter !== null) {
         throw new StatePersistenceError(
           'Local owner erase could not verify that durable owner roots were cleared',
         );
       }
+      recoveryViewOrigins.delete(ownerKey);
 
       await closeReplicaAuthority();
       store$.set(blankState('auth-required'));
@@ -1978,17 +2024,304 @@ function displayedReplicaForRecoveryInspection(lease: RecoveryInspectionLease): 
   return serializedReplicaForRecovery(replica);
 }
 
+function setRecoveryViewOrigin(ownerKey: string, origin: ReplicaRecoveryViewSource): void {
+  recoveryViewOrigins.set(ownerKey, origin);
+}
+
+function assertRecoveryViewCommand(lease: RecoveryInspectionLease): void {
+  assertCurrentRecoveryInspectionLease(lease);
+  const binding = replicaAuthorityBinding;
+  const role =
+    binding && isCurrentAuthorityBinding(binding) && binding.ownerKey === lease.ownerKey
+      ? binding.handle?.snapshot().role
+      : null;
+  if (role !== 'leader' && role !== 'unavailable') {
+    throw new StatePersistenceError('This Iris tab cannot change the recovery view');
+  }
+  if (
+    !authoritativeRecoveryFencedOwners.has(lease.ownerKey) ||
+    store$.activeOwnerKey.get() !== lease.ownerKey ||
+    store$.status.get() !== 'recovery-required'
+  ) {
+    throw new StatePersistenceError(
+      'Recovery view selection is available only while recovery is required',
+    );
+  }
+}
+
+async function readRecoveryViewSelection(
+  sourceOwnerKey: string,
+): Promise<{ raw: string; selection: ReplicaRecoveryViewSelection } | null> {
+  const viewKey = replicaRecoveryViewOwnerKey(sourceOwnerKey);
+  let raw: string | null;
+  try {
+    raw = await ownerReplicaRuntime.recoveryRepository.read(viewKey);
+  } catch (cause) {
+    throw new StatePersistenceError('Could not read the recovery view selection', { cause });
+  }
+  if (raw === null) return null;
+  try {
+    return { raw, selection: parseReplicaRecoveryView(raw, sourceOwnerKey) };
+  } catch (cause) {
+    throw new StatePersistenceError('Could not read the recovery view selection', { cause });
+  }
+}
+
+async function eraseRecoveryViewIfUnchanged(
+  sourceOwnerKey: string,
+  expectedRaw: string,
+): Promise<void> {
+  const repository = ownerReplicaRuntime.recoveryRepository;
+  const viewKey = replicaRecoveryViewOwnerKey(sourceOwnerKey);
+  const observed = await repository.read(viewKey);
+  if (observed !== expectedRaw) return;
+  if (typeof repository.erase !== 'function') {
+    throw new StatePersistenceError('Recovery view selection could not be cleared');
+  }
+  await repository.erase(viewKey);
+  if ((await repository.read(viewKey)) !== null) {
+    throw new StatePersistenceError('Recovery view selection could not be cleared');
+  }
+}
+
+function matchingRecoverySnapshot(
+  envelope: ReplicaRecoveryEnvelope | null,
+  selection: ReplicaRecoveryViewSelection,
+): ReplicaRecoverySnapshot | null {
+  return (
+    envelope?.snapshots.find(
+      (snapshot) =>
+        snapshot.sequence === selection.sequence &&
+        snapshot.serializedReplica === selection.serializedReplica,
+    ) ?? null
+  );
+}
+
+async function selectedRecoveryReplica(
+  session: Session,
+  attempt = 1,
+): Promise<PersistedReplica | null> {
+  const ownerKey = ownerKeyFor(session);
+  const record = await readRecoveryViewSelection(ownerKey);
+  if (!record) return null;
+  let envelope: ReplicaRecoveryEnvelope | null;
+  try {
+    envelope = await readReplicaRecoveryEnvelope(ownerKey);
+  } catch (cause) {
+    throw new StatePersistenceError('Could not read the owner recovery journal', { cause });
+  }
+  if (matchingRecoverySnapshot(envelope, record.selection)) {
+    const replica = parseReplica(record.selection.serializedReplica, session);
+    fenceOwnerForAuthoritativeRecovery(ownerKey);
+    return replica;
+  }
+  const current = await ownerReplicaRuntime.recoveryRepository.read(
+    replicaRecoveryViewOwnerKey(ownerKey),
+  );
+  if (current !== record.raw) {
+    if (attempt >= RECOVERY_VIEW_COMMIT_ATTEMPTS) {
+      throw new StatePersistenceError(
+        'Recovery view selection changed before it could be verified',
+      );
+    }
+    return selectedRecoveryReplica(session, attempt + 1);
+  }
+  await eraseRecoveryViewIfUnchanged(ownerKey, record.raw);
+  return null;
+}
+
+async function recoveryInspectionFor(
+  ownerKey: string,
+  envelope: ReplicaRecoveryEnvelope | null,
+  displayedSerializedReplica: string,
+  catalog: ReplicaRecoveryCatalog | null,
+  journalFailure: unknown,
+): Promise<ReplicaRecoveryInspection> {
+  if (journalFailure) {
+    return { catalog, viewSource: 'unselected', selectedSequence: null };
+  }
+  const record = await readRecoveryViewSelection(ownerKey);
+  const matched = record ? matchingRecoverySnapshot(envelope, record.selection) : null;
+  if (record && matched) {
+    const showingSelection = displayedSerializedReplica === record.selection.serializedReplica;
+    return {
+      catalog,
+      viewSource: showingSelection ? 'recovery-selection' : 'unselected',
+      selectedSequence: record.selection.sequence,
+    };
+  }
+  if (
+    authoritativeRecoveryFencedOwners.has(ownerKey) &&
+    recoveryViewOrigins.get(ownerKey) === 'stored-primary'
+  ) {
+    return { catalog, viewSource: 'stored-primary', selectedSequence: null };
+  }
+  return { catalog, viewSource: 'unselected', selectedSequence: null };
+}
+
+async function commitRecoveryViewSelection(
+  lease: RecoveryInspectionLease,
+  epochs: RecoveryInspectionVersion,
+  serializedReplica: string,
+  sequence: number,
+): Promise<void> {
+  const raw = serializeReplicaRecoveryView({
+    sourceOwnerKey: lease.ownerKey,
+    sequence,
+    serializedReplica,
+  });
+  const repository = ownerReplicaRuntime.recoveryRepository;
+  const viewKey = replicaRecoveryViewOwnerKey(lease.ownerKey);
+  for (let attempt = 1; attempt <= RECOVERY_VIEW_COMMIT_ATTEMPTS; attempt += 1) {
+    assertCurrentRecoveryInspectionLease(lease);
+    assertRecoveryInspectionUnchanged(lease, epochs);
+    await repository.read(viewKey);
+    try {
+      await repository.commit(viewKey, raw);
+    } catch (cause) {
+      if (
+        cause instanceof ReplicaRepositoryStaleWriterError &&
+        attempt < RECOVERY_VIEW_COMMIT_ATTEMPTS
+      ) {
+        continue;
+      }
+      throw new StatePersistenceError('Recovery view selection could not be saved', { cause });
+    }
+    if ((await repository.read(viewKey)) === raw) return;
+  }
+  throw new StatePersistenceError('Recovery view selection could not be saved');
+}
+
+function publishRecoveryView(
+  ownerKey: string,
+  replica: PersistedReplica,
+  origin: ReplicaRecoveryViewSource,
+): void {
+  publishReplicaProjection(replica);
+  setRecoveryViewOrigin(ownerKey, origin);
+  if (store$.activeOwnerKey.get() === ownerKey) store$.status.set('recovery-required');
+  advanceRecoveryEpoch(ownerKey);
+}
+
+/**
+ * Show one journal snapshot in the fenced projection.
+ *
+ * The primary, legacy root, and journal envelope are not written. An exact match with the
+ * projection already on screen does not create a selection record.
+ */
+export async function showReplicaRecoverySnapshotForLease(
+  lease: RecoveryInspectionLease,
+  sequence: number,
+): Promise<ReplicaRecoveryInspection> {
+  assertRecoveryViewCommand(lease);
+  await flushPendingReplicaRecoveries(lease.ownerKey);
+  assertRecoveryViewCommand(lease);
+  if ((pendingReplicaRecoveries.get(lease.ownerKey)?.size ?? 0) > 0) {
+    throw new StatePersistenceError('A recovery copy is still memory-only');
+  }
+  const epochs = captureRecoveryInspectionEpochs(lease);
+  let envelope: ReplicaRecoveryEnvelope | null;
+  try {
+    envelope = await readReplicaRecoveryEnvelope(lease.ownerKey);
+  } catch (cause) {
+    throw new StatePersistenceError('Could not verify the owner recovery journal', { cause });
+  }
+  assertRecoveryInspectionUnchanged(lease, epochs);
+  const snapshot = envelope?.snapshots.find((candidate) => candidate.sequence === sequence);
+  if (!snapshot) {
+    throw new StatePersistenceError('That preserved copy is no longer in the recovery journal');
+  }
+  assertReplicaRecoverySnapshot(lease.ownerKey, snapshot.serializedReplica);
+  const displayed = displayedReplicaForRecoveryInspection(lease);
+  if (displayed === snapshot.serializedReplica) {
+    return readReplicaRecoveryCatalogForLease(lease);
+  }
+  assertRecoveryViewCommand(lease);
+  assertRecoveryInspectionUnchanged(lease, epochs);
+  await commitRecoveryViewSelection(lease, epochs, snapshot.serializedReplica, snapshot.sequence);
+  assertCurrentRecoveryInspectionLease(lease);
+  assertRecoveryInspectionUnchanged(lease, epochs);
+  const session = store$.session.get();
+  if (!session) throw new StaleSessionError();
+  publishRecoveryView(
+    lease.ownerKey,
+    parseReplica(snapshot.serializedReplica, session),
+    'recovery-selection',
+  );
+  return readReplicaRecoveryCatalogForLease(lease);
+}
+
+/**
+ * Clear the selection and show the untouched primary without leaving recovery-required.
+ * A primary that cannot be verified leaves the selection and projection unchanged.
+ */
+export async function showStoredPrimaryForLease(
+  lease: RecoveryInspectionLease,
+): Promise<ReplicaRecoveryInspection> {
+  assertRecoveryViewCommand(lease);
+  if ((pendingReplicaRecoveries.get(lease.ownerKey)?.size ?? 0) > 0) {
+    throw new StatePersistenceError('A recovery copy is still memory-only');
+  }
+  const epochs = captureRecoveryInspectionEpochs(lease);
+  const record = await readRecoveryViewSelection(lease.ownerKey);
+  if (!record) {
+    throw new StatePersistenceError('No recovery view selection is active');
+  }
+  let envelope: ReplicaRecoveryEnvelope | null;
+  try {
+    envelope = await readReplicaRecoveryEnvelope(lease.ownerKey);
+  } catch (cause) {
+    throw new StatePersistenceError('Could not verify the owner recovery journal', { cause });
+  }
+  if (!matchingRecoverySnapshot(envelope, record.selection)) {
+    throw new StatePersistenceError(
+      'The recovery view selection no longer matches its journal copy',
+    );
+  }
+  assertRecoveryInspectionUnchanged(lease, epochs);
+  let primaryRaw: string | null;
+  try {
+    primaryRaw = await readReplicaWithoutPromotion(lease.ownerKey);
+  } catch {
+    throw new StatePersistenceError('The stored primary could not be verified');
+  }
+  const session = store$.session.get();
+  if (!primaryRaw || !session) {
+    throw new StatePersistenceError('The stored primary could not be verified');
+  }
+  let primary: PersistedReplica;
+  try {
+    primary = parseReplica(primaryRaw, session);
+  } catch {
+    throw new StatePersistenceError('The stored primary could not be verified');
+  }
+  assertRecoveryViewCommand(lease);
+  assertRecoveryInspectionUnchanged(lease, epochs);
+  await eraseRecoveryViewIfUnchanged(lease.ownerKey, record.raw);
+  if (
+    (await ownerReplicaRuntime.recoveryRepository.read(
+      replicaRecoveryViewOwnerKey(lease.ownerKey),
+    )) !== null
+  ) {
+    throw new StatePersistenceError('Recovery view selection could not be cleared');
+  }
+  assertCurrentRecoveryInspectionLease(lease);
+  assertRecoveryInspectionUnchanged(lease, epochs);
+  publishRecoveryView(lease.ownerKey, primary, 'stored-primary');
+  return readReplicaRecoveryCatalogForLease(lease);
+}
+
 /** Read every durable and current-process recovery candidate without committing state. */
 export async function readReplicaRecoveryCatalogForLease(
   lease: RecoveryInspectionLease,
-): Promise<ReplicaRecoveryCatalog | null> {
+): Promise<ReplicaRecoveryInspection> {
   return readReplicaRecoveryCatalogAttempt(lease, 1);
 }
 
 async function readReplicaRecoveryCatalogAttempt(
   lease: RecoveryInspectionLease,
   attempt: number,
-): Promise<ReplicaRecoveryCatalog | null> {
+): Promise<ReplicaRecoveryInspection> {
   const epochs = captureRecoveryInspectionEpochs(lease);
   let envelope = null;
   let journalFailure: unknown;
@@ -2016,13 +2349,21 @@ async function readReplicaRecoveryCatalogAttempt(
       cause: journalFailure,
     });
   }
+  const displayedSerializedReplica = displayedReplicaForRecoveryInspection(lease);
   const catalog = buildReplicaRecoveryCatalog({
     sourceOwnerKey: lease.ownerKey,
     envelope,
     pending,
-    displayedSerializedReplica: displayedReplicaForRecoveryInspection(lease),
+    displayedSerializedReplica,
     inventoryComplete: !journalFailure,
   });
+  const inspection = await recoveryInspectionFor(
+    lease.ownerKey,
+    envelope,
+    displayedSerializedReplica,
+    catalog,
+    journalFailure,
+  );
   try {
     assertRecoveryInspectionUnchanged(lease, epochs);
   } catch (error) {
@@ -2036,7 +2377,7 @@ async function readReplicaRecoveryCatalogAttempt(
     }
     throw error;
   }
-  return catalog;
+  return inspection;
 }
 
 /**

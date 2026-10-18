@@ -17,6 +17,7 @@ const legacyStorageKey = `iris.replica.v2.${ownerKey}`;
 const seedMarkerKey = `iris.e2e.owner-authority.seeded.v1.${ownerKey}`;
 const divergenceOwnerKey = `iris.replica-divergence.v1.${encodeURIComponent(ownerKey)}`;
 const recoveryOwnerKey = `iris.recovery-journal.v1.${encodeURIComponent(ownerKey)}`;
+const recoveryViewOwnerKey = `iris.recovery-view.v1.${encodeURIComponent(ownerKey)}`;
 const replicaDigestDomain = 'iris.owner-replica.v2.exact-bytes';
 
 const session = {
@@ -216,6 +217,35 @@ async function waitForDurableNoteTitle(
     .toBe(true);
   if (!last) throw new Error('Durable note title wait completed without a record');
   return last;
+}
+
+async function optionalIndexedDbRecord(
+  page: Page,
+  key: string,
+): Promise<BrowserReplicaRecord | null> {
+  return page.evaluate(
+    ({ databaseName, storeName, key }) =>
+      new Promise<BrowserReplicaRecord | null>((resolve, reject) => {
+        const open = indexedDB.open(databaseName);
+        open.onerror = () => reject(open.error);
+        open.onsuccess = () => {
+          const database = open.result;
+          const transaction = database.transaction(storeName, 'readonly');
+          const request = transaction.objectStore(storeName).get(key);
+          transaction.onerror = () => reject(transaction.error);
+          transaction.oncomplete = () => {
+            const value = request.result as BrowserReplicaRecord | undefined;
+            database.close();
+            resolve(
+              value
+                ? { revision: value.revision, serializedReplica: value.serializedReplica }
+                : null,
+            );
+          };
+        };
+      }),
+    { databaseName, storeName, key },
+  );
 }
 
 async function legacyReplicaRaw(page: Page): Promise<string | null> {
@@ -787,6 +817,47 @@ test('a frozen old writer preserves both roots and fences the current runtime be
   await expect(relaunched.getByText('Recovery Center', { exact: true })).toBeVisible();
   await expect(relaunched.getByText('Local recovery mode')).toBeVisible();
   await expect(relaunched.getByText('3 local branches shown')).toBeVisible();
+
+  const primaryBeforeView = await indexedDbRecord(relaunched);
+  const legacyBeforeView = await legacyReplicaRaw(relaunched);
+  const journalBeforeView = await indexedDbRecord(relaunched, recoveryOwnerKey);
+  const divergenceBeforeView = await indexedDbRecord(relaunched, divergenceOwnerKey);
+  const fetchesBeforeView = await fetchCount(relaunched);
+  const legacyCopy = relaunched
+    .locator('div')
+    .filter({ hasText: 'Changed legacy branch detected.' })
+    .filter({ has: relaunched.getByRole('button', { name: 'Show this copy' }) })
+    .last();
+  await legacyCopy.getByRole('button', { name: 'Show this copy' }).click();
+  await relaunched.getByRole('button', { name: 'Confirm show this copy' }).click();
+  await expect(relaunched.getByText(/Showing preserved copy #/)).toBeVisible();
+  const selection = await indexedDbRecord(relaunched, recoveryViewOwnerKey);
+  expect(selection.serializedReplica).toContain(legacyDivergenceTitleSentinel);
+  expect(await indexedDbRecord(relaunched)).toEqual(primaryBeforeView);
+  expect(await legacyReplicaRaw(relaunched)).toBe(legacyBeforeView);
+  expect(await indexedDbRecord(relaunched, recoveryOwnerKey)).toEqual(journalBeforeView);
+  expect(await indexedDbRecord(relaunched, divergenceOwnerKey)).toEqual(divergenceBeforeView);
+  expect(await fetchCount(relaunched)).toBe(fetchesBeforeView);
+
+  await relaunched.getByRole('button', { name: 'View notes read-only' }).click();
+  await expect(relaunched).toHaveURL(/\/notes$/);
+  await expect(relaunched.getByText(legacyDivergenceTitleSentinel)).toBeVisible();
+  await expect(relaunched.getByText(mixedVersionPrimarySentinel)).toHaveCount(0);
+  await expect(relaunched.getByRole('button', { name: /New note/ })).toBeDisabled();
+  await relaunched.getByRole('tab', { name: 'Settings' }).click();
+  await relaunched.getByRole('button', { name: 'Open Recovery Center' }).click();
+  await expect(relaunched).toHaveURL(/\/recovery$/);
+  await relaunched.getByRole('button', { name: 'Show stored primary' }).click();
+  await relaunched.getByRole('button', { name: 'Confirm show stored primary' }).click();
+  await expect(
+    relaunched.getByText('Showing the stored primary. Sync and editing stay off.').first(),
+  ).toBeVisible();
+  expect(await optionalIndexedDbRecord(relaunched, recoveryViewOwnerKey)).toBeNull();
+  expect(await indexedDbRecord(relaunched)).toEqual(primaryBeforeView);
+  expect(await legacyReplicaRaw(relaunched)).toBe(legacyBeforeView);
+  expect(await indexedDbRecord(relaunched, recoveryOwnerKey)).toEqual(journalBeforeView);
+  expect(await fetchCount(relaunched)).toBe(fetchesBeforeView);
+
   await relaunched.getByRole('button', { name: 'View notes read-only' }).click();
   await expect(relaunched).toHaveURL(/\/notes$/);
   await expect(relaunched.getByText(mixedVersionPrimarySentinel)).toBeVisible();

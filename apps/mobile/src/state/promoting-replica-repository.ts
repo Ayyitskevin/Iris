@@ -25,6 +25,7 @@ import {
   replicaRecoveryJournalOwnerKey,
   type ReplicaRecoveryReason,
 } from './replica-recovery-journal';
+import { replicaRecoveryViewOwnerKey } from './replica-recovery-selection';
 
 async function eraseOwnerRoot(repository: OwnerReplicaRepository, ownerKey: string): Promise<void> {
   if (typeof repository.erase !== 'function') {
@@ -117,15 +118,18 @@ export class PromotingOwnerReplicaRepository implements OwnerReplicaRepository {
   }
 
   /**
-   * Confirmed account deletion: erase primary, legacy, and recovery-journal roots for this
-   * owner. Missing erase on a child adapter fails closed rather than claiming a partial wipe.
+   * Confirmed account deletion: erase primary, legacy, recovery-journal, and recovery-view
+   * roots for this owner. Missing erase on a child adapter fails closed rather than claiming
+   * a partial wipe. Divergence control bytes stay until a later erasure slice.
    */
   erase(ownerKey: string): Promise<void> {
     return this.enqueue(ownerKey, async () => {
       const journalOwnerKey = replicaRecoveryJournalOwnerKey(ownerKey);
+      const viewOwnerKey = replicaRecoveryViewOwnerKey(ownerKey);
       await eraseOwnerRoot(this.primary, ownerKey);
       await eraseOwnerRoot(this.legacy, ownerKey);
       await eraseOwnerRoot(this.primary, journalOwnerKey);
+      await eraseOwnerRoot(this.primary, viewOwnerKey);
     });
   }
 

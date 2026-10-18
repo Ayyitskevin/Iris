@@ -25,6 +25,10 @@ import {
   ReplicaRepositoryDivergedError,
 } from './promoting-replica-repository';
 import { ReplicaRecoveryJournal, replicaRecoveryJournalOwnerKey } from './replica-recovery-journal';
+import {
+  replicaRecoveryViewOwnerKey,
+  serializeReplicaRecoveryView,
+} from './replica-recovery-selection';
 import type { OwnerReplicaRepository } from './replica-repository';
 import { TransactionalOwnerReplicaRepository } from './transactional-replica-repository';
 
@@ -110,6 +114,10 @@ class MemoryRepo implements OwnerReplicaRepository {
     }
     this.data.set(ownerKey, raw);
     await this.afterCommit?.(ownerKey, raw);
+  }
+
+  async erase(ownerKey: string): Promise<void> {
+    this.data.delete(ownerKey);
   }
 }
 
@@ -669,6 +677,29 @@ describe('PromotingOwnerReplicaRepository mixed-version protocol', () => {
     expect(await primary.read(ownerB)).toBe(bNext);
     expect((await divergence.read(ownerA))?.entries.at(-1)?.state).toBe('diverged');
     expect((await divergence.read(ownerB))?.entries.at(-1)?.state).toBe('transactional');
+  });
+
+  it('erases a recovery view selection and leaves divergence control bytes in place', async () => {
+    const primary = sqliteRepo();
+    const legacy = new MemoryRepo();
+    const { repository } = protocol(primary, legacy);
+    const viewKey = replicaRecoveryViewOwnerKey(ownerA);
+    const divergenceKey = replicaDivergenceJournalOwnerKey(ownerA);
+    const selection = serializeReplicaRecoveryView({
+      sourceOwnerKey: ownerA,
+      sequence: 1,
+      serializedReplica: serialized(ownerA, 'preserved-branch'),
+    });
+    await primary.commit(ownerA, serialized(ownerA, 'primary'));
+    await primary.commit(viewKey, selection);
+    await primary.commit(divergenceKey, JSON.stringify({ ownerKey: divergenceKey, keep: true }));
+
+    await repository.erase(ownerA);
+
+    expect(await primary.read(ownerA)).toBeNull();
+    expect(await primary.read(viewKey)).toBeNull();
+    expect(await primary.read(replicaRecoveryJournalOwnerKey(ownerA))).toBeNull();
+    expect(await primary.read(divergenceKey)).toContain('"keep":true');
   });
 
   it('uses the production Expo digest implementation only behind its explicit async boundary', async () => {

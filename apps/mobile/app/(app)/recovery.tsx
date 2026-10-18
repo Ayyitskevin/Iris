@@ -7,10 +7,7 @@ import {
   type RecoveryExportDeliveryResult,
 } from '../../src/recovery/export-sink';
 import { useObs } from '../../src/state/hooks';
-import type {
-  ReplicaRecoveryCatalog,
-  ReplicaRecoveryCatalogCopy,
-} from '../../src/state/replica-recovery-catalog';
+import type { ReplicaRecoveryCatalogCopy } from '../../src/state/replica-recovery-catalog';
 import type { ReplicaRecoveryReason } from '../../src/state/replica-recovery-journal';
 import {
   createReplicaRecoveryExportForLease,
@@ -19,10 +16,14 @@ import {
   openRecoveryInspectionLease,
   readReplicaRecoveryCatalogForLease,
   recoveryCatalogRevision$,
+  showReplicaRecoverySnapshotForLease,
+  showStoredPrimaryForLease,
   StaleSessionError,
   StaleRecoveryInspectionError,
   store$,
   type ReplicaRecoveryExportArtifact,
+  type ReplicaRecoveryInspection,
+  type ReplicaRecoveryViewSource,
 } from '../../src/state/store';
 import { theme } from '../../src/theme';
 
@@ -34,6 +35,28 @@ const reasonLabels = {
   'legacy-divergence': 'Changed legacy branch detected.',
   'primary-divergence': 'Transactional primary branch preserved after divergence.',
 } as const satisfies Readonly<Record<ReplicaRecoveryReason, string>>;
+
+type PendingRecoveryView = { kind: 'snapshot'; sequence: number } | { kind: 'primary' };
+
+function viewSourceLabel(
+  source: ReplicaRecoveryViewSource,
+  sequence: number | null,
+): string | null {
+  switch (source) {
+    case 'recovery-selection':
+      return sequence === null
+        ? null
+        : `Showing preserved copy #${sequence}. Sync and editing stay off.`;
+    case 'stored-primary':
+      return 'Showing the stored primary. Sync and editing stay off.';
+    case 'unselected':
+      return null;
+    default: {
+      const unreachable: never = source;
+      return unreachable;
+    }
+  }
+}
 
 function copyTitle(copy: ReplicaRecoveryCatalogCopy): string {
   if (copy.persistence === 'journal-verified') return `Preserved copy #${copy.sequence}`;
@@ -74,7 +97,9 @@ export default function RecoveryCenter() {
   const ownerKey = useObs(() => store$.activeOwnerKey.get());
   const recoveryRequired = useObs(() => store$.status.get() === 'recovery-required');
   const catalogRevision = useObs(() => recoveryCatalogRevision$.get());
-  const [catalog, setCatalog] = useState<ReplicaRecoveryCatalog | null>();
+  const [inspection, setInspection] = useState<ReplicaRecoveryInspection | null>();
+  const [pendingView, setPendingView] = useState<PendingRecoveryView | null>(null);
+  const [showing, setShowing] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportMessage, setExportMessage] = useState('');
@@ -85,7 +110,9 @@ export default function RecoveryCenter() {
 
   useEffect(() => {
     requestId.current += 1;
-    setCatalog(undefined);
+    setInspection(undefined);
+    setPendingView(null);
+    setShowing(false);
     setLoadError(false);
     setExporting(false);
     setExportMessage('');
@@ -97,7 +124,7 @@ export default function RecoveryCenter() {
   const loadCatalog = useCallback(
     async (preserveExportMessage = false, keepCatalog = false) => {
       const request = ++requestId.current;
-      if (!keepCatalog) setCatalog(undefined);
+      if (!keepCatalog) setInspection(undefined);
       setLoadError(false);
       if (!preserveExportMessage) {
         setExportMessage('');
@@ -107,18 +134,19 @@ export default function RecoveryCenter() {
       if (!lease) {
         if (requestId.current === request) {
           setLoadError(true);
-          setCatalog(undefined);
+          setInspection(undefined);
         }
         return;
       }
       try {
         const result = await readReplicaRecoveryCatalogForLease(lease);
         if (requestId.current !== request || !isCurrentRecoveryInspectionLease(lease)) return;
-        setCatalog(result);
+        setInspection(result);
+        setPendingView(null);
       } catch {
         if (requestId.current === request && store$.activeOwnerKey.get() === ownerKey) {
           setLoadError(true);
-          setCatalog(undefined);
+          setInspection(undefined);
         }
       }
     },
@@ -126,10 +154,10 @@ export default function RecoveryCenter() {
   );
 
   useEffect(() => {
-    if (lastCatalogRevision.current === catalogRevision || exporting) return;
+    if (lastCatalogRevision.current === catalogRevision || exporting || showing) return;
     lastCatalogRevision.current = catalogRevision;
     void loadCatalog(true, true);
-  }, [catalogRevision, exporting, loadCatalog]);
+  }, [catalogRevision, exporting, loadCatalog, showing]);
 
   useEffect(() => {
     if (!exportMessage || Platform.OS !== 'ios') return;
@@ -184,7 +212,8 @@ export default function RecoveryCenter() {
         guard,
       );
       guard();
-      setCatalog(completedArtifact.catalog);
+      setInspection(await readReplicaRecoveryCatalogForLease(lease));
+      setPendingView(null);
       if (delivery.kind === 'download-requested') {
         setExportMessage('Download requested. Confirm the file was saved before closing Iris.');
       } else {
@@ -214,6 +243,58 @@ export default function RecoveryCenter() {
     }
   }, [ownerKey]);
 
+  const showView = useCallback(async () => {
+    if (!pendingView) return;
+    const request = ++requestId.current;
+    const lease = openRecoveryInspectionLease();
+    if (!lease) {
+      setExportError(true);
+      setExportMessage('The active account changed. Reopen Recovery Center and try again.');
+      return;
+    }
+    setShowing(true);
+    setExportMessage('');
+    setExportError(false);
+    try {
+      const result =
+        pendingView.kind === 'snapshot'
+          ? await showReplicaRecoverySnapshotForLease(lease, pendingView.sequence)
+          : await showStoredPrimaryForLease(lease);
+      if (requestId.current !== request || !isCurrentRecoveryInspectionLease(lease)) return;
+      setInspection(result);
+      setPendingView(null);
+      setExportMessage(
+        pendingView.kind === 'snapshot'
+          ? 'Showing that preserved copy. Sync and editing stay off.'
+          : 'Showing the stored primary. Sync and editing stay off.',
+      );
+    } catch (error) {
+      if (requestId.current === request && store$.activeOwnerKey.get() === ownerKey) {
+        setExportError(true);
+        setExportMessage(
+          error instanceof Error ? error.message : 'The recovery view could not be changed.',
+        );
+      }
+    } finally {
+      if (requestId.current === request && store$.activeOwnerKey.get() === ownerKey) {
+        setShowing(false);
+      }
+    }
+  }, [ownerKey, pendingView]);
+
+  const catalog = inspection ? inspection.catalog : undefined;
+  const canShow = Boolean(
+    recoveryRequired &&
+    catalog &&
+    catalog.inventoryComplete &&
+    !catalog.hasUnverifiedCopies &&
+    !exporting &&
+    !showing,
+  );
+  const showingLabel = inspection
+    ? viewSourceLabel(inspection.viewSource, inspection.selectedSequence)
+    : null;
+
   return (
     <Screen>
       <ScrollView contentContainerStyle={styles.content}>
@@ -226,8 +307,9 @@ export default function RecoveryCenter() {
         </View>
         <Title>Recovery Center</Title>
         <Muted>
-          Inspect and export local copies. This screen cannot select, merge, restore, discard, or
-          delete a copy.
+          {recoveryRequired
+            ? 'Inspect and export local copies. You can show a preserved copy, or show the stored primary again. Sync and editing stay off. This screen cannot merge, discard, or delete a copy.'
+            : 'Inspect and export local copies. This screen cannot select, merge, restore, discard, or delete a copy.'}
         </Muted>
         {recoveryRequired ? <RecoveryNotice /> : null}
 
@@ -284,10 +366,36 @@ export default function RecoveryCenter() {
                   {catalog.memoryOnlyCount === 1 ? 'it' : 'them'} in local recovery storage.
                 </Text>
               ) : null}
+              {showingLabel ? <Text style={styles.match}>{showingLabel}</Text> : null}
+              {canShow && inspection?.selectedSequence !== null && inspection ? (
+                pendingView?.kind === 'primary' ? (
+                  <View>
+                    <Text style={styles.meta}>
+                      Iris will show the untouched stored primary again. Sync and editing stay off.
+                      The journal stays unchanged.
+                    </Text>
+                    <Button
+                      label="Confirm show stored primary"
+                      variant="danger"
+                      disabled={showing}
+                      onPress={() => void showView()}
+                    />
+                    <Button label="Cancel" variant="ghost" onPress={() => setPendingView(null)} />
+                  </View>
+                ) : (
+                  <Button
+                    label="Show stored primary"
+                    variant="ghost"
+                    disabled={showing || exporting}
+                    onPress={() => setPendingView({ kind: 'primary' })}
+                  />
+                )
+              ) : null}
             </Card>
 
             {catalog.copies.map((copy) => {
               const isExpanded = Boolean(expanded[copy.key]);
+              const sequence = copy.sequence;
               return (
                 <Card key={copy.key}>
                   <Text accessibilityRole="header" style={styles.copyTitle}>
@@ -314,6 +422,36 @@ export default function RecoveryCenter() {
                     {copy.conflictCount === 1 ? 'conflict' : 'conflicts'} ·{' '}
                     {copy.hasSyncIssue ? 'sync issue' : 'no sync issue'}
                   </Text>
+                  {canShow &&
+                  sequence !== null &&
+                  copy.persistence === 'journal-verified' &&
+                  !copy.matchesDisplayedProjection ? (
+                    pendingView?.kind === 'snapshot' && pendingView.sequence === sequence ? (
+                      <View>
+                        <Text style={styles.meta}>
+                          Iris will show this preserved copy. Sync and editing stay off. The stored
+                          primary and every journal copy stay unchanged.
+                        </Text>
+                        <Button
+                          label="Confirm show this copy"
+                          variant="danger"
+                          disabled={showing}
+                          onPress={() => void showView()}
+                        />
+                        <Button
+                          label="Cancel"
+                          variant="ghost"
+                          onPress={() => setPendingView(null)}
+                        />
+                      </View>
+                    ) : (
+                      <Button
+                        label="Show this copy"
+                        disabled={showing || exporting}
+                        onPress={() => setPendingView({ kind: 'snapshot', sequence })}
+                      />
+                    )
+                  ) : null}
                   <Button
                     label={isExpanded ? 'Hide note previews' : 'Show note previews'}
                     variant="ghost"
@@ -364,7 +502,7 @@ export default function RecoveryCenter() {
               <Button
                 label="Export all local copies (.json)"
                 loading={exporting}
-                disabled={catalog.preservedCount === 0}
+                disabled={catalog.preservedCount === 0 || showing}
                 onPress={() => void exportCopies()}
               />
               {exportMessage ? (

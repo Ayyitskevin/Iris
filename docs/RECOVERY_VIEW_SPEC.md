@@ -1,7 +1,7 @@
 # Recovery view selection
 
-**Status: proposal for review. Not an accepted ADR. Do not implement until the three
-review decisions at the top are accepted.**
+**Status: accepted and implemented.** The three review decisions below are unchanged.
+View selection is a fenced projection. Journal bytes are not discarded.
 
 This slice lets an operator who is already in read-only recovery choose which preserved
 local branch is on screen, and switch back to the untouched stored primary. It does not
@@ -120,12 +120,13 @@ divergence-journal key. The recovery repository's `commit` writes it. The promot
 
 Exact keys, version 1:
 
-| Field | Rule |
-| --- | --- |
-| `version` | `1` |
-| `sourceOwnerKey` | The replica owner key |
-| `sequence` | Safe integer `>= 1`, matching one current snapshot |
-| `serializedReplica` | Exact snapshot bytes, not a canonical re-encoding |
+| Field               | Rule                                                                                           |
+| ------------------- | ---------------------------------------------------------------------------------------------- |
+| `version`           | `1`                                                                                            |
+| `ownerKey`          | The domain-separated storage key. Required so repository `commit` can verify the record owner. |
+| `sourceOwnerKey`    | The replica owner key                                                                          |
+| `sequence`          | Safe integer `>= 1`, matching one current snapshot                                             |
+| `serializedReplica` | Exact snapshot bytes, not a canonical re-encoding                                              |
 
 `parse` rejects unknown fields, the wrong owner, a credential-like nested field, and any
 replica that fails `assertReplicaRecoverySnapshot`. A failed parse is a hard read
@@ -261,20 +262,20 @@ reader is enabled, matching export.
 
 ## Failure matrix
 
-| Case | Result |
-| --- | --- |
-| Show a verified snapshot while fenced | Projection matches those bytes. Status stays `recovery-required`. Journal, primary, and legacy bytes are unchanged. Selection read-back matches. No fetch. |
-| Reload after that Show | Hydration projects the same bytes and keeps the fence, including when the primary parses. |
-| Show the snapshot already on screen | No selection write. Projection unchanged. |
-| Show stored primary after a verified primary read | Selection key is absent. Projection is the primary. Fence and `recovery-required` remain. Journal unchanged. |
-| Primary unreadable during Show stored primary | Selection and projection unchanged. UI reports that the primary could not be verified. |
-| Last or middle snapshot, divergence snapshot, displayed snapshot | Show still only copies it into the selection. The journal still contains it. |
-| Memory-only card, displayed-only card, partial inventory | Action refused before a selection write. |
-| Owner switch, stale lease, epoch change, follower, `acquiring` | No selection write and no projection publish. |
-| Selection write conflicts | Retry the same snapshot intent against the selection key. Exhaustion leaves the previous selection and projection in place. |
-| Journal unreadable | No selection write. Existing selection is not deleted. |
-| Stale selection on a successful journal read | That exact stale selection is erased, then ordinary hydration runs. |
-| Confirmed account erasure | Selection key, primary, and journal key are absent before success is returned. |
+| Case                                                             | Result                                                                                                                                                     |
+| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Show a verified snapshot while fenced                            | Projection matches those bytes. Status stays `recovery-required`. Journal, primary, and legacy bytes are unchanged. Selection read-back matches. No fetch. |
+| Reload after that Show                                           | Hydration projects the same bytes and keeps the fence, including when the primary parses.                                                                  |
+| Show the snapshot already on screen                              | No selection write. Projection unchanged.                                                                                                                  |
+| Show stored primary after a verified primary read                | Selection key is absent. Projection is the primary. Fence and `recovery-required` remain. Journal unchanged.                                               |
+| Primary unreadable during Show stored primary                    | Selection and projection unchanged. UI reports that the primary could not be verified.                                                                     |
+| Last or middle snapshot, divergence snapshot, displayed snapshot | Show still only copies it into the selection. The journal still contains it.                                                                               |
+| Memory-only card, displayed-only card, partial inventory         | Action refused before a selection write.                                                                                                                   |
+| Owner switch, stale lease, epoch change, follower, `acquiring`   | No selection write and no projection publish.                                                                                                              |
+| Selection write conflicts                                        | Retry the same snapshot intent against the selection key. Exhaustion leaves the previous selection and projection in place.                                |
+| Journal unreadable                                               | No selection write. Existing selection is not deleted.                                                                                                     |
+| Stale selection on a successful journal read                     | That exact stale selection is erased, then ordinary hydration runs.                                                                                        |
+| Confirmed account erasure                                        | Selection key, primary, and journal key are absent before success is returned.                                                                             |
 
 ## Tests
 
